@@ -6,16 +6,19 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import zipfile
+import os
 
 class SeleniumClient:
     """
     Manages a Selenium browser instance to interact with Telegram Web.
     Uses undetected-chromedriver to avoid bot detection.
     """
-    def __init__(self, account_name: str, proxy: str = None):
+    def __init__(self, account_name: str, proxy: str = None, user_agent: str = None):
         self.account_name = account_name
         self.proxy = proxy
         self.driver = None
+        self.plugin_path = None
 
         options = uc.ChromeOptions()
         user_data_dir = Path.cwd() / "selenium_sessions" / self.account_name
@@ -24,10 +27,78 @@ class SeleniumClient:
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
         
-        if self.proxy:
-            options.add_argument(f'--proxy-server={self.proxy}')
+        if user_agent:
+            options.add_argument(f'user-agent={user_agent}')
 
-        # Use undetected_chromedriver
+        # --- PROXY CONFIGURATION ---
+        # This section now handles authenticated proxies by creating a temporary extension.
+        if self.proxy:
+            proxy_parts = self.proxy.split(':')
+            if len(proxy_parts) == 4:  # Format: ip:port:user:pass
+                ip, port, user, password = proxy_parts
+                
+                manifest_json = """
+                {
+                    "version": "1.0.0",
+                    "manifest_version": 2,
+                    "name": "Chrome Proxy",
+                    "permissions": [
+                        "proxy",
+                        "tabs",
+                        "unlimitedStorage",
+                        "storage",
+                        "<all_urls>",
+                        "webRequest",
+                        "webRequestBlocking"
+                    ],
+                    "background": {
+                        "scripts": ["background.js"]
+                    },
+                    "minimum_chrome_version":"22.0.0"
+                }
+                """
+
+                background_js = f\"\"\"
+                var config = {{
+                        mode: "fixed_servers",
+                        rules: {{
+                          singleProxy: {{
+                            scheme: "http",
+                            host: "{ip}",
+                            port: parseInt("{port}")
+                          }},
+                          bypassList: ["localhost"]
+                        }}
+                      }};
+                chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+                function callbackFn(details) {{
+                    return {{
+                        authCredentials: {{
+                            username: "{user}",
+                            password: "{password}"
+                        }}
+                    }};
+                }}
+                chrome.webRequest.onAuthRequired.addListener(
+                            callbackFn,
+                            {{urls: ["<all_urls>"]}},
+                            ['blocking']
+                );
+                \"\"\"
+                
+                # Use a unique name for the plugin file to avoid conflicts
+                self.plugin_path = Path.cwd() / f'proxy_plugin_{account_name}.zip'
+                with zipfile.ZipFile(self.plugin_path, 'w') as zp:
+                    zp.writestr("manifest.json", manifest_json)
+                    zp.writestr("background.js", background_js)
+                
+                options.add_extension(self.plugin_path)
+
+            elif len(proxy_parts) == 2:  # Format: ip:port
+                options.add_argument(f'--proxy-server={self.proxy}')
+            else:
+                print(f"WARNING: Invalid proxy format for {account_name}: {self.proxy}")
+
         self.driver = uc.Chrome(options=options, use_subprocess=True)
 
     def is_logged_in(self) -> bool:
@@ -134,5 +205,11 @@ class SeleniumClient:
             return False
 
     def close(self):
+        """Closes the browser and cleans up the proxy plugin file."""
         if self.driver:
             self.driver.quit()
+        if self.plugin_path and os.path.exists(self.plugin_path):
+            try:
+                os.remove(self.plugin_path)
+            except OSError as e:
+                print(f"Error removing proxy plugin file: {e}")

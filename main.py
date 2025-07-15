@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -491,6 +492,77 @@ class GroupCreatorBot:
         await self.bot.send_message(event.sender_id, "🏁 Silent proxy test finished. Check system logs for results.")
         raise events.StopPropagation
 
+    # ADDED: New handler to clean session files
+    async def _clean_sessions_handler(self, event: events.NewMessage.Event) -> None:
+        """Stops all workers and cleans up all user session files and folders."""
+        user_id = event.sender_id
+        LOGGER.info(f"User {user_id} initiated session cleaning.")
+
+        try:
+            async with self.bot.conversation(user_id, timeout=30) as conv:
+                await conv.send_message("⚠️ **هشدار:** این عملیات تمام نشست‌های کاربری را حذف کرده و تمام عملیات‌های در حال اجرا را متوقف می‌کند. لطفاً با ارسال `confirm` در 30 ثانیه آینده تایید کنید.")
+                response = await conv.get_response()
+                if response.text.lower() != 'confirm':
+                    await conv.send_message("❌ عملیات لغو شد.")
+                    return
+        except asyncio.TimeoutError:
+            await self.bot.send_message(user_id, "❌ زمان انتظار برای تایید به پایان رسید. عملیات لغو شد.")
+            return
+
+        msg = await self.bot.send_message(user_id, "🧹 در حال پاکسازی نشست‌ها و توقف عملیات‌ها...")
+        
+        # 1. Stop all active workers
+        stopped_workers = []
+        if self.active_workers:
+            LOGGER.info("Stopping all active workers before cleaning sessions.")
+            for worker_key, task in list(self.active_workers.items()):
+                task.cancel()
+                stopped_workers.append(worker_key.split(":", 1)[1])
+            self.active_workers.clear()
+            await asyncio.sleep(1) # Give tasks a moment to cancel
+
+        report = ["**📝 گزارش پاکسازی:**\n"]
+        if stopped_workers:
+            report.append(f"⏹️ **عملیات‌های متوقف شده:** {', '.join(f'`{name}`' for name in stopped_workers)}\n")
+
+        # 2. Clean session files and folders
+        deleted_files_count = 0
+        deleted_folders = []
+        
+        # Delete .session files from SESSIONS_DIR, keeping essential ones
+        if SESSIONS_DIR.exists():
+            for item in SESSIONS_DIR.iterdir():
+                if item.is_file() and item.name.endswith(".session") and item.name != 'bot_session.session':
+                    try:
+                        item.unlink()
+                        deleted_files_count += 1
+                        LOGGER.debug(f"Deleted session file: {item.name}")
+                    except OSError as e:
+                        LOGGER.error(f"Failed to delete file {item}: {e}")
+
+        report.append(f"🗑️ **فایل‌های نشست حذف شده:** {deleted_files_count} عدد\n")
+        LOGGER.info(f"Deleted {deleted_files_count} user session files.")
+
+        # Other folders to clean completely
+        folders_to_clean = ["selenium_sessions", "api_sessions", "telethon_sessions"]
+        for folder_name in folders_to_clean:
+            folder_path = Path(folder_name)
+            if folder_path.exists() and folder_path.is_dir():
+                try:
+                    shutil.rmtree(folder_path)
+                    deleted_folders.append(folder_name)
+                    LOGGER.info(f"Deleted folder: {folder_name}")
+                except OSError as e:
+                    LOGGER.error(f"Failed to delete folder {folder_path}: {e}")
+        
+        if deleted_folders:
+            report.append(f"📁 **پوشه‌های حذف شده:** {', '.join(f'`{name}`' for name in deleted_folders)}\n")
+            
+        report.append("\n✅ پاکسازی با موفقیت انجام شد.")
+        
+        await msg.edit(''.join(report))
+        raise events.StopPropagation
+
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
         await event.reply('📞 لطفا شماره تلفن حساب جدید را با فرمت بین‌المللی ارسال کنید (مثال: `+989123456789`).', buttons=Button.clear())
@@ -541,6 +613,8 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
             "/debug_proxies": self._debug_test_proxies_handler,
+            # ADDED: Route for the new clean sessions command
+            "/clean_sessions": self._clean_sessions_handler,
         }
         
         handler = route_map.get(text)

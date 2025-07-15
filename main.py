@@ -36,7 +36,8 @@ class Config:
     MIN_SLEEP_SECONDS = 60   # 1 minute
     MAX_SLEEP_SECONDS = 240  # 4 minutes
     GROUP_MEMBER_TO_ADD = '@BotFather'
-    PROXY_FILE = "proxy10"
+    # MODIFIED: Changed file name to proxy10.txt
+    PROXY_FILE = "proxy10.txt"
     PROXY_TIMEOUT = 2
 
     # --- UI Text & Buttons ---
@@ -130,7 +131,7 @@ class GroupCreatorBot:
                         })
                     except ValueError:
                         LOGGER.warning(f"Skipping malformed proxy line: {line}")
-            LOGGER.info(f"Loaded {len(proxy_list)} proxies.")
+            LOGGER.info(f"Loaded {len(proxy_list)} proxies from {Config.PROXY_FILE}.")
         except FileNotFoundError:
             LOGGER.warning(f"Proxy file '{Config.PROXY_FILE}' not found. Continuing without proxies.")
         return proxy_list
@@ -407,6 +408,7 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
+    # FIXED: This entire function has been updated to fix the TypeError
     async def _test_proxies_handler(self, event: events.NewMessage.Event) -> None:
         """Handles the proxy test command."""
         msg = await event.reply("🧪 **شروع تست پراکسی‌ها...**\n\nلطفا صبر کنید، این عملیات ممکن است کمی طول بکشد.")
@@ -414,14 +416,16 @@ class GroupCreatorBot:
         results = "📝 **نتایج تست پراکسی:**\n\n"
         
         if not self.proxies:
-            results += "⚠️ هیچ پراکسی‌ای در فایل `proxy10` یافت نشد.\n"
+            results += f"⚠️ هیچ پراکسی‌ای در فایل `{Config.PROXY_FILE}` یافت نشد.\n"
 
         for proxy in self.proxies:
             proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             client = None
             try:
+                # Randomly select device parameters for each test
+                device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
                 # Use a temporary in-memory session for testing
-                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT)
+                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
                 await client.connect()
                 if await client.is_connected():
                     results += f"✅ `{proxy_addr}`: **موفق**\n"
@@ -438,7 +442,9 @@ class GroupCreatorBot:
         results += "\n---\n**تست اتصال مستقیم (بدون پراکسی):**\n"
         client = None
         try:
-            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT)
+            # Randomly select device parameters for the direct test as well
+            device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
             if await client.is_connected():
                 results += "✅ **موفق**\n"

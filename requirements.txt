@@ -1,0 +1,5 @@
+telethon
+python-dotenv
+selenium
+undetected-chromedriver
+cryptography

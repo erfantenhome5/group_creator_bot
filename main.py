@@ -241,6 +241,8 @@ class GroupCreatorBot:
                 return client
             except Exception as e:
                 LOGGER.warning(f"Failed to connect with proxy {proxy_addr}: {e}")
+                if isinstance(e, errors.AuthKeyUnregisteredError):
+                    raise  # Re-raise the specific error to be handled by the caller
                 continue
 
         LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
@@ -259,6 +261,8 @@ class GroupCreatorBot:
             return client
         except Exception as e:
             LOGGER.error(f"Failed to connect without a proxy: {e}")
+            if isinstance(e, errors.AuthKeyUnregisteredError):
+                raise  # Re-raise the specific error to be handled by the caller
             return None
 
 
@@ -338,7 +342,6 @@ class GroupCreatorBot:
                         sleep_time = random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS)
                         await asyncio.sleep(sleep_time)
 
-                    # FIXED: Added specific handling for AuthKeyUnregisteredError
                     except errors.AuthKeyUnregisteredError:
                         LOGGER.error(f"Authentication key for account '{account_name}' is unregistered during worker execution. Deleting session.")
                         self._delete_session_file(user_id, account_name)
@@ -367,7 +370,8 @@ class GroupCreatorBot:
 
             if worker_key in self.active_workers:
                 del self.active_workers[worker_key]
-            if user_client.is_connected():
+            # FIXED: Ensure client is always disconnected gracefully
+            if user_client and user_client.is_connected():
                 await user_client.disconnect()
 
 
@@ -456,11 +460,10 @@ class GroupCreatorBot:
                 await client.connect()
                 if client.is_connected():
                     LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
-                else:
-                    LOGGER.warning(f"  ❌ FAILED (Connection Error): {proxy_addr}")
             except Exception as e:
                 LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): {proxy_addr} - {e}")
             finally:
+                # FIXED: Ensure client is always disconnected gracefully
                 if client and client.is_connected():
                     await client.disconnect()
 
@@ -480,11 +483,10 @@ class GroupCreatorBot:
             await client.connect()
             if client.is_connected():
                 LOGGER.info("  ✅ SUCCESS: Direct Connection")
-            else:
-                LOGGER.warning("  ❌ FAILED: Direct Connection")
         except Exception as e:
             LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): Direct Connection - {e}")
         finally:
+            # FIXED: Ensure client is always disconnected gracefully
             if client and client.is_connected():
                 await client.disconnect()
         
@@ -492,7 +494,6 @@ class GroupCreatorBot:
         await self.bot.send_message(event.sender_id, "🏁 Silent proxy test finished. Check system logs for results.")
         raise events.StopPropagation
 
-    # ADDED: New handler to clean session files
     async def _clean_sessions_handler(self, event: events.NewMessage.Event) -> None:
         """Stops all workers and cleans up all user session files and folders."""
         user_id = event.sender_id
@@ -511,7 +512,6 @@ class GroupCreatorBot:
 
         msg = await self.bot.send_message(user_id, "🧹 در حال پاکسازی نشست‌ها و توقف عملیات‌ها...")
         
-        # 1. Stop all active workers
         stopped_workers = []
         if self.active_workers:
             LOGGER.info("Stopping all active workers before cleaning sessions.")
@@ -519,17 +519,15 @@ class GroupCreatorBot:
                 task.cancel()
                 stopped_workers.append(worker_key.split(":", 1)[1])
             self.active_workers.clear()
-            await asyncio.sleep(1) # Give tasks a moment to cancel
+            await asyncio.sleep(1) 
 
         report = ["**📝 گزارش پاکسازی:**\n"]
         if stopped_workers:
             report.append(f"⏹️ **عملیات‌های متوقف شده:** {', '.join(f'`{name}`' for name in stopped_workers)}\n")
 
-        # 2. Clean session files and folders
         deleted_files_count = 0
         deleted_folders = []
         
-        # Delete .session files from SESSIONS_DIR, keeping essential ones
         if SESSIONS_DIR.exists():
             for item in SESSIONS_DIR.iterdir():
                 if item.is_file() and item.name.endswith(".session") and item.name != 'bot_session.session':
@@ -543,7 +541,6 @@ class GroupCreatorBot:
         report.append(f"🗑️ **فایل‌های نشست حذف شده:** {deleted_files_count} عدد\n")
         LOGGER.info(f"Deleted {deleted_files_count} user session files.")
 
-        # Other folders to clean completely
         folders_to_clean = ["selenium_sessions", "api_sessions", "telethon_sessions"]
         for folder_name in folders_to_clean:
             folder_path = Path(folder_name)
@@ -613,7 +610,6 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
             "/debug_proxies": self._debug_test_proxies_handler,
-            # ADDED: Route for the new clean sessions command
             "/clean_sessions": self._clean_sessions_handler,
         }
         
@@ -652,22 +648,24 @@ class GroupCreatorBot:
             return
 
         await event.reply(f'🚀 در حال آماده‌سازی برای شروع عملیات حساب `{account_name}`...')
-        user_client = await self._create_new_user_client(session_str)
         
-        if not user_client:
-            await event.reply(f'❌ اتصال به تلگرام برای حساب `{account_name}` با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد.')
-            return
-            
+        user_client = None
         try:
+            user_client = await self._create_new_user_client(session_str)
+            
+            if not user_client:
+                await event.reply(f'❌ اتصال به تلگرام برای حساب `{account_name}` با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد.')
+                return
+                
             if await user_client.is_user_authorized():
                 task = asyncio.create_task(self.run_group_creation_worker(user_id, account_name, user_client))
                 self.active_workers[worker_key] = task
                 await self._send_accounts_menu(event)
             else:
+                # This case might happen if the session is valid but the user has been logged out.
                 self._delete_session_file(user_id, account_name)
                 self._remove_group_count(worker_key)
                 await event.reply(f'⚠️ نشست برای حساب `{account_name}` منقضی شده و حذف شد. لطفا دوباره آن را اضافه کنید.')
-        # FIXED: Added specific handling for AuthKeyUnregisteredError
         except errors.AuthKeyUnregisteredError:
             LOGGER.error(f"Authentication key for account '{account_name}' is unregistered. Deleting session.")
             self._delete_session_file(user_id, account_name)
@@ -677,6 +675,11 @@ class GroupCreatorBot:
         except Exception as e:
             LOGGER.error(f"Failed to start process for {worker_key}", exc_info=e)
             await event.reply(f'❌ خطایی در اتصال به حساب `{account_name}` رخ داد.')
+        finally:
+            # FIXED: Ensure client is always disconnected gracefully if it was created but not passed to a worker
+            if user_client and not self.active_workers.get(worker_key):
+                if user_client.is_connected():
+                    await user_client.disconnect()
 
     async def _cancel_worker_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
         user_id = event.sender_id
@@ -719,13 +722,14 @@ class GroupCreatorBot:
         user_id = event.sender_id
         self.user_sessions[user_id]['phone'] = event.text.strip()
         
-        user_client = await self._create_new_user_client()
-        if not user_client:
-            await event.reply('❌ اتصال به تلگرام با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد. لطفا بعدا تلاش کنید.')
-            return
-            
-        self.user_sessions[user_id]['client'] = user_client
+        user_client = None
         try:
+            user_client = await self._create_new_user_client()
+            if not user_client:
+                await event.reply('❌ اتصال به تلگرام با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد. لطفا بعدا تلاش کنید.')
+                return
+                
+            self.user_sessions[user_id]['client'] = user_client
             sent_code = await user_client.send_code_request(self.user_sessions[user_id]['phone'])
             self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
             self.user_sessions[user_id]['state'] = 'awaiting_code'
@@ -737,6 +741,11 @@ class GroupCreatorBot:
                 '❌ **خطا:** شماره تلفن نامعتبر است یا مشکلی در ارسال کد رخ داد. لطفا دوباره با فرمت بین‌المللی (+کد کشور) تلاش کنید یا عملیات را لغو کنید.',
                 buttons=[[Button.text(Config.BTN_BACK)]]
             )
+        finally:
+            # FIXED: Ensure client is always disconnected gracefully if not passed to the next stage
+            if user_client and self.user_sessions.get(user_id, {}).get('state') != 'awaiting_code':
+                 if user_client.is_connected():
+                    await user_client.disconnect()
 
     async def _handle_code_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id

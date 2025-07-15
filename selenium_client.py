@@ -21,9 +21,7 @@ class SeleniumClient:
         options = uc.ChromeOptions()
         user_data_dir = Path.cwd() / "selenium_sessions" / self.account_name
         
-        # --- FIX: Enable Headless Mode for Server ---
         options.add_argument('--headless=new')
-        
         options.add_argument(f"--user-data-dir={user_data_dir}")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -38,7 +36,6 @@ class SeleniumClient:
         """Checks if the user is logged in."""
         try:
             self.driver.get("https://web.telegram.org/a/")
-            # NOTE: This ID is subject to change if Telegram updates its web UI.
             WebDriverWait(self.driver, 25).until(
                 EC.presence_of_element_located((By.ID, "telegram-search-input"))
             )
@@ -46,35 +43,35 @@ class SeleniumClient:
         except TimeoutException:
             return False
 
-    async def login(self, phone: str, get_code_callback, get_password_callback):
-        """Guides the user through the login process."""
+    # --- FIX: Changed from async def to def ---
+    def login(self, phone: str, code: str, password: Optional[str] = None) -> bool:
+        """Guides the user through the login process. This is a blocking (synchronous) method."""
         self.driver.get("https://web.telegram.org/a/")
         try:
-            # NOTE: These XPaths are brittle and may break with UI updates.
             phone_input = WebDriverWait(self.driver, 20).until(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'input-field-input') and @inputmode='tel']"))
             )
-            await asyncio.sleep(1)
+            time.sleep(1) # Use time.sleep instead of asyncio.sleep
             phone_input.send_keys(phone)
             
             next_button = self.driver.find_element(By.XPATH, "//button[contains(., 'Next')]")
             next_button.click()
 
-            code = await get_code_callback()
             code_input = WebDriverWait(self.driver, 20).until(
                 EC.presence_of_element_located((By.XPATH, "//input[@inputmode='numeric']"))
             )
             code_input.send_keys(code)
             
-            try:
-                password_input = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((By.XPATH, "//input[@type='password']"))
-                )
-                password = await get_password_callback()
-                password_input.send_keys(password)
-            except TimeoutException:
-                pass 
-
+            if password:
+                try:
+                    password_input = WebDriverWait(self.driver, 5).until(
+                        EC.presence_of_element_located((By.XPATH, "//input[@type='password']"))
+                    )
+                    password_input.send_keys(password)
+                except TimeoutException:
+                    print("Password field was expected but not found.")
+                    return False
+            
             WebDriverWait(self.driver, 30).until(
                 EC.presence_of_element_located((By.ID, "telegram-search-input"))
             )
@@ -86,7 +83,6 @@ class SeleniumClient:
     def create_group(self, group_name: str, member_username: str) -> bool:
         """Creates a new group with a given name and initial member."""
         try:
-            # NOTE: These CSS selectors and XPaths are brittle and may break with UI updates.
             new_chat_button = WebDriverWait(self.driver, 20).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button.floating-button"))
             )

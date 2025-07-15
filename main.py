@@ -104,6 +104,10 @@ class GroupCreatorBot:
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
         self.proxies = self._load_proxies()
+        # ADDED: Logic for assigning proxies to accounts
+        self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
+        self.account_proxies = self._load_account_proxies()
+        self.last_proxy_index = 0
         try:
             self.fernet = Fernet(ENCRYPTION_KEY.encode())
         except (ValueError, TypeError):
@@ -120,7 +124,6 @@ class GroupCreatorBot:
                     if not line:
                         continue
                     try:
-                        # Handle proxies with format ip:port for HTTP proxies without auth
                         ip, port = line.split(':', 1)
                         proxy_list.append({
                             'proxy_type': 'http',
@@ -133,6 +136,34 @@ class GroupCreatorBot:
         except FileNotFoundError:
             LOGGER.warning(f"Proxy file '{Config.PROXY_FILE}' not found. Continuing without proxies.")
         return proxy_list
+    
+    # ADDED: Methods to manage proxy assignments
+    def _load_account_proxies(self) -> Dict[str, Dict]:
+        """Loads the account-to-proxy assignments from a JSON file."""
+        if not self.account_proxy_file.exists():
+            return {}
+        try:
+            with self.account_proxy_file.open("r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            LOGGER.error("Could not read or parse account_proxies.json. Starting with empty assignments.")
+            return {}
+
+    def _save_account_proxies(self) -> None:
+        """Saves the current account-to-proxy assignments to a JSON file."""
+        try:
+            with self.account_proxy_file.open("w") as f:
+                json.dump(self.account_proxies, f, indent=4)
+        except IOError:
+            LOGGER.error("Could not save account_proxies.json.")
+
+    def _get_next_proxy(self) -> Optional[Dict]:
+        """Gets the next proxy from the list in a round-robin fashion."""
+        if not self.proxies:
+            return None
+        proxy = self.proxies[self.last_proxy_index]
+        self.last_proxy_index = (self.last_proxy_index + 1) % len(self.proxies)
+        return proxy
 
     # --- Group Count Helpers ---
     def _load_group_counts(self) -> Dict[str, int]:
@@ -214,57 +245,59 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
         return False
 
-    async def _create_new_user_client(self, session_string: Optional[str] = None) -> Optional[TelegramClient]:
-        """Tries to connect with a proxy, falls back to no proxy."""
-        session = StringSession(session_string) if session_string else StringSession()
+    # MODIFIED: Renamed to reflect its use for temporary login clients
+    async def _create_login_client(self) -> Optional[TelegramClient]:
+        """Creates a temporary client for the login flow, trying a random proxy."""
+        session = StringSession()
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
 
-        # Shuffle proxies to not always try in the same order
-        shuffled_proxies = self.proxies.copy()
-        random.shuffle(shuffled_proxies)
-
-        for proxy in shuffled_proxies:
+        if self.proxies:
+            proxy = random.choice(self.proxies)
             proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             try:
-                LOGGER.debug(f"Attempting to connect with proxy: {proxy_addr}")
-                client = TelegramClient(
-                    session,
-                    API_ID,
-                    API_HASH,
-                    proxy=proxy,
-                    timeout=Config.PROXY_TIMEOUT,
-                    device_model=device_params['device_model'],
-                    system_version=device_params['system_version']
-                )
+                LOGGER.debug(f"Attempting login connection with random proxy: {proxy_addr}")
+                client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
                 await client.connect()
-                LOGGER.info(f"Successfully connected using proxy: {proxy_addr}")
                 return client
             except Exception as e:
-                LOGGER.warning(f"Failed to connect with proxy {proxy_addr}: {e}")
-                if isinstance(e, errors.AuthKeyUnregisteredError):
-                    raise  # Re-raise the specific error to be handled by the caller
-                continue
-
-        LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
+                LOGGER.warning(f"Random proxy {proxy_addr} failed for login: {e}")
+        
+        LOGGER.warning("Login connection falling back to no proxy.")
         try:
-            LOGGER.debug("Attempting to connect without a proxy.")
-            client = TelegramClient(
-                session,
-                API_ID,
-                API_HASH,
-                timeout=Config.PROXY_TIMEOUT,
-                device_model=device_params['device_model'],
-                system_version=device_params['system_version']
-            )
+            client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
-            LOGGER.info("Successfully connected without a proxy.")
             return client
         except Exception as e:
-            LOGGER.error(f"Failed to connect without a proxy: {e}")
-            if isinstance(e, errors.AuthKeyUnregisteredError):
-                raise  # Re-raise the specific error to be handled by the caller
+            LOGGER.error(f"Failed to connect without proxy for login: {e}")
             return None
 
+    # ADDED: New method to create clients with their assigned proxy
+    async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
+        """Creates a client for a worker, using its assigned proxy."""
+        session = StringSession(session_string)
+        device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+        
+        client = TelegramClient(
+            session,
+            API_ID,
+            API_HASH,
+            proxy=proxy,
+            timeout=Config.PROXY_TIMEOUT,
+            device_model=device_params['device_model'],
+            system_version=device_params['system_version']
+        )
+        
+        try:
+            proxy_info = f"proxy {proxy['addr']}:{proxy['port']}" if proxy else "no proxy"
+            LOGGER.debug(f"Attempting worker connection with {proxy_info}")
+            await client.connect()
+            LOGGER.info(f"Worker successfully connected with {proxy_info}")
+            return client
+        except Exception as e:
+            LOGGER.error(f"Worker connection failed with {proxy_info}: {e}")
+            if isinstance(e, errors.AuthKeyUnregisteredError):
+                raise  # Re-raise to be handled by the caller
+            return None
 
     # --- Dynamic UI Builder ---
     def _build_main_menu(self) -> List[List[Button]]:
@@ -370,7 +403,6 @@ class GroupCreatorBot:
 
             if worker_key in self.active_workers:
                 del self.active_workers[worker_key]
-            # FIXED: Ensure client is always disconnected gracefully
             if user_client and user_client.is_connected():
                 await user_client.disconnect()
 
@@ -378,7 +410,19 @@ class GroupCreatorBot:
     async def on_login_success(self, event: events.NewMessage.Event, user_client: TelegramClient) -> None:
         user_id = event.sender_id
         account_name = self.user_sessions[user_id]['account_name']
+        worker_key = f"{user_id}:{account_name}"
+        
         self._save_session_string(user_id, account_name, user_client.session.save())
+
+        # ADDED: Assign a proxy to the new account
+        assigned_proxy = self._get_next_proxy()
+        if assigned_proxy:
+            self.account_proxies[worker_key] = assigned_proxy
+            self._save_account_proxies()
+            proxy_addr = f"{assigned_proxy['addr']}:{assigned_proxy['port']}"
+            LOGGER.info(f"Assigned proxy {proxy_addr} to account '{account_name}'.")
+        else:
+            LOGGER.warning(f"No proxies available to assign to account '{account_name}'. It will run without a proxy.")
 
         if 'client' in self.user_sessions[user_id]:
             del self.user_sessions[user_id]['client']
@@ -417,7 +461,9 @@ class GroupCreatorBot:
             status_text += "\n**حساب‌های در حال کار:**\n"
             for worker_key in self.active_workers.keys():
                 _, acc_name = worker_key.split(":", 1)
-                status_text += f"- `{acc_name}`\n"
+                proxy_info = self.account_proxies.get(worker_key)
+                proxy_str = f" (Proxy: {proxy_info['addr']})" if proxy_info else ""
+                status_text += f"- `{acc_name}`{proxy_str}\n"
         else:
             status_text += "\nℹ️ در حال حاضر هیچ حسابی مشغول به کار نیست."
 
@@ -448,22 +494,13 @@ class GroupCreatorBot:
                 
                 LOGGER.debug(f"Testing proxy: {proxy} with device: {device_params}")
                 
-                client = TelegramClient(
-                    StringSession(), 
-                    API_ID, 
-                    API_HASH, 
-                    proxy=proxy, 
-                    timeout=Config.PROXY_TIMEOUT,
-                    device_model=device_params['device_model'],
-                    system_version=device_params['system_version']
-                )
+                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
                 await client.connect()
                 if client.is_connected():
                     LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
             except Exception as e:
                 LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): {proxy_addr} - {e}")
             finally:
-                # FIXED: Ensure client is always disconnected gracefully
                 if client and client.is_connected():
                     await client.disconnect()
 
@@ -472,21 +509,13 @@ class GroupCreatorBot:
         try:
             device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
             LOGGER.debug(f"Testing direct connection with device: {device_params}")
-            client = TelegramClient(
-                StringSession(), 
-                API_ID, 
-                API_HASH, 
-                timeout=Config.PROXY_TIMEOUT,
-                device_model=device_params['device_model'],
-                system_version=device_params['system_version']
-            )
+            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
             if client.is_connected():
                 LOGGER.info("  ✅ SUCCESS: Direct Connection")
         except Exception as e:
             LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): Direct Connection - {e}")
         finally:
-            # FIXED: Ensure client is always disconnected gracefully
             if client and client.is_connected():
                 await client.disconnect()
         
@@ -501,7 +530,7 @@ class GroupCreatorBot:
 
         try:
             async with self.bot.conversation(user_id, timeout=30) as conv:
-                await conv.send_message("⚠️ **هشدار:** این عملیات تمام نشست‌های کاربری را حذف کرده و تمام عملیات‌های در حال اجرا را متوقف می‌کند. لطفاً با ارسال `confirm` در 30 ثانیه آینده تایید کنید.")
+                await conv.send_message("⚠️ **هشدار:** این عملیات تمام نشست‌های کاربری، شمارنده‌ها و تخصیص پراکسی‌ها را حذف کرده و تمام عملیات‌های در حال اجرا را متوقف می‌کند. لطفاً با ارسال `confirm` در 30 ثانیه آینده تایید کنید.")
                 response = await conv.get_response()
                 if response.text.lower() != 'confirm':
                     await conv.send_message("❌ عملیات لغو شد.")
@@ -526,20 +555,25 @@ class GroupCreatorBot:
             report.append(f"⏹️ **عملیات‌های متوقف شده:** {', '.join(f'`{name}`' for name in stopped_workers)}\n")
 
         deleted_files_count = 0
-        deleted_folders = []
         
+        # MODIFIED: Clean all files in the sessions directory except the bot's own session
         if SESSIONS_DIR.exists():
             for item in SESSIONS_DIR.iterdir():
-                if item.is_file() and item.name.endswith(".session") and item.name != 'bot_session.session':
+                if item.name != 'bot_session.session':
                     try:
-                        item.unlink()
-                        deleted_files_count += 1
-                        LOGGER.debug(f"Deleted session file: {item.name}")
+                        if item.is_file():
+                            item.unlink()
+                            deleted_files_count += 1
+                            LOGGER.debug(f"Deleted file: {item.name}")
                     except OSError as e:
                         LOGGER.error(f"Failed to delete file {item}: {e}")
+        
+        # Reset in-memory stores
+        self.group_counts.clear()
+        self.account_proxies.clear()
 
-        report.append(f"🗑️ **فایل‌های نشست حذف شده:** {deleted_files_count} عدد\n")
-        LOGGER.info(f"Deleted {deleted_files_count} user session files.")
+        report.append(f"🗑️ **فایل‌های داده حذف شده:** {deleted_files_count} عدد\n")
+        LOGGER.info(f"Deleted {deleted_files_count} data files from {SESSIONS_DIR}.")
 
         folders_to_clean = ["selenium_sessions", "api_sessions", "telethon_sessions"]
         for folder_name in folders_to_clean:
@@ -547,13 +581,10 @@ class GroupCreatorBot:
             if folder_path.exists() and folder_path.is_dir():
                 try:
                     shutil.rmtree(folder_path)
-                    deleted_folders.append(folder_name)
+                    report.append(f"📁 **پوشه `{folder_name}` حذف شد.**\n")
                     LOGGER.info(f"Deleted folder: {folder_name}")
                 except OSError as e:
                     LOGGER.error(f"Failed to delete folder {folder_path}: {e}")
-        
-        if deleted_folders:
-            report.append(f"📁 **پوشه‌های حذف شده:** {', '.join(f'`{name}`' for name in deleted_folders)}\n")
             
         report.append("\n✅ پاکسازی با موفقیت انجام شد.")
         
@@ -651,10 +682,12 @@ class GroupCreatorBot:
         
         user_client = None
         try:
-            user_client = await self._create_new_user_client(session_str)
+            # MODIFIED: Use the assigned proxy for the account
+            assigned_proxy = self.account_proxies.get(worker_key)
+            user_client = await self._create_worker_client(session_str, assigned_proxy)
             
             if not user_client:
-                await event.reply(f'❌ اتصال به تلگرام برای حساب `{account_name}` با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد.')
+                await event.reply(f'❌ اتصال به تلگرام برای حساب `{account_name}` با استفاده از پراکسی اختصاصی‌اش با شکست مواجه شد.')
                 return
                 
             if await user_client.is_user_authorized():
@@ -662,7 +695,6 @@ class GroupCreatorBot:
                 self.active_workers[worker_key] = task
                 await self._send_accounts_menu(event)
             else:
-                # This case might happen if the session is valid but the user has been logged out.
                 self._delete_session_file(user_id, account_name)
                 self._remove_group_count(worker_key)
                 await event.reply(f'⚠️ نشست برای حساب `{account_name}` منقضی شده و حذف شد. لطفا دوباره آن را اضافه کنید.')
@@ -676,7 +708,6 @@ class GroupCreatorBot:
             LOGGER.error(f"Failed to start process for {worker_key}", exc_info=e)
             await event.reply(f'❌ خطایی در اتصال به حساب `{account_name}` رخ داد.')
         finally:
-            # FIXED: Ensure client is always disconnected gracefully if it was created but not passed to a worker
             if user_client and not self.active_workers.get(worker_key):
                 if user_client.is_connected():
                     await user_client.disconnect()
@@ -702,6 +733,10 @@ class GroupCreatorBot:
 
         if self._delete_session_file(user_id, account_name):
             self._remove_group_count(worker_key)
+            # ADDED: Remove proxy assignment on deletion
+            if worker_key in self.account_proxies:
+                del self.account_proxies[worker_key]
+                self._save_account_proxies()
             await event.reply(f"✅ حساب `{account_name}` با موفقیت حذف شد و عملیات مرتبط متوقف گردید.")
         else:
             await event.reply(f"✅ عملیات برای حساب `{account_name}` متوقف شد (نشست از قبل وجود نداشت).")
@@ -724,7 +759,8 @@ class GroupCreatorBot:
         
         user_client = None
         try:
-            user_client = await self._create_new_user_client()
+            # MODIFIED: Use the dedicated login client creator
+            user_client = await self._create_login_client()
             if not user_client:
                 await event.reply('❌ اتصال به تلگرام با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد. لطفا بعدا تلاش کنید.')
                 return
@@ -742,7 +778,6 @@ class GroupCreatorBot:
                 buttons=[[Button.text(Config.BTN_BACK)]]
             )
         finally:
-            # FIXED: Ensure client is always disconnected gracefully if not passed to the next stage
             if user_client and self.user_sessions.get(user_id, {}).get('state') != 'awaiting_code':
                  if user_client.is_connected():
                     await user_client.disconnect()

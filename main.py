@@ -286,15 +286,17 @@ class GroupCreatorBot:
             async with self.sessions_lock:
                 client = self.user_sessions[user_id]['client']
                 phone = self.user_sessions[user_id]['phone']
-                phone_code_hash = self.user_sessions[user_id]['phone_code_hash']
+                phone_code_hash = self.user_sessions[user_id].get('phone_code_hash')
+                account_name = self.user_sessions[user_id].get('account_name')
             try:
-                # Attempt to sign in with the provided code
                 await client.sign_in(phone, text.strip(), phone_code_hash=phone_code_hash)
-                # If successful, finalize the login
                 await self._finalize_login(event)
+            except errors.PhoneCodeExpiredError:
+                await event.reply("❌ کد ورود منقضی شده است. لطفا فرآیند افزودن حساب را از ابتدا شروع کنید.")
+                if account_name:
+                    self._delete_account(account_name)
+                await self._send_accounts_menu(event)
             except errors.SessionPasswordNeededError:
-                # This is the crucial part for 2FA.
-                # The library correctly identifies that a password is now needed.
                 async with self.sessions_lock:
                     self.user_sessions[user_id]['sub_state'] = 'awaiting_password'
                 LOGGER.info(f"Account {phone} requires 2FA password. Prompting user.")
@@ -303,16 +305,12 @@ class GroupCreatorBot:
                 await event.reply(f"❌ کد نامعتبر است: {e}. لطفا دوباره تلاش کنید.")
 
         elif state == 'awaiting_password':
-            # This state is entered only after the SessionPasswordNeededError was caught.
             async with self.sessions_lock:
                 client = self.user_sessions[user_id]['client']
             try:
-                # Attempt to sign in with the provided 2FA password.
                 await client.sign_in(password=text.strip())
-                # If the password is correct, finalize the login.
                 await self._finalize_login(event)
             except Exception as e:
-                # This will catch errors like a wrong password.
                 await event.reply(f"❌ رمز عبور اشتباه است یا خطای دیگری رخ داد: {e}. لطفا دوباره تلاش کنید.")
 
     async def _finalize_login(self, event):

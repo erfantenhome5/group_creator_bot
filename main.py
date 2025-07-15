@@ -33,9 +33,11 @@ class Config:
     MASTER_PASSWORD = "3935Eerfan@123"
     MAX_CONCURRENT_WORKERS = 5
     GROUPS_TO_CREATE = 50
-    MIN_SLEEP_SECONDS = 100  # 1.6 minutes
+    MIN_SLEEP_SECONDS = 60   # 1 minute
     MAX_SLEEP_SECONDS = 240  # 4 minutes
     GROUP_MEMBER_TO_ADD = '@BotFather'
+    PROXY_FILE = "Webshare 10 proxies (1).txt"
+    PROXY_TIMEOUT = 2
 
     # --- UI Text & Buttons ---
     # Main Menu
@@ -100,10 +102,37 @@ class GroupCreatorBot:
         self.worker_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_WORKERS)
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
+        self.proxies = self._load_proxies()
         try:
             self.fernet = Fernet(ENCRYPTION_KEY.encode())
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
+
+    # --- Proxy Helpers ---
+    def _load_proxies(self) -> List[Dict]:
+        """Loads proxies from the specified file."""
+        proxy_list = []
+        try:
+            with open(Config.PROXY_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ip, port, user, pw = line.split(':')
+                        proxy_list.append({
+                            'proxy_type': 'http',
+                            'addr': ip,
+                            'port': int(port),
+                            'username': user,
+                            'password': pw
+                        })
+                    except ValueError:
+                        LOGGER.warning(f"Skipping malformed proxy line: {line}")
+            LOGGER.info(f"Loaded {len(proxy_list)} proxies.")
+        except FileNotFoundError:
+            LOGGER.warning(f"Proxy file '{Config.PROXY_FILE}' not found. Continuing without proxies.")
+        return proxy_list
 
     # --- Group Count Helpers ---
     def _load_group_counts(self) -> Dict[str, int]:
@@ -185,10 +214,36 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
         return False
 
-    def _create_new_user_client(self, session_string: Optional[str] = None) -> TelegramClient:
+    async def _create_new_user_client(self, session_string: Optional[str] = None) -> Optional[TelegramClient]:
+        """Tries to connect with a proxy, falls back to no proxy."""
         session = StringSession(session_string) if session_string else StringSession()
-        device_params = [{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}]
-        return TelegramClient(session, API_ID, API_HASH, **random.choice(device_params))
+        device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+
+        # Shuffle proxies to not always try in the same order
+        shuffled_proxies = self.proxies.copy()
+        random.shuffle(shuffled_proxies)
+
+        for proxy in shuffled_proxies:
+            try:
+                LOGGER.info(f"Attempting to connect with proxy: {proxy['addr']}")
+                client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
+                await client.connect()
+                LOGGER.info(f"Successfully connected using proxy: {proxy['addr']}")
+                return client
+            except Exception as e:
+                LOGGER.warning(f"Failed to connect with proxy {proxy['addr']}: {e}")
+                continue
+
+        LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
+        try:
+            client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
+            await client.connect()
+            LOGGER.info("Successfully connected without a proxy.")
+            return client
+        except Exception as e:
+            LOGGER.error(f"Failed to connect without a proxy: {e}")
+            return None
+
 
     # --- Dynamic UI Builder ---
     def _build_main_menu(self) -> List[List[Button]]:
@@ -227,6 +282,7 @@ class GroupCreatorBot:
             async with self.worker_semaphore:
                 LOGGER.info(f"Worker started for {worker_key}. Semaphore acquired.")
 
+                # Calculate and inform the user about the estimated time
                 avg_sleep = (Config.MIN_SLEEP_SECONDS + Config.MAX_SLEEP_SECONDS) / 2
                 estimated_total_minutes = (Config.GROUPS_TO_CREATE * avg_sleep) / 60
                 
@@ -235,6 +291,7 @@ class GroupCreatorBot:
                 await self.bot.send_message(user_id, f"✅ **عملیات برای حساب `{account_name}` آغاز شد!**\n\n⏳ تخمین زمان کل عملیات: حدود {estimated_total_minutes:.0f} دقیقه.")
 
                 for i in range(Config.GROUPS_TO_CREATE):
+                    # Create a group, then wait
                     current_semester += 1
                     group_title = f"collage Semester {current_semester}"
                     try:
@@ -253,27 +310,21 @@ class GroupCreatorBot:
 
                         # If successful, save the new count
                         self._set_group_count(worker_key, current_semester)
-                        group_id = chat.id
-                        invite_link = ""
-                        try:
-                            invite = await user_client(ExportChatInviteRequest(group_id))
-                            invite_link = invite.link
-                        except Exception as e:
-                            LOGGER.warning(f"Could not export invite link for group {group_id}: {e}")
-                            invite_link = "لینک دعوت قابل ساخت نبود."
-
+                        
                         groups_made = i + 1
                         groups_remaining = Config.GROUPS_TO_CREATE - groups_made
                         time_remaining_minutes = (groups_remaining * avg_sleep) / 60
 
+                        # Updated progress message without the invite link
                         progress_message = (
                             f"📊 [{account_name}] گروه '{group_title}' ساخته شد. ({groups_made}/{Config.GROUPS_TO_CREATE})\n"
-                            f"🔗 لینک دعوت: {invite_link}\n"
                             f"⏳ زمان تقریبی باقی‌مانده: {time_remaining_minutes:.0f} دقیقه."
                         )
                         await self.bot.send_message(user_id, progress_message)
 
-                        await asyncio.sleep(random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS))
+                        # Wait for a random time between 1 and 4 minutes AFTER creating the group
+                        sleep_time = random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS)
+                        await asyncio.sleep(sleep_time)
 
                     except errors.UserRestrictedError:
                         LOGGER.error(f"Worker for {worker_key} failed: User is restricted.")
@@ -438,9 +489,13 @@ class GroupCreatorBot:
             return
 
         await event.reply(f'🚀 در حال آماده‌سازی برای شروع عملیات حساب `{account_name}`...')
-        user_client = self._create_new_user_client(session_str)
+        user_client = await self._create_new_user_client(session_str)
+        
+        if not user_client:
+            await event.reply(f'❌ اتصال به تلگرام برای حساب `{account_name}` با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد.')
+            return
+            
         try:
-            await user_client.connect()
             if await user_client.is_user_authorized():
                 task = asyncio.create_task(self.run_group_creation_worker(user_id, account_name, user_client))
                 self.active_workers[worker_key] = task
@@ -493,10 +548,14 @@ class GroupCreatorBot:
     async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         self.user_sessions[user_id]['phone'] = event.text.strip()
-        user_client = self._create_new_user_client()
+        
+        user_client = await self._create_new_user_client()
+        if not user_client:
+            await event.reply('❌ اتصال به تلگرام با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد. لطفا بعدا تلاش کنید.')
+            return
+            
         self.user_sessions[user_id]['client'] = user_client
         try:
-            await user_client.connect()
             sent_code = await user_client.send_code_request(self.user_sessions[user_id]['phone'])
             self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
             self.user_sessions[user_id]['state'] = 'awaiting_code'

@@ -3,3 +3,4 @@ python-dotenv
 selenium
 undetected-chromedriver
 cryptography
+python-dotenv

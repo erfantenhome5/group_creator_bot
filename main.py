@@ -38,7 +38,7 @@ class Config:
     MAX_SLEEP_SECONDS = 240  # 4 minutes
     GROUP_MEMBER_TO_ADD = '@BotFather'
     PROXY_FILE = "proxy10.txt"
-    PROXY_TIMEOUT = 2
+    PROXY_TIMEOUT = 5 # Increased timeout for better reliability
 
     # --- UI Text & Buttons ---
     # Main Menu
@@ -227,7 +227,15 @@ class GroupCreatorBot:
             proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             try:
                 LOGGER.debug(f"Attempting to connect with proxy: {proxy_addr}")
-                client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
+                client = TelegramClient(
+                    session,
+                    API_ID,
+                    API_HASH,
+                    proxy=proxy,
+                    timeout=Config.PROXY_TIMEOUT,
+                    device_model=device_params['device_model'],
+                    system_version=device_params['system_version']
+                )
                 await client.connect()
                 LOGGER.info(f"Successfully connected using proxy: {proxy_addr}")
                 return client
@@ -238,7 +246,14 @@ class GroupCreatorBot:
         LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
         try:
             LOGGER.debug("Attempting to connect without a proxy.")
-            client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
+            client = TelegramClient(
+                session,
+                API_ID,
+                API_HASH,
+                timeout=Config.PROXY_TIMEOUT,
+                device_model=device_params['device_model'],
+                system_version=device_params['system_version']
+            )
             await client.connect()
             LOGGER.info("Successfully connected without a proxy.")
             return client
@@ -407,14 +422,17 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
-    # ADDED: Hidden command to test proxies and log results to debug
+    # MODIFIED: This entire function is updated to fix the TypeError and add more logging.
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
         """Runs a silent proxy test, logging results to debug."""
         LOGGER.info(f"User {event.sender_id} initiated a silent proxy test.")
         
         if not self.proxies:
             LOGGER.debug("Proxy test: No proxies found in the file.")
+            await self.bot.send_message(event.sender_id, "⚠️ No proxies found in file to test.")
             return
+        
+        await self.bot.send_message(event.sender_id, "🧪 Starting silent proxy test... Results will be in the system logs.")
 
         LOGGER.debug("--- Starting Proxy Test ---")
         for proxy in self.proxies:
@@ -422,15 +440,28 @@ class GroupCreatorBot:
             client = None
             try:
                 device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
-                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
+                
+                LOGGER.debug(f"Testing proxy: {proxy} with device: {device_params}")
+                
+                client = TelegramClient(
+                    StringSession(), 
+                    API_ID, 
+                    API_HASH, 
+                    proxy=proxy, 
+                    timeout=Config.PROXY_TIMEOUT,
+                    device_model=device_params['device_model'],
+                    system_version=device_params['system_version']
+                )
                 await client.connect()
                 if await client.is_connected():
-                    LOGGER.debug(f"  ✅ SUCCESS: {proxy_addr}")
+                    LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
                 else:
-                    LOGGER.debug(f"  ❌ FAILED (Connection Error): {proxy_addr}")
+                    # This case is unlikely as connect() would raise an error, but included for completeness.
+                    LOGGER.warning(f"  ❌ FAILED (Connection Error): {proxy_addr}")
+            except TypeError as e:
+                LOGGER.error(f"  ❌ FAILED (TypeError): {proxy_addr} - {e}", exc_info=True)
             except Exception as e:
-                error_type = type(e).__name__
-                LOGGER.debug(f"  ❌ FAILED ({error_type}): {proxy_addr}")
+                LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): {proxy_addr} - {e}")
             finally:
                 if client and client.is_connected():
                     await client.disconnect()
@@ -439,20 +470,30 @@ class GroupCreatorBot:
         client = None
         try:
             device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
-            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
+            LOGGER.debug(f"Testing direct connection with device: {device_params}")
+            client = TelegramClient(
+                StringSession(), 
+                API_ID, 
+                API_HASH, 
+                timeout=Config.PROXY_TIMEOUT,
+                device_model=device_params['device_model'],
+                system_version=device_params['system_version']
+            )
             await client.connect()
             if await client.is_connected():
-                LOGGER.debug("  ✅ SUCCESS: Direct Connection")
+                LOGGER.info("  ✅ SUCCESS: Direct Connection")
             else:
-                LOGGER.debug("  ❌ FAILED: Direct Connection")
+                LOGGER.warning("  ❌ FAILED: Direct Connection")
+        except TypeError as e:
+            LOGGER.error(f"  ❌ FAILED (TypeError): Direct Connection - {e}", exc_info=True)
         except Exception as e:
-            error_type = type(e).__name__
-            LOGGER.debug(f"  ❌ FAILED ({error_type}): Direct Connection")
+            LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): Direct Connection - {e}")
         finally:
             if client and client.is_connected():
                 await client.disconnect()
+        
         LOGGER.info("Silent proxy test finished.")
-        # Do not send any message back to the user.
+        await self.bot.send_message(event.sender_id, "🏁 Silent proxy test finished. Check system logs for results.")
         raise events.StopPropagation
 
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:

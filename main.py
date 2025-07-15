@@ -1,0 +1,437 @@
+import asyncio
+import logging
+import os
+import re
+import shutil
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from cryptography.fernet import Fernet, InvalidToken
+from dotenv import load_dotenv
+from telethon import Button, TelegramClient, errors, events
+from telethon.sessions import StringSession
+from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest
+from telethon.tl.types import Message
+
+# Import Selenium client only if the file exists
+try:
+    from selenium_client import SeleniumClient
+    SELENIUM_ENABLED = True
+except ImportError:
+    SELENIUM_ENABLED = False
+    print("WARNING: selenium_client.py not found. Selenium method will be disabled.")
+
+
+# --- Basic Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot_activity.log"),
+        logging.StreamHandler()
+    ]
+)
+LOGGER = logging.getLogger(__name__)
+
+# --- Centralized Configuration ---
+class Config:
+    MASTER_PASSWORD = "3935Eerfan@123"
+    MAX_CONCURRENT_API_WORKERS = 5
+    MAX_CONCURRENT_SELENIUM_WORKERS = 1
+    GROUPS_TO_CREATE = 50
+    SLEEP_SECONDS = 240
+    GROUP_NAME_BASE = "collage Semester"
+    GROUP_MEMBER_TO_ADD = '@BotFather'
+    PROXIES = []
+
+    BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
+    BTN_ADD_ACCOUNT = "➕ افزودن حساب جدید"
+    BTN_BACK = "⬅️ بازگشت"
+    BTN_START_PREFIX = "🟢 شروع برای"
+    BTN_STOP_PREFIX = "⏹️ توقف برای"
+    BTN_DELETE_PREFIX = "🗑️ حذف"
+    
+    METHOD_API = "🚀 API (سریع و سبک)"
+    METHOD_SELENIUM = "🛡️ Selenium (امن و کند)"
+    
+    MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
+    MSG_ACCOUNT_MENU_HEADER = "👤 **مدیریت حساب‌ها**\n\nاز این منو می‌توانید حساب‌های خود را مدیریت کرده و عملیات ساخت گروه را برای هرکدام آغاز یا متوقف کنید."
+    MSG_PROMPT_MASTER_PASSWORD = "🔑 لطفا برای دسترسی به ربات، رمز عبور اصلی را وارد کنید:"
+    MSG_INCORRECT_MASTER_PASSWORD = "❌ رمز عبور اشتباه است. لطفا دوباره تلاش کنید."
+
+# --- Environment & Paths ---
+load_dotenv()
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+
+if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
+    raise ValueError("Missing required environment variables.")
+
+API_ID = int(API_ID)
+TELETHON_SESSIONS_DIR = Path("telethon_sessions")
+SELENIUM_SESSIONS_DIR = Path("selenium_sessions")
+TELETHON_SESSIONS_DIR.mkdir(exist_ok=True)
+SELENIUM_SESSIONS_DIR.mkdir(exist_ok=True)
+
+class GroupCreatorBot:
+    def __init__(self) -> None:
+        self.bot = TelegramClient('bot_session', API_ID, API_HASH)
+        self.user_sessions: Dict[int, Dict[str, Any]] = {}
+        self.active_workers: Dict[str, asyncio.Task] = {}
+        self.api_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_API_WORKERS)
+        self.selenium_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_SELENIUM_WORKERS)
+        try:
+            self.fernet = Fernet(ENCRYPTION_KEY.encode())
+        except (ValueError, TypeError):
+            raise ValueError("Invalid ENCRYPTION_KEY.")
+
+    # --- Account & Session Management ---
+    def get_all_accounts(self) -> Dict[str, List[str]]:
+        accounts = {'api': [], 'selenium': []}
+        for d in TELETHON_SESSIONS_DIR.iterdir():
+            if d.is_dir(): accounts['api'].append(d.name)
+        for d in SELENIUM_SESSIONS_DIR.iterdir():
+            if d.is_dir(): accounts['selenium'].append(d.name)
+        accounts['api'].sort()
+        accounts['selenium'].sort()
+        return accounts
+
+    def get_account_type(self, account_name: str) -> Optional[str]:
+        if (TELETHON_SESSIONS_DIR / account_name).exists(): return 'api'
+        if (SELENIUM_SESSIONS_DIR / account_name).exists(): return 'selenium'
+        return None
+
+    def _get_api_session_path(self, account_name: str) -> Path:
+        return TELETHON_SESSIONS_DIR / account_name / f"{account_name}.session"
+
+    def _get_counter_path(self, account_name: str, acc_type: str) -> Path:
+        base_dir = TELETHON_SESSIONS_DIR if acc_type == 'api' else SELENIUM_SESSIONS_DIR
+        return base_dir / account_name / "group.counter"
+
+    def _read_counter(self, account_name: str, acc_type: str) -> int:
+        counter_file = self._get_counter_path(account_name, acc_type)
+        if not counter_file.exists(): return 0
+        try: return int(counter_file.read_text())
+        except (ValueError, OSError): return 0
+
+    def _write_counter(self, account_name: str, acc_type: str, value: int):
+        counter_file = self._get_counter_path(account_name, acc_type)
+        try: counter_file.write_text(str(value))
+        except OSError as e: LOGGER.error(f"Error writing counter for {account_name}: {e}")
+    
+    def _delete_account(self, account_name: str) -> bool:
+        acc_type = self.get_account_type(account_name)
+        if not acc_type: return False
+        
+        dir_to_delete = TELETHON_SESSIONS_DIR / account_name if acc_type == 'api' else SELENIUM_SESSIONS_DIR / account_name
+        try:
+            shutil.rmtree(dir_to_delete)
+            LOGGER.info(f"Deleted directory for account '{account_name}' ({acc_type}).")
+            return True
+        except OSError as e:
+            LOGGER.error(f"Error deleting directory for '{account_name}': {e}")
+            return False
+
+    # --- UI Builder ---
+    def _build_main_menu(self) -> List[List[Button]]:
+        return [[Button.text(Config.BTN_MANAGE_ACCOUNTS)], [Button.text(Config.BTN_BACK)]]
+
+    def _build_accounts_menu(self, user_id: int) -> List[List[Button]]:
+        accounts = self.get_all_accounts()
+        keyboard = []
+        
+        all_accounts = [(name, 'api') for name in accounts['api']] + [(name, 'selenium') for name in accounts['selenium']]
+        all_accounts.sort()
+
+        if not all_accounts:
+            keyboard.append([Button.text("هنوز هیچ حسابی اضافه نشده است.")])
+        else:
+            for acc_name, acc_type in all_accounts:
+                worker_key = f"{user_id}:{acc_name}"
+                type_label = "(API)" if acc_type == 'api' else "(Selenium)"
+                if worker_key in self.active_workers:
+                    keyboard.append([Button.text(f"{Config.BTN_STOP_PREFIX} {acc_name} {type_label}")])
+                else:
+                    keyboard.append([
+                        Button.text(f"{Config.BTN_START_PREFIX} {acc_name} {type_label}"),
+                        Button.text(f"{Config.BTN_DELETE_PREFIX} {acc_name}")
+                    ])
+
+        keyboard.append([Button.text(Config.BTN_ADD_ACCOUNT)])
+        keyboard.append([Button.text(Config.BTN_BACK)])
+        return keyboard
+
+    # --- Worker Tasks ---
+    async def run_group_creation_worker_api(self, user_id: int, account_name: str):
+        worker_key = f"{user_id}:{account_name}"
+        session_path = self._get_api_session_path(account_name)
+        user_client = TelegramClient(str(session_path), API_ID, API_HASH)
+        
+        try:
+            async with self.api_semaphore:
+                await user_client.connect()
+                if not await user_client.is_user_authorized():
+                    await self.bot.send_message(user_id, f"⚠️ نشست برای حساب API `{account_name}` منقضی شده. لطفا حذف و دوباره اضافه کنید.")
+                    return
+
+                await self.bot.send_message(user_id, f"✅ عملیات API برای `{account_name}` آغاز شد.")
+                current_counter = self._read_counter(account_name, 'api')
+                
+                for i in range(Config.GROUPS_TO_CREATE):
+                    current_counter += 1
+                    group_title = f"{Config.GROUP_NAME_BASE} {current_counter}"
+                    try:
+                        await user_client(CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title))
+                        self._write_counter(account_name, 'api', current_counter)
+                        await self.bot.send_message(user_id, f"✅ [API:{account_name}] گروه '{group_title}' ساخته شد. در حال انتظار...")
+                        await asyncio.sleep(Config.SLEEP_SECONDS)
+                    except Exception as e:
+                        await self.bot.send_message(user_id, f"❌ [API:{account_name}] خطایی در ساخت گروه رخ داد: {e}")
+                        break
+        except asyncio.CancelledError:
+            await self.bot.send_message(user_id, f"⏹️ عملیات API برای `{account_name}` متوقف شد.")
+        finally:
+            if user_client.is_connected(): await user_client.disconnect()
+            if worker_key in self.active_workers: del self.active_workers[worker_key]
+            LOGGER.info(f"API Worker finished for {worker_key}.")
+
+    async def run_group_creation_worker_selenium(self, user_id: int, account_name: str):
+        worker_key = f"{user_id}:{account_name}"
+        selenium_client = None
+        loop = asyncio.get_running_loop()
+        try:
+            async with self.selenium_semaphore:
+                await self.bot.send_message(user_id, f"🚀 Starting browser for `{account_name}`...")
+                selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, None)
+                
+                is_logged_in = await loop.run_in_executor(None, selenium_client.is_logged_in)
+                if not is_logged_in:
+                    await self.bot.send_message(user_id, f"⚠️ حساب Selenium `{account_name}` وارد نشده. لطفا حذف و دوباره اضافه کنید.")
+                    return
+
+                await self.bot.send_message(user_id, f"✅ عملیات Selenium برای `{account_name}` آغاز شد.")
+                current_counter = self._read_counter(account_name, 'selenium')
+
+                for i in range(Config.GROUPS_TO_CREATE):
+                    current_counter += 1
+                    group_title = f"{Config.GROUP_NAME_BASE} {current_counter}"
+                    success = await loop.run_in_executor(None, selenium_client.create_group, group_title, Config.GROUP_MEMBER_TO_ADD)
+
+                    if success:
+                        self._write_counter(account_name, 'selenium', current_counter)
+                        await self.bot.send_message(user_id, f"✅ [Selenium:{account_name}] گروه '{group_title}' ساخته شد. در حال انتظار...")
+                        await asyncio.sleep(Config.SLEEP_SECONDS)
+                    else:
+                        await self.bot.send_message(user_id, f"❌ [Selenium:{account_name}] خطایی در ساخت گروه رخ داد.")
+                        break
+        except asyncio.CancelledError:
+            await self.bot.send_message(user_id, f"⏹️ عملیات Selenium برای `{account_name}` متوقف شد.")
+        finally:
+            if selenium_client: await loop.run_in_executor(None, selenium_client.close)
+            if worker_key in self.active_workers: del self.active_workers[worker_key]
+            LOGGER.info(f"Selenium Worker finished for {worker_key}.")
+
+    # --- Bot Handlers & State Machine ---
+    async def _start_handler(self, event):
+        self.user_sessions[event.sender_id] = {'state': 'awaiting_master_password'}
+        await event.reply(Config.MSG_PROMPT_MASTER_PASSWORD)
+        raise events.StopPropagation
+
+    async def _send_main_menu(self, event):
+        self.user_sessions[event.sender_id] = {'state': 'authenticated'}
+        await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
+
+    async def _send_accounts_menu(self, event):
+        self.user_sessions[event.sender_id] = {'state': 'manage_accounts'}
+        await event.reply(Config.MSG_ACCOUNT_MENU_HEADER, buttons=self._build_accounts_menu(event.sender_id))
+
+    async def _initiate_add_account_flow(self, event):
+        buttons = [[Button.text(Config.METHOD_API)]]
+        if SELENIUM_ENABLED:
+            buttons.append([Button.text(Config.METHOD_SELENIUM)])
+        buttons.append([Button.text(Config.BTN_BACK)])
+        
+        await event.reply("لطفا روش افزودن حساب را انتخاب کنید:", buttons=buttons)
+        self.user_sessions[event.sender_id] = {'state': 'awaiting_add_method'}
+
+    async def _handle_api_login(self, event, text):
+        user_id = event.sender_id
+        state = self.user_sessions[user_id].get('sub_state')
+
+        if state == 'awaiting_name':
+            account_name = text.strip()
+            if not re.match("^[a-zA-Z0-9_-]+$", account_name) or self.get_account_type(account_name):
+                await event.reply("❌ نام نامعتبر است یا از قبل وجود دارد. لطفا نام دیگری انتخاب کنید.")
+                return
+            (TELETHON_SESSIONS_DIR / account_name).mkdir(exist_ok=True)
+            self.user_sessions[user_id]['account_name'] = account_name
+            self.user_sessions[user_id]['sub_state'] = 'awaiting_phone'
+            await event.reply("لطفا شماره تلفن را با فرمت بین‌المللی ارسال کنید:")
+        
+        elif state == 'awaiting_phone':
+            phone = text.strip()
+            self.user_sessions[user_id]['phone'] = phone
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            self.user_sessions[user_id]['client'] = client
+            try:
+                await client.connect()
+                sent_code = await client.send_code_request(phone)
+                self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
+                self.user_sessions[user_id]['sub_state'] = 'awaiting_code'
+                await event.reply("کد ارسال شده را وارد کنید:")
+            except Exception as e:
+                await event.reply(f"❌ خطایی در ارسال کد رخ داد: {e}. لطفا دوباره تلاش کنید.")
+                self.user_sessions[user_id]['sub_state'] = 'awaiting_phone'
+
+        elif state == 'awaiting_code':
+            client = self.user_sessions[user_id]['client']
+            try:
+                await client.sign_in(self.user_sessions[user_id]['phone'], text.strip(), phone_code_hash=self.user_sessions[user_id]['phone_code_hash'])
+                await self._finalize_api_login(event)
+            except errors.SessionPasswordNeededError:
+                self.user_sessions[user_id]['sub_state'] = 'awaiting_password'
+                await event.reply("این حساب تایید دو مرحله‌ای دارد. لطفا رمز عبور را ارسال کنید:")
+            except Exception as e:
+                await event.reply(f"❌ کد نامعتبر است: {e}. لطفا دوباره تلاش کنید.")
+
+        elif state == 'awaiting_password':
+            client = self.user_sessions[user_id]['client']
+            try:
+                await client.sign_in(password=text.strip())
+                await self._finalize_api_login(event)
+            except Exception as e:
+                await event.reply(f"❌ رمز عبور اشتباه است: {e}. لطفا دوباره تلاش کنید.")
+
+    async def _finalize_api_login(self, event):
+        user_id = event.sender_id
+        client = self.user_sessions[user_id]['client']
+        account_name = self.user_sessions[user_id]['account_name']
+        session_path = self._get_api_session_path(account_name)
+        with open(session_path, "w") as f:
+            f.write(client.session.save())
+        await client.disconnect()
+        await event.reply(f"✅ حساب API `{account_name}` با موفقیت اضافه شد.")
+        await self._send_accounts_menu(event)
+
+    # --- Main Message Router ---
+    async def _message_router(self, event: events.NewMessage.Event):
+        user_id = event.sender_id
+        text = event.text.strip()
+        
+        session = self.user_sessions.get(user_id, {})
+        state = session.get('state')
+
+        if state != 'authenticated' and not state.startswith('adding_account'):
+            if text == Config.MASTER_PASSWORD:
+                await self._send_main_menu(event)
+            else:
+                if state == 'awaiting_master_password':
+                    await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
+                else: # First time interaction
+                    await self._start_handler(event)
+            return
+
+        if text == Config.BTN_BACK:
+            await self._send_main_menu(event)
+            return
+
+        if state == 'authenticated':
+            if text == Config.BTN_MANAGE_ACCOUNTS:
+                await self._send_accounts_menu(event)
+            return
+
+        if state == 'manage_accounts':
+            if text == Config.BTN_ADD_ACCOUNT:
+                await self._initiate_add_account_flow(event)
+            elif text.startswith(Config.BTN_START_PREFIX):
+                parts = text.split(' ')
+                acc_name = parts[2]
+                acc_type = 'api' if parts[3] == '(API)' else 'selenium'
+                worker_key = f"{user_id}:{acc_name}"
+                task = asyncio.create_task(
+                    self.run_group_creation_worker_api(user_id, acc_name) if acc_type == 'api' 
+                    else self.run_group_creation_worker_selenium(user_id, acc_name)
+                )
+                self.active_workers[worker_key] = task
+                await event.reply(f"🚀 Worker started for `{acc_name}`.")
+                await self._send_accounts_menu(event)
+            elif text.startswith(Config.BTN_STOP_PREFIX):
+                acc_name = text.split(' ')[2]
+                worker_key = f"{user_id}:{acc_name}"
+                if worker_key in self.active_workers:
+                    self.active_workers[worker_key].cancel()
+                    await event.reply(f"⏹️ Stopping worker for `{acc_name}`.")
+                await self._send_accounts_menu(event)
+            elif text.startswith(Config.BTN_DELETE_PREFIX):
+                acc_name = text.split(' ')[2]
+                if self._delete_account(acc_name):
+                    await event.reply(f"🗑️ Account `{acc_name}` deleted.")
+                await self._send_accounts_menu(event)
+            return
+
+        if state == 'awaiting_add_method':
+            if text == Config.METHOD_API:
+                self.user_sessions[user_id] = {'state': 'adding_account', 'sub_state': 'awaiting_name', 'method': 'api'}
+                await event.reply("یک نام مستعار برای حساب API وارد کنید (فقط حروف انگلیسی و اعداد):")
+            elif text == Config.METHOD_SELENIUM and SELENIUM_ENABLED:
+                self.user_sessions[user_id]['state'] = 'adding_account' # Lock state
+                await event.reply("To add a Selenium account, please follow the steps. First, enter a nickname for the account:")
+                try:
+                    async with self.bot.conversation(user_id, timeout=300) as conv:
+                        acc_name_msg = await conv.get_response()
+                        account_name = acc_name_msg.text.strip()
+                        if not re.match("^[a-zA-Z0-9_-]+$", account_name) or self.get_account_type(account_name):
+                            await conv.send_message("❌ نام نامعتبر است یا از قبل وجود دارد. عملیات لغو شد.")
+                            await self._send_accounts_menu(event)
+                            return
+                        
+                        (SELENIUM_SESSIONS_DIR / account_name).mkdir(exist_ok=True)
+                        
+                        await conv.send_message("OK. Now please send the phone number in international format:")
+                        phone_msg = await conv.get_response()
+                        phone = phone_msg.text.strip()
+
+                        await conv.send_message(f"🚀 Starting browser for `{account_name}`. This may take a moment.")
+                        
+                        loop = asyncio.get_running_loop()
+                        selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, None)
+
+                        async def get_code():
+                            await conv.send_message("Please enter the login code you received:")
+                            return (await conv.get_response()).text.strip()
+
+                        async def get_password():
+                            await conv.send_message("Please enter your 2FA password:")
+                            return (await conv.get_response()).text.strip()
+
+                        success = await loop.run_in_executor(None, selenium_client.login, phone, get_code, get_password)
+                        
+                        if success:
+                            await conv.send_message(f"✅ Successfully logged in and saved session for `{account_name}`.")
+                        else:
+                            await conv.send_message(f"❌ Login failed for `{account_name}`.")
+                        
+                        await loop.run_in_executor(None, selenium_client.close)
+                        await self._send_accounts_menu(event)
+
+                except asyncio.TimeoutError:
+                    await event.reply("Timeout. Operation cancelled.")
+                    await self._send_accounts_menu(event)
+            return
+
+        if session.get('state') == 'adding_account' and session.get('method') == 'api':
+            await self._handle_api_login(event, text)
+            return
+
+    async def run(self):
+        await self.bot.start(bot_token=BOT_TOKEN)
+        self.bot.add_event_handler(self._start_handler, events.NewMessage(pattern='/start'))
+        self.bot.add_event_handler(self._message_router, events.NewMessage)
+        LOGGER.info("Bot service has started successfully.")
+        await self.bot.run_until_disconnected()
+
+if __name__ == "__main__":
+    bot = GroupCreatorBot()
+    asyncio.run(bot.run())

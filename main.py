@@ -110,8 +110,6 @@ class GroupCreatorBot:
         self.api_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_API_WORKERS)
         self.selenium_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_SELENIUM_WORKERS)
         
-        # --- ASYNC SAFETY IMPROVEMENT ---
-        # Locks to prevent race conditions on shared dictionaries
         self.sessions_lock = asyncio.Lock()
         self.workers_lock = asyncio.Lock()
 
@@ -120,7 +118,6 @@ class GroupCreatorBot:
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY.")
         
-        # --- RESOURCE CLEANUP IMPROVEMENT ---
         self._cleanup_stale_plugins()
 
     def _cleanup_stale_plugins(self):
@@ -398,21 +395,28 @@ class GroupCreatorBot:
         async with self.sessions_lock:
             session = self.user_sessions.get(user_id, {})
             state = session.get('state')
+        
+        # --- DEBUG PRINT ---
+        print(f"DEBUG: user_id={user_id} state='{state}' text='{text}'")
 
-        if state != 'authenticated' and not state.startswith('adding_account'):
+        # --- REVISED STATE LOGIC ---
+        # 1. Handle users who are not authenticated at all.
+        if state not in ['authenticated', 'manage_accounts', 'awaiting_add_method', 'adding_account']:
             if text == Config.MASTER_PASSWORD:
                 await self._send_main_menu(event)
             else:
                 if state == 'awaiting_master_password':
                     await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
-                else: 
-                    await self._start_handler(event)
+                # For any other unknown state, force re-authentication.
+                await self._start_handler(event)
             return
 
+        # 2. Handle global commands for authenticated users.
         if text == Config.BTN_BACK:
             await self._send_main_menu(event)
             return
 
+        # 3. Handle specific states for authenticated users.
         if state == 'authenticated':
             if text == Config.BTN_MANAGE_ACCOUNTS:
                 await self._send_accounts_menu(event)
@@ -508,7 +512,6 @@ class GroupCreatorBot:
             return
 
     async def run(self):
-        # --- DEBUGGING STEP: Wrap run() in try...except ---
         try:
             print("--- Attempting to start bot client ---")
             await self.bot.start(bot_token=BOT_TOKEN)
@@ -524,8 +527,7 @@ class GroupCreatorBot:
         except Exception as e:
             print(f"FATAL ERROR in bot.run(): {e}")
             LOGGER.critical(f"FATAL ERROR in bot.run(): {e}", exc_info=True)
-            # You can optionally re-raise the exception to make the service show a failed state
-            # raise e
+            raise
 
 if __name__ == "__main__":
     print("--- Running main block ---")

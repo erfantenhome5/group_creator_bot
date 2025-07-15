@@ -104,7 +104,6 @@ class GroupCreatorBot:
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
         self.proxies = self._load_proxies()
-        # ADDED: Logic for assigning proxies to accounts
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
         self.last_proxy_index = 0
@@ -137,7 +136,6 @@ class GroupCreatorBot:
             LOGGER.warning(f"Proxy file '{Config.PROXY_FILE}' not found. Continuing without proxies.")
         return proxy_list
     
-    # ADDED: Methods to manage proxy assignments
     def _load_account_proxies(self) -> Dict[str, Dict]:
         """Loads the account-to-proxy assignments from a JSON file."""
         if not self.account_proxy_file.exists():
@@ -245,7 +243,6 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
         return False
 
-    # MODIFIED: Renamed to reflect its use for temporary login clients
     async def _create_login_client(self) -> Optional[TelegramClient]:
         """Creates a temporary client for the login flow, trying a random proxy."""
         session = StringSession()
@@ -271,7 +268,6 @@ class GroupCreatorBot:
             LOGGER.error(f"Failed to connect without proxy for login: {e}")
             return None
 
-    # ADDED: New method to create clients with their assigned proxy
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         """Creates a client for a worker, using its assigned proxy."""
         session = StringSession(session_string)
@@ -296,8 +292,28 @@ class GroupCreatorBot:
         except Exception as e:
             LOGGER.error(f"Worker connection failed with {proxy_info}: {e}")
             if isinstance(e, errors.AuthKeyUnregisteredError):
-                raise  # Re-raise to be handled by the caller
+                raise
             return None
+            
+    # ADDED: New wrapper function for sending requests with auto-reconnect
+    async def _send_request_with_reconnect(self, client: TelegramClient, request: Any, account_name: str) -> Any:
+        """
+        Sends a request, attempting to reconnect if the client is disconnected.
+        Raises the original error if reconnection or the request fails.
+        """
+        try:
+            if not client.is_connected():
+                LOGGER.warning(f"Client for '{account_name}' was disconnected. Attempting to reconnect...")
+                await client.connect()
+                LOGGER.info(f"Successfully reconnected client for '{account_name}'.")
+            
+            return await client(request)
+        except ConnectionError as e:
+            LOGGER.error(f"Connection error for '{account_name}' even after checking: {e}")
+            raise 
+        except Exception as e:
+            LOGGER.error(f"An unexpected error occurred while sending a request for '{account_name}': {e}")
+            raise
 
     # --- Dynamic UI Builder ---
     def _build_main_menu(self) -> List[List[Button]]:
@@ -347,7 +363,9 @@ class GroupCreatorBot:
                     current_semester += 1
                     group_title = f"collage Semester {current_semester}"
                     try:
-                        result = await user_client(CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title))
+                        # MODIFIED: Use the new request wrapper with reconnect logic
+                        request = CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title)
+                        result = await self._send_request_with_reconnect(user_client, request, account_name)
 
                         chat = None
                         if hasattr(result, 'chats') and result.chats:
@@ -414,7 +432,6 @@ class GroupCreatorBot:
         
         self._save_session_string(user_id, account_name, user_client.session.save())
 
-        # ADDED: Assign a proxy to the new account
         assigned_proxy = self._get_next_proxy()
         if assigned_proxy:
             self.account_proxies[worker_key] = assigned_proxy
@@ -556,7 +573,6 @@ class GroupCreatorBot:
 
         deleted_files_count = 0
         
-        # MODIFIED: Clean all files in the sessions directory except the bot's own session
         if SESSIONS_DIR.exists():
             for item in SESSIONS_DIR.iterdir():
                 if item.name != 'bot_session.session':
@@ -568,7 +584,6 @@ class GroupCreatorBot:
                     except OSError as e:
                         LOGGER.error(f"Failed to delete file {item}: {e}")
         
-        # Reset in-memory stores
         self.group_counts.clear()
         self.account_proxies.clear()
 
@@ -682,7 +697,6 @@ class GroupCreatorBot:
         
         user_client = None
         try:
-            # MODIFIED: Use the assigned proxy for the account
             assigned_proxy = self.account_proxies.get(worker_key)
             user_client = await self._create_worker_client(session_str, assigned_proxy)
             
@@ -733,7 +747,6 @@ class GroupCreatorBot:
 
         if self._delete_session_file(user_id, account_name):
             self._remove_group_count(worker_key)
-            # ADDED: Remove proxy assignment on deletion
             if worker_key in self.account_proxies:
                 del self.account_proxies[worker_key]
                 self._save_account_proxies()
@@ -759,7 +772,6 @@ class GroupCreatorBot:
         
         user_client = None
         try:
-            # MODIFIED: Use the dedicated login client creator
             user_client = await self._create_login_client()
             if not user_client:
                 await event.reply('❌ اتصال به تلگرام با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد. لطفا بعدا تلاش کنید.')

@@ -36,7 +36,6 @@ class Config:
     MIN_SLEEP_SECONDS = 60   # 1 minute
     MAX_SLEEP_SECONDS = 240  # 4 minutes
     GROUP_MEMBER_TO_ADD = '@BotFather'
-    # MODIFIED: Changed file name to proxy10.txt
     PROXY_FILE = "proxy10.txt"
     PROXY_TIMEOUT = 2
 
@@ -45,7 +44,6 @@ class Config:
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
     BTN_SERVER_STATUS = "📊 وضعیت سرور"
     BTN_HELP = "ℹ️ راهنما"
-    BTN_TEST_PROXIES = "🧪 تست پراکسی‌ها"
 
     # Account Management Menu
     BTN_ADD_ACCOUNT = "➕ افزودن حساب (API)"
@@ -121,16 +119,15 @@ class GroupCreatorBot:
                     if not line:
                         continue
                     try:
-                        ip, port, user, pw = line.split(':')
+                        # Handle proxies with format ip:port for HTTP proxies without auth
+                        ip, port = line.split(':', 1)
                         proxy_list.append({
                             'proxy_type': 'http',
                             'addr': ip,
-                            'port': int(port),
-                            'username': user,
-                            'password': pw
+                            'port': int(port)
                         })
                     except ValueError:
-                        LOGGER.warning(f"Skipping malformed proxy line: {line}")
+                        LOGGER.warning(f"Skipping malformed proxy line: {line}. Expected format is IP:PORT.")
             LOGGER.info(f"Loaded {len(proxy_list)} proxies from {Config.PROXY_FILE}.")
         except FileNotFoundError:
             LOGGER.warning(f"Proxy file '{Config.PROXY_FILE}' not found. Continuing without proxies.")
@@ -252,7 +249,6 @@ class GroupCreatorBot:
         return [
             [Button.text(Config.BTN_MANAGE_ACCOUNTS)],
             [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)],
-            [Button.text(Config.BTN_TEST_PROXIES)],
         ]
 
     def _build_accounts_menu(self, user_id: int) -> List[List[Button]]:
@@ -408,58 +404,6 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
-    # FIXED: This entire function has been updated to fix the TypeError
-    async def _test_proxies_handler(self, event: events.NewMessage.Event) -> None:
-        """Handles the proxy test command."""
-        msg = await event.reply("🧪 **شروع تست پراکسی‌ها...**\n\nلطفا صبر کنید، این عملیات ممکن است کمی طول بکشد.")
-        
-        results = "📝 **نتایج تست پراکسی:**\n\n"
-        
-        if not self.proxies:
-            results += f"⚠️ هیچ پراکسی‌ای در فایل `{Config.PROXY_FILE}` یافت نشد.\n"
-
-        for proxy in self.proxies:
-            proxy_addr = f"{proxy['addr']}:{proxy['port']}"
-            client = None
-            try:
-                # Randomly select device parameters for each test
-                device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
-                # Use a temporary in-memory session for testing
-                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
-                await client.connect()
-                if await client.is_connected():
-                    results += f"✅ `{proxy_addr}`: **موفق**\n"
-                else:
-                    results += f"❌ `{proxy_addr}`: **ناموفق (خطای اتصال)**\n"
-            except Exception as e:
-                error_type = type(e).__name__
-                results += f"❌ `{proxy_addr}`: **ناموفق** ({error_type})\n"
-            finally:
-                if client and client.is_connected():
-                    await client.disconnect()
-
-        # Test direct connection
-        results += "\n---\n**تست اتصال مستقیم (بدون پراکسی):**\n"
-        client = None
-        try:
-            # Randomly select device parameters for the direct test as well
-            device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
-            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
-            await client.connect()
-            if await client.is_connected():
-                results += "✅ **موفق**\n"
-            else:
-                results += "❌ **ناموفق (خطای اتصال)**\n"
-        except Exception as e:
-            error_type = type(e).__name__
-            results += f"❌ **ناموفق** ({error_type})\n"
-        finally:
-            if client and client.is_connected():
-                await client.disconnect()
-                
-        await msg.edit(results)
-        raise events.StopPropagation
-
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
         await event.reply('📞 لطفا شماره تلفن حساب جدید را با فرمت بین‌المللی ارسال کنید (مثال: `+989123456789`).', buttons=Button.clear())
@@ -509,8 +453,6 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
-            Config.BTN_TEST_PROXIES: self._test_proxies_handler,
-            "/test_proxies": self._test_proxies_handler,
         }
         
         # Match commands and buttons

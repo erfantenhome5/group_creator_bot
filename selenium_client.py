@@ -8,6 +8,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import zipfile
 import os
+# --- FIX: Import Optional ---
+from typing import Optional
 
 class SeleniumClient:
     """
@@ -43,7 +45,6 @@ class SeleniumClient:
         except TimeoutException:
             return False
 
-    # --- FIX: Changed from async def to def ---
     def login(self, phone: str, code: str, password: Optional[str] = None) -> bool:
         """Guides the user through the login process. This is a blocking (synchronous) method."""
         self.driver.get("https://web.telegram.org/a/")
@@ -51,7 +52,7 @@ class SeleniumClient:
             phone_input = WebDriverWait(self.driver, 20).until(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'input-field-input') and @inputmode='tel']"))
             )
-            time.sleep(1) # Use time.sleep instead of asyncio.sleep
+            time.sleep(1)
             phone_input.send_keys(phone)
             
             next_button = self.driver.find_element(By.XPATH, "//button[contains(., 'Next')]")

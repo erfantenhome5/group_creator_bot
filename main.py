@@ -422,7 +422,7 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
-    # MODIFIED: This entire function is updated to fix the TypeError and add more logging.
+    # MODIFIED: This entire function is updated to fix the TypeError by removing 'await'.
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
         """Runs a silent proxy test, logging results to debug."""
         LOGGER.info(f"User {event.sender_id} initiated a silent proxy test.")
@@ -453,16 +453,17 @@ class GroupCreatorBot:
                     system_version=device_params['system_version']
                 )
                 await client.connect()
-                if await client.is_connected():
+                # FIXED: Removed 'await' from client.is_connected()
+                if client.is_connected():
                     LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
                 else:
-                    # This case is unlikely as connect() would raise an error, but included for completeness.
                     LOGGER.warning(f"  ❌ FAILED (Connection Error): {proxy_addr}")
             except TypeError as e:
                 LOGGER.error(f"  ❌ FAILED (TypeError): {proxy_addr} - {e}", exc_info=True)
             except Exception as e:
                 LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): {proxy_addr} - {e}")
             finally:
+                # FIXED: Removed 'await' from client.is_connected()
                 if client and client.is_connected():
                     await client.disconnect()
 
@@ -480,7 +481,8 @@ class GroupCreatorBot:
                 system_version=device_params['system_version']
             )
             await client.connect()
-            if await client.is_connected():
+            # FIXED: Removed 'await' from client.is_connected()
+            if client.is_connected():
                 LOGGER.info("  ✅ SUCCESS: Direct Connection")
             else:
                 LOGGER.warning("  ❌ FAILED: Direct Connection")
@@ -489,6 +491,7 @@ class GroupCreatorBot:
         except Exception as e:
             LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): Direct Connection - {e}")
         finally:
+            # FIXED: Removed 'await' from client.is_connected()
             if client and client.is_connected():
                 await client.disconnect()
         

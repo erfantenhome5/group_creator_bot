@@ -189,7 +189,6 @@ class GroupCreatorBot:
                 
                 await user_client.connect()
                 
-                # --- DEBUGGING FIX: Enhanced Authorization Check ---
                 if not await user_client.is_user_authorized():
                     LOGGER.error(f"Session for {account_name} is not authorized. Skipping group creation.")
                     await self.bot.send_message(user_id, f"⚠️ نشست برای حساب `{account_name}` منقضی شده یا معتبر نیست. لطفا حذف و دوباره اضافه کنید.")
@@ -202,7 +201,6 @@ class GroupCreatorBot:
                     current_counter += 1
                     group_title = f"{Config.GROUP_NAME_BASE} {current_counter}"
                     try:
-                        # --- DEBUGGING FIX: Log attempt ---
                         LOGGER.info(f"Attempting to create group '{group_title}' for {account_name} ({acc_type})")
                         await user_client(CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title))
                         self._write_counter(account_name, acc_type, current_counter)
@@ -265,7 +263,8 @@ class GroupCreatorBot:
                 return
             
             base_dir = API_SESSIONS_DIR if acc_type == 'api' else SELENIUM_SESSIONS_DIR
-            (base_dir / account_name).mkdir(exist_ok=True)
+            # --- FIX: Create parent directories if they don't exist ---
+            (base_dir / account_name).mkdir(parents=True, exist_ok=True)
             
             async with self.sessions_lock:
                 self.user_sessions[user_id]['account_name'] = account_name

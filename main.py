@@ -16,7 +16,6 @@ from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRe
 from telethon.tl.types import Message
 
 # --- Basic Logging Setup ---
-# MODIFIED: Changed logging level to DEBUG for more detailed output
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -299,7 +298,6 @@ class GroupCreatorBot:
             async with self.worker_semaphore:
                 LOGGER.info(f"Worker started for {worker_key}. Semaphore acquired.")
 
-                # Calculate and inform the user about the estimated time
                 avg_sleep = (Config.MIN_SLEEP_SECONDS + Config.MAX_SLEEP_SECONDS) / 2
                 estimated_total_minutes = (Config.GROUPS_TO_CREATE * avg_sleep) / 60
                 
@@ -308,7 +306,6 @@ class GroupCreatorBot:
                 await self.bot.send_message(user_id, f"✅ **عملیات برای حساب `{account_name}` آغاز شد!**\n\n⏳ تخمین زمان کل عملیات: حدود {estimated_total_minutes:.0f} دقیقه.")
 
                 for i in range(Config.GROUPS_TO_CREATE):
-                    # Create a group, then wait
                     current_semester += 1
                     group_title = f"collage Semester {current_semester}"
                     try:
@@ -322,27 +319,31 @@ class GroupCreatorBot:
                         else:
                             LOGGER.error(f"Could not find chat in result of type {type(result)} for account {account_name}")
                             await self.bot.send_message(user_id, f"❌ [{account_name}] خطای غیرمنتظره: اطلاعات گروه یافت نشد.")
-                            current_semester -= 1 # Roll back count since it failed
+                            current_semester -= 1 
                             continue
 
-                        # If successful, save the new count
                         self._set_group_count(worker_key, current_semester)
                         
                         groups_made = i + 1
                         groups_remaining = Config.GROUPS_TO_CREATE - groups_made
                         time_remaining_minutes = (groups_remaining * avg_sleep) / 60
 
-                        # Updated progress message without the invite link
                         progress_message = (
                             f"📊 [{account_name}] گروه '{group_title}' ساخته شد. ({groups_made}/{Config.GROUPS_TO_CREATE})\n"
                             f"⏳ زمان تقریبی باقی‌مانده: {time_remaining_minutes:.0f} دقیقه."
                         )
                         await self.bot.send_message(user_id, progress_message)
 
-                        # Wait for a random time between 1 and 4 minutes AFTER creating the group
                         sleep_time = random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS)
                         await asyncio.sleep(sleep_time)
 
+                    # FIXED: Added specific handling for AuthKeyUnregisteredError
+                    except errors.AuthKeyUnregisteredError:
+                        LOGGER.error(f"Authentication key for account '{account_name}' is unregistered during worker execution. Deleting session.")
+                        self._delete_session_file(user_id, account_name)
+                        self._remove_group_count(worker_key)
+                        await self.bot.send_message(user_id, f"🚨 **خطای امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند نقطه، توسط تلگرام باطل شد. عملیات متوقف و حساب حذف گردید. لطفاً آن را دوباره اضافه کنید.")
+                        break 
                     except errors.UserRestrictedError:
                         LOGGER.error(f"Worker for {worker_key} failed: User is restricted.")
                         await self.bot.send_message(user_id, f"❌ حساب `{account_name}` توسط تلگرام محدود شده و قادر به ساخت گروه نیست. عملیات متوقف شد.")
@@ -376,7 +377,7 @@ class GroupCreatorBot:
 
         if 'client' in self.user_sessions[user_id]:
             del self.user_sessions[user_id]['client']
-        self.user_sessions[user_id]['state'] = 'authenticated' # Set state to authenticated
+        self.user_sessions[user_id]['state'] = 'authenticated' 
 
         await self.bot.send_message(user_id, f"✅ حساب `{account_name}` با موفقیت اضافه شد!")
         await self._send_accounts_menu(event)
@@ -422,7 +423,6 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
-    # MODIFIED: This entire function is updated to fix the TypeError by removing 'await'.
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
         """Runs a silent proxy test, logging results to debug."""
         LOGGER.info(f"User {event.sender_id} initiated a silent proxy test.")
@@ -453,17 +453,13 @@ class GroupCreatorBot:
                     system_version=device_params['system_version']
                 )
                 await client.connect()
-                # FIXED: Removed 'await' from client.is_connected()
                 if client.is_connected():
                     LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
                 else:
                     LOGGER.warning(f"  ❌ FAILED (Connection Error): {proxy_addr}")
-            except TypeError as e:
-                LOGGER.error(f"  ❌ FAILED (TypeError): {proxy_addr} - {e}", exc_info=True)
             except Exception as e:
                 LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): {proxy_addr} - {e}")
             finally:
-                # FIXED: Removed 'await' from client.is_connected()
                 if client and client.is_connected():
                     await client.disconnect()
 
@@ -481,17 +477,13 @@ class GroupCreatorBot:
                 system_version=device_params['system_version']
             )
             await client.connect()
-            # FIXED: Removed 'await' from client.is_connected()
             if client.is_connected():
                 LOGGER.info("  ✅ SUCCESS: Direct Connection")
             else:
                 LOGGER.warning("  ❌ FAILED: Direct Connection")
-        except TypeError as e:
-            LOGGER.error(f"  ❌ FAILED (TypeError): Direct Connection - {e}", exc_info=True)
         except Exception as e:
             LOGGER.warning(f"  ❌ FAILED ({type(e).__name__}): Direct Connection - {e}")
         finally:
-            # FIXED: Removed 'await' from client.is_connected()
             if client and client.is_connected():
                 await client.disconnect()
         
@@ -548,11 +540,9 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
-            # ADDED: Route for the hidden debug command
             "/debug_proxies": self._debug_test_proxies_handler,
         }
         
-        # Match commands and buttons
         handler = route_map.get(text)
         if handler:
             await handler(event)
@@ -603,6 +593,13 @@ class GroupCreatorBot:
                 self._delete_session_file(user_id, account_name)
                 self._remove_group_count(worker_key)
                 await event.reply(f'⚠️ نشست برای حساب `{account_name}` منقضی شده و حذف شد. لطفا دوباره آن را اضافه کنید.')
+        # FIXED: Added specific handling for AuthKeyUnregisteredError
+        except errors.AuthKeyUnregisteredError:
+            LOGGER.error(f"Authentication key for account '{account_name}' is unregistered. Deleting session.")
+            self._delete_session_file(user_id, account_name)
+            self._remove_group_count(worker_key)
+            await event.reply(f"🚨 **خطای امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند نقطه، توسط تلگرام باطل شد. این حساب حذف گردید. لطفاً آن را دوباره اضافه کنید.")
+            await self._send_accounts_menu(event)
         except Exception as e:
             LOGGER.error(f"Failed to start process for {worker_key}", exc_info=e)
             await event.reply(f'❌ خطایی در اتصال به حساب `{account_name}` رخ داد.')
@@ -716,9 +713,14 @@ class GroupCreatorBot:
     async def run(self) -> None:
         self.register_handlers()
         LOGGER.info("Starting bot...")
-        await self.bot.start(bot_token=BOT_TOKEN)
-        LOGGER.info("Bot service has started successfully.")
-        await self.bot.run_until_disconnected()
+        try:
+            await self.bot.start(bot_token=BOT_TOKEN)
+            LOGGER.info("Bot service has started successfully.")
+            await self.bot.run_until_disconnected()
+        finally:
+            LOGGER.info("Bot service is shutting down. Disconnecting main bot client.")
+            if self.bot.is_connected():
+                await self.bot.disconnect()
 
 if __name__ == "__main__":
     bot_instance = GroupCreatorBot()

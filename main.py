@@ -36,7 +36,7 @@ class Config:
     MIN_SLEEP_SECONDS = 60   # 1 minute
     MAX_SLEEP_SECONDS = 240  # 4 minutes
     GROUP_MEMBER_TO_ADD = '@BotFather'
-    PROXY_FILE = "Webshare 10 proxies (1).txt"
+    PROXY_FILE = "proxy10"
     PROXY_TIMEOUT = 2
 
     # --- UI Text & Buttons ---

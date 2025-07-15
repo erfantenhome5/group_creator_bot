@@ -16,8 +16,9 @@ from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRe
 from telethon.tl.types import Message
 
 # --- Basic Logging Setup ---
+# MODIFIED: Changed logging level to DEBUG for more detailed output
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("bot_activity.log"),
@@ -213,7 +214,7 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
         return False
 
-    async def _create_new_user_client(self, session_string: Optional[str] = None, is_test: bool = False) -> Optional[TelegramClient]:
+    async def _create_new_user_client(self, session_string: Optional[str] = None) -> Optional[TelegramClient]:
         """Tries to connect with a proxy, falls back to no proxy."""
         session = StringSession(session_string) if session_string else StringSession()
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
@@ -223,24 +224,26 @@ class GroupCreatorBot:
         random.shuffle(shuffled_proxies)
 
         for proxy in shuffled_proxies:
+            proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             try:
-                if not is_test: LOGGER.info(f"Attempting to connect with proxy: {proxy['addr']}")
+                LOGGER.debug(f"Attempting to connect with proxy: {proxy_addr}")
                 client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
                 await client.connect()
-                if not is_test: LOGGER.info(f"Successfully connected using proxy: {proxy['addr']}")
+                LOGGER.info(f"Successfully connected using proxy: {proxy_addr}")
                 return client
             except Exception as e:
-                if not is_test: LOGGER.warning(f"Failed to connect with proxy {proxy['addr']}: {e}")
+                LOGGER.warning(f"Failed to connect with proxy {proxy_addr}: {e}")
                 continue
 
-        if not is_test: LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
+        LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
         try:
+            LOGGER.debug("Attempting to connect without a proxy.")
             client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
-            if not is_test: LOGGER.info("Successfully connected without a proxy.")
+            LOGGER.info("Successfully connected without a proxy.")
             return client
         except Exception as e:
-            if not is_test: LOGGER.error(f"Failed to connect without a proxy: {e}")
+            LOGGER.error(f"Failed to connect without a proxy: {e}")
             return None
 
 
@@ -404,6 +407,54 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
+    # ADDED: Hidden command to test proxies and log results to debug
+    async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
+        """Runs a silent proxy test, logging results to debug."""
+        LOGGER.info(f"User {event.sender_id} initiated a silent proxy test.")
+        
+        if not self.proxies:
+            LOGGER.debug("Proxy test: No proxies found in the file.")
+            return
+
+        LOGGER.debug("--- Starting Proxy Test ---")
+        for proxy in self.proxies:
+            proxy_addr = f"{proxy['addr']}:{proxy['port']}"
+            client = None
+            try:
+                device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
+                await client.connect()
+                if await client.is_connected():
+                    LOGGER.debug(f"  ✅ SUCCESS: {proxy_addr}")
+                else:
+                    LOGGER.debug(f"  ❌ FAILED (Connection Error): {proxy_addr}")
+            except Exception as e:
+                error_type = type(e).__name__
+                LOGGER.debug(f"  ❌ FAILED ({error_type}): {proxy_addr}")
+            finally:
+                if client and client.is_connected():
+                    await client.disconnect()
+
+        LOGGER.debug("--- Testing Direct Connection ---")
+        client = None
+        try:
+            device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
+            await client.connect()
+            if await client.is_connected():
+                LOGGER.debug("  ✅ SUCCESS: Direct Connection")
+            else:
+                LOGGER.debug("  ❌ FAILED: Direct Connection")
+        except Exception as e:
+            error_type = type(e).__name__
+            LOGGER.debug(f"  ❌ FAILED ({error_type}): Direct Connection")
+        finally:
+            if client and client.is_connected():
+                await client.disconnect()
+        LOGGER.info("Silent proxy test finished.")
+        # Do not send any message back to the user.
+        raise events.StopPropagation
+
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
         await event.reply('📞 لطفا شماره تلفن حساب جدید را با فرمت بین‌المللی ارسال کنید (مثال: `+989123456789`).', buttons=Button.clear())
@@ -453,6 +504,8 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
+            # ADDED: Route for the hidden debug command
+            "/debug_proxies": self._debug_test_proxies_handler,
         }
         
         # Match commands and buttons

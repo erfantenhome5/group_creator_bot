@@ -59,7 +59,6 @@ class Config:
     GROUP_NAME_BASE = "collage Semester"
     GROUP_MEMBER_TO_ADD = '@BotFather'
     
-    PROXIES = load_from_file("proxies.txt")
     USER_AGENTS = load_from_file("user_agents.txt")
 
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
@@ -117,23 +116,6 @@ class GroupCreatorBot:
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY.")
         
-        self._cleanup_stale_plugins()
-
-    def _cleanup_stale_plugins(self):
-        LOGGER.info("Cleaning up stale proxy plugin files...")
-        count = 0
-        for f in Path.cwd().glob("proxy_plugin_*.zip"):
-            try:
-                f.unlink()
-                count += 1
-            except OSError as e:
-                LOGGER.error(f"Error deleting stale plugin {f.name}: {e}")
-        if count > 0:
-            LOGGER.info(f"Removed {count} stale plugin files.")
-
-    def get_random_proxy(self) -> Optional[str]:
-        return random.choice(Config.PROXIES) if Config.PROXIES else None
-
     def get_random_user_agent(self) -> Optional[str]:
         if Config.USER_AGENTS:
             return random.choice(Config.USER_AGENTS)
@@ -254,11 +236,10 @@ class GroupCreatorBot:
         loop = asyncio.get_running_loop()
         try:
             async with self.selenium_semaphore:
-                proxy = self.get_random_proxy()
                 user_agent = self.get_random_user_agent()
                 
                 await self.bot.send_message(user_id, f"🚀 در حال اجرای مرورگر برای `{account_name}`...")
-                selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, proxy, user_agent)
+                selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, user_agent)
                 
                 is_logged_in = await loop.run_in_executor(None, selenium_client.is_logged_in)
                 if not is_logged_in:
@@ -473,9 +454,8 @@ class GroupCreatorBot:
                         await conv.send_message(f"🚀 در حال اجرای مرورگر برای `{account_name}`. این ممکن است کمی طول بکشد.")
                         
                         loop = asyncio.get_running_loop()
-                        proxy = self.get_random_proxy()
                         user_agent = self.get_random_user_agent()
-                        selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, proxy, user_agent)
+                        selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, user_agent)
 
                         async def get_code():
                             await conv.send_message("لطفا کد ورودی که دریافت کردید را وارد کنید:")

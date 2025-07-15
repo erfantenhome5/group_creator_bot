@@ -110,6 +110,8 @@ class GroupCreatorBot:
         self.api_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_API_WORKERS)
         self.selenium_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_SELENIUM_WORKERS)
         
+        # --- ASYNC SAFETY IMPROVEMENT ---
+        # Locks to prevent race conditions on shared dictionaries
         self.sessions_lock = asyncio.Lock()
         self.workers_lock = asyncio.Lock()
 
@@ -118,6 +120,7 @@ class GroupCreatorBot:
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY.")
         
+        # --- RESOURCE CLEANUP IMPROVEMENT ---
         self._cleanup_stale_plugins()
 
     def _cleanup_stale_plugins(self):

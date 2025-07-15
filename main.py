@@ -106,7 +106,6 @@ class GroupCreatorBot:
         self.proxies = self._load_proxies()
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
-        self.last_proxy_index = 0
         try:
             self.fernet = Fernet(ENCRYPTION_KEY.encode())
         except (ValueError, TypeError):
@@ -155,13 +154,26 @@ class GroupCreatorBot:
         except IOError:
             LOGGER.error("Could not save account_proxies.json.")
 
-    def _get_next_proxy(self) -> Optional[Dict]:
-        """Gets the next proxy from the list in a round-robin fashion."""
+    # MODIFIED: This function now finds an unassigned proxy
+    def _get_available_proxy(self) -> Optional[Dict]:
+        """Finds the first available proxy that is not currently assigned to any account."""
         if not self.proxies:
             return None
-        proxy = self.proxies[self.last_proxy_index]
-        self.last_proxy_index = (self.last_proxy_index + 1) % len(self.proxies)
-        return proxy
+
+        # Get a set of all currently assigned proxy addresses for quick lookup
+        assigned_proxy_addrs = set()
+        for proxy_data in self.account_proxies.values():
+            if proxy_data: # Ensure proxy_data is not None
+                assigned_proxy_addrs.add(proxy_data['addr'])
+
+        # Find the first proxy that is not in the assigned set
+        for proxy in self.proxies:
+            if proxy['addr'] not in assigned_proxy_addrs:
+                LOGGER.info(f"Found available proxy: {proxy['addr']}")
+                return proxy
+
+        LOGGER.warning("All proxies are currently assigned. No available proxy found.")
+        return None
 
     # --- Group Count Helpers ---
     def _load_group_counts(self) -> Dict[str, int]:
@@ -295,7 +307,6 @@ class GroupCreatorBot:
                 raise
             return None
             
-    # ADDED: New wrapper function for sending requests with auto-reconnect
     async def _send_request_with_reconnect(self, client: TelegramClient, request: Any, account_name: str) -> Any:
         """
         Sends a request, attempting to reconnect if the client is disconnected.
@@ -363,7 +374,6 @@ class GroupCreatorBot:
                     current_semester += 1
                     group_title = f"collage Semester {current_semester}"
                     try:
-                        # MODIFIED: Use the new request wrapper with reconnect logic
                         request = CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title)
                         result = await self._send_request_with_reconnect(user_client, request, account_name)
 
@@ -432,14 +442,17 @@ class GroupCreatorBot:
         
         self._save_session_string(user_id, account_name, user_client.session.save())
 
-        assigned_proxy = self._get_next_proxy()
+        # MODIFIED: Use the new available proxy logic
+        assigned_proxy = self._get_available_proxy()
+        self.account_proxies[worker_key] = assigned_proxy
+        self._save_account_proxies()
+        
         if assigned_proxy:
-            self.account_proxies[worker_key] = assigned_proxy
-            self._save_account_proxies()
             proxy_addr = f"{assigned_proxy['addr']}:{assigned_proxy['port']}"
-            LOGGER.info(f"Assigned proxy {proxy_addr} to account '{account_name}'.")
+            LOGGER.info(f"Assigned available proxy {proxy_addr} to account '{account_name}'.")
         else:
-            LOGGER.warning(f"No proxies available to assign to account '{account_name}'. It will run without a proxy.")
+            LOGGER.warning(f"No available proxies. Account '{account_name}' will run without a proxy.")
+            await self.bot.send_message(user_id, f"⚠️ **هشدار:** تمام پراکسی‌ها در حال استفاده هستند. حساب `{account_name}` بدون پراکسی اضافه شد.")
 
         if 'client' in self.user_sessions[user_id]:
             del self.user_sessions[user_id]['client']
@@ -726,13 +739,22 @@ class GroupCreatorBot:
                 if user_client.is_connected():
                     await user_client.disconnect()
 
+    # MODIFIED: This function now waits for the task to finish before updating the UI
     async def _cancel_worker_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
         user_id = event.sender_id
         worker_key = f"{user_id}:{account_name}"
 
         if worker_key in self.active_workers:
-            self.active_workers[worker_key].cancel()
+            task = self.active_workers[worker_key]
+            task.cancel()
             LOGGER.info(f"User initiated cancellation for worker {worker_key}.")
+            try:
+                # Wait for the task to acknowledge cancellation and finish its finally block
+                await task
+            except asyncio.CancelledError:
+                LOGGER.info(f"Worker task {worker_key} successfully cancelled and cleaned up.")
+            
+            # Now the worker should be removed from the active list, so the menu will be correct.
             await self._send_accounts_menu(event)
         else:
             await event.reply(f"ℹ️ هیچ عملیات فعالی برای حساب `{account_name}` جهت توقف وجود ندارد.")

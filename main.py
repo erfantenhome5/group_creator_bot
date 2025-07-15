@@ -259,7 +259,7 @@ class GroupCreatorBot:
                 proxy = self.get_random_proxy()
                 user_agent = self.get_random_user_agent()
                 
-                await self.bot.send_message(user_id, f"🚀 Starting browser for `{account_name}`...")
+                await self.bot.send_message(user_id, f"🚀 در حال اجرای مرورگر برای `{account_name}`...")
                 selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, proxy, user_agent)
                 
                 is_logged_in = await loop.run_in_executor(None, selenium_client.is_logged_in)
@@ -396,7 +396,6 @@ class GroupCreatorBot:
             session = self.user_sessions.get(user_id, {})
             state = session.get('state')
         
-        # --- DEBUG PRINT ---
         print(f"DEBUG: user_id={user_id} state='{state}' text='{text}'")
 
         # --- REVISED STATE LOGIC ---
@@ -416,7 +415,7 @@ class GroupCreatorBot:
             await self._send_main_menu(event)
             return
 
-        # 3. Handle specific states for authenticated users.
+        # 3. Handle state-specific commands.
         if state == 'authenticated':
             if text == Config.BTN_MANAGE_ACCOUNTS:
                 await self._send_accounts_menu(event)
@@ -436,7 +435,7 @@ class GroupCreatorBot:
                 )
                 async with self.workers_lock:
                     self.active_workers[worker_key] = task
-                await event.reply(f"🚀 Worker started for `{acc_name}`.")
+                await event.reply(f"🚀 عملیات برای `{acc_name}` آغاز شد.")
                 await self._send_accounts_menu(event)
             elif text.startswith(Config.BTN_STOP_PREFIX):
                 acc_name = text.split(' ')[2]
@@ -444,12 +443,12 @@ class GroupCreatorBot:
                 async with self.workers_lock:
                     if worker_key in self.active_workers:
                         self.active_workers[worker_key].cancel()
-                        await event.reply(f"⏹️ Stopping worker for `{acc_name}`.")
+                        await event.reply(f"⏹️ در حال توقف عملیات برای `{acc_name}`.")
                 await self._send_accounts_menu(event)
             elif text.startswith(Config.BTN_DELETE_PREFIX):
                 acc_name = text.split(' ')[2]
                 if self._delete_account(acc_name):
-                    await event.reply(f"🗑️ Account `{acc_name}` deleted.")
+                    await event.reply(f"🗑️ حساب `{acc_name}` حذف شد.")
                 await self._send_accounts_menu(event)
             return
 
@@ -461,11 +460,12 @@ class GroupCreatorBot:
             elif text == Config.METHOD_SELENIUM and SELENIUM_ENABLED:
                 async with self.sessions_lock:
                     self.user_sessions[user_id]['state'] = 'adding_account'
-                await event.reply("To add a Selenium account, please follow the steps. First, enter a nickname for the account:")
                 try:
                     async with self.bot.conversation(user_id, timeout=300) as conv:
+                        await conv.send_message("برای افزودن حساب با روش سلنیوم، لطفا یک نام مستعار وارد کنید:")
                         acc_name_msg = await conv.get_response()
                         account_name = acc_name_msg.text.strip()
+
                         if not re.match("^[a-zA-Z0-9_-]+$", account_name) or self.get_account_type(account_name):
                             await conv.send_message("❌ نام نامعتبر است یا از قبل وجود دارد. عملیات لغو شد.")
                             await self._send_accounts_menu(event)
@@ -473,11 +473,11 @@ class GroupCreatorBot:
                         
                         (SELENIUM_SESSIONS_DIR / account_name).mkdir(exist_ok=True)
                         
-                        await conv.send_message("OK. Now please send the phone number in international format:")
+                        await conv.send_message("بسیار خب. اکنون شماره تلفن را با فرمت بین‌المللی ارسال کنید:")
                         phone_msg = await conv.get_response()
                         phone = phone_msg.text.strip()
 
-                        await conv.send_message(f"🚀 Starting browser for `{account_name}`. This may take a moment.")
+                        await conv.send_message(f"🚀 در حال اجرای مرورگر برای `{account_name}`. این ممکن است کمی طول بکشد.")
                         
                         loop = asyncio.get_running_loop()
                         proxy = self.get_random_proxy()
@@ -485,25 +485,25 @@ class GroupCreatorBot:
                         selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, proxy, user_agent)
 
                         async def get_code():
-                            await conv.send_message("Please enter the login code you received:")
+                            await conv.send_message("لطفا کد ورودی که دریافت کردید را وارد کنید:")
                             return (await conv.get_response()).text.strip()
 
                         async def get_password():
-                            await conv.send_message("Please enter your 2FA password:")
+                            await conv.send_message("این حساب نیاز به رمز تایید دو مرحله‌ای دارد. لطفا آن را وارد کنید:")
                             return (await conv.get_response()).text.strip()
 
                         success = await loop.run_in_executor(None, selenium_client.login, phone, get_code, get_password)
                         
                         if success:
-                            await conv.send_message(f"✅ Successfully logged in and saved session for `{account_name}`.")
+                            await conv.send_message(f"✅ نشست با موفقیت برای حساب `{account_name}` ذخیره شد.")
                         else:
-                            await conv.send_message(f"❌ Login failed for `{account_name}`.")
+                            await conv.send_message(f"❌ ورود ناموفق بود برای حساب `{account_name}`.")
                         
                         await loop.run_in_executor(None, selenium_client.close)
                         await self._send_accounts_menu(event)
 
                 except asyncio.TimeoutError:
-                    await event.reply("Timeout. Operation cancelled.")
+                    await event.reply("زمان به پایان رسید. عملیات لغو شد.")
                     await self._send_accounts_menu(event)
             return
 

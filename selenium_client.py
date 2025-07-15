@@ -14,17 +14,15 @@ class SeleniumClient:
     Manages a Selenium browser instance to interact with Telegram Web.
     Uses undetected-chromedriver to avoid bot detection.
     """
-    def __init__(self, account_name: str, proxy: str = None, user_agent: str = None):
+    def __init__(self, account_name: str, user_agent: str = None):
         self.account_name = account_name
-        self.proxy = proxy
         self.driver = None
-        self.plugin_path = None
 
         options = uc.ChromeOptions()
         user_data_dir = Path.cwd() / "selenium_sessions" / self.account_name
         
         # --- FIX: Enable Headless Mode for Server ---
-        options.headless = True
+        options.add_argument('--headless=new')
         
         options.add_argument(f"--user-data-dir={user_data_dir}")
         options.add_argument("--no-sandbox")
@@ -34,79 +32,13 @@ class SeleniumClient:
         if user_agent:
             options.add_argument(f'user-agent={user_agent}')
 
-        # --- PROXY CONFIGURATION ---
-        if self.proxy:
-            proxy_parts = self.proxy.split(':')
-            if len(proxy_parts) == 4:  # Format: ip:port:user:pass
-                ip, port, user, password = proxy_parts
-                
-                manifest_json = """
-                {
-                    "version": "1.0.0",
-                    "manifest_version": 2,
-                    "name": "Chrome Proxy",
-                    "permissions": [
-                        "proxy",
-                        "tabs",
-                        "unlimitedStorage",
-                        "storage",
-                        "<all_urls>",
-                        "webRequest",
-                        "webRequestBlocking"
-                    ],
-                    "background": {
-                        "scripts": ["background.js"]
-                    },
-                    "minimum_chrome_version":"22.0.0"
-                }
-                """
-
-                background_js = f"""
-                var config = {{
-                        mode: "fixed_servers",
-                        rules: {{
-                          singleProxy: {{
-                            scheme: "http",
-                            host: "{ip}",
-                            port: parseInt("{port}")
-                          }},
-                          bypassList: ["localhost"]
-                        }}
-                      }};
-                chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
-                function callbackFn(details) {{
-                    return {{
-                        authCredentials: {{
-                            username: "{user}",
-                            password: "{password}"
-                        }}
-                    }};
-                }}
-                chrome.webRequest.onAuthRequired.addListener(
-                            callbackFn,
-                            {{urls: ["<all_urls>"]}},
-                            ['blocking']
-                );
-                """
-                
-                self.plugin_path = Path.cwd() / f'proxy_plugin_{account_name}.zip'
-                with zipfile.ZipFile(self.plugin_path, 'w') as zp:
-                    zp.writestr("manifest.json", manifest_json)
-                    zp.writestr("background.js", background_js)
-                
-                options.add_extension(self.plugin_path)
-
-            elif len(proxy_parts) == 2:
-                options.add_argument(f'--proxy-server={self.proxy}')
-            else:
-                print(f"WARNING: Invalid proxy format for {account_name}: {self.proxy}")
-
         self.driver = uc.Chrome(options=options, use_subprocess=True)
 
     def is_logged_in(self) -> bool:
         """Checks if the user is logged in."""
         try:
             self.driver.get("https://web.telegram.org/a/")
+            # NOTE: This ID is subject to change if Telegram updates its web UI.
             WebDriverWait(self.driver, 25).until(
                 EC.presence_of_element_located((By.ID, "telegram-search-input"))
             )
@@ -118,6 +50,7 @@ class SeleniumClient:
         """Guides the user through the login process."""
         self.driver.get("https://web.telegram.org/a/")
         try:
+            # NOTE: These XPaths are brittle and may break with UI updates.
             phone_input = WebDriverWait(self.driver, 20).until(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'input-field-input') and @inputmode='tel']"))
             )
@@ -153,6 +86,7 @@ class SeleniumClient:
     def create_group(self, group_name: str, member_username: str) -> bool:
         """Creates a new group with a given name and initial member."""
         try:
+            # NOTE: These CSS selectors and XPaths are brittle and may break with UI updates.
             new_chat_button = WebDriverWait(self.driver, 20).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button.floating-button"))
             )
@@ -198,11 +132,6 @@ class SeleniumClient:
             return False
 
     def close(self):
-        """Closes the browser and cleans up the proxy plugin file."""
+        """Closes the browser."""
         if self.driver:
             self.driver.quit()
-        if self.plugin_path and os.path.exists(self.plugin_path):
-            try:
-                os.remove(self.plugin_path)
-            except OSError as e:
-                print(f"Error removing proxy plugin file: {e}")

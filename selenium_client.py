@@ -22,6 +22,10 @@ class SeleniumClient:
 
         options = uc.ChromeOptions()
         user_data_dir = Path.cwd() / "selenium_sessions" / self.account_name
+        
+        # --- FIX: Enable Headless Mode for Server ---
+        options.headless = True
+        
         options.add_argument(f"--user-data-dir={user_data_dir}")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -57,8 +61,6 @@ class SeleniumClient:
                 }
                 """
 
-                # --- SYNTAX ERROR FIX ---
-                # Corrected the f-string syntax from f\"\"\" to f"""
                 background_js = f"""
                 var config = {{
                         mode: "fixed_servers",
@@ -105,7 +107,6 @@ class SeleniumClient:
         """Checks if the user is logged in."""
         try:
             self.driver.get("https://web.telegram.org/a/")
-            # NOTE: This ID is subject to change if Telegram updates its web UI.
             WebDriverWait(self.driver, 25).until(
                 EC.presence_of_element_located((By.ID, "telegram-search-input"))
             )
@@ -117,7 +118,6 @@ class SeleniumClient:
         """Guides the user through the login process."""
         self.driver.get("https://web.telegram.org/a/")
         try:
-            # NOTE: These XPaths are brittle and may break with UI updates.
             phone_input = WebDriverWait(self.driver, 20).until(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'input-field-input') and @inputmode='tel']"))
             )
@@ -153,7 +153,6 @@ class SeleniumClient:
     def create_group(self, group_name: str, member_username: str) -> bool:
         """Creates a new group with a given name and initial member."""
         try:
-            # NOTE: These CSS selectors and XPaths are brittle and may break with UI updates.
             new_chat_button = WebDriverWait(self.driver, 20).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button.floating-button"))
             )

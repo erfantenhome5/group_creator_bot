@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shutil
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,16 +34,35 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger(__name__)
 
+# --- Helper function to load from text files ---
+def load_from_file(filename: str) -> List[str]:
+    """Loads lines from a text file, stripping whitespace and ignoring empty lines."""
+    try:
+        with open(filename, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        LOGGER.warning(f"File not found: {filename}. Proceeding with an empty list.")
+        return []
+
 # --- Centralized Configuration ---
 class Config:
     MASTER_PASSWORD = "3935Eerfan@123"
     MAX_CONCURRENT_API_WORKERS = 5
     MAX_CONCURRENT_SELENIUM_WORKERS = 1
     GROUPS_TO_CREATE = 50
-    SLEEP_SECONDS = 240
+    
+    # --- Timing Configuration ---
+    # To create 50 groups in 4-5 hours (14400-18000 seconds)
+    # Min wait: 14400 / 50 = 288 seconds (4.8 minutes)
+    # Max wait: 18000 / 50 = 360 seconds (6 minutes)
+    MIN_SLEEP_SECONDS = 288
+    MAX_SLEEP_SECONDS = 360
+
     GROUP_NAME_BASE = "collage Semester"
     GROUP_MEMBER_TO_ADD = '@BotFather'
-    PROXIES = []
+    
+    PROXIES = load_from_file("proxies.txt")
+    USER_AGENTS = load_from_file("user_agents.txt")
 
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
     BTN_ADD_ACCOUNT = "➕ افزودن حساب جدید"
@@ -87,7 +107,14 @@ class GroupCreatorBot:
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY.")
 
-    # --- Account & Session Management ---
+    def get_random_proxy(self) -> Optional[str]:
+        return random.choice(Config.PROXIES) if Config.PROXIES else None
+
+    def get_random_user_agent(self) -> Optional[str]:
+        if Config.USER_AGENTS:
+            return random.choice(Config.USER_AGENTS)
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
     def get_all_accounts(self) -> Dict[str, List[str]]:
         accounts = {'api': [], 'selenium': []}
         for d in TELETHON_SESSIONS_DIR.iterdir():
@@ -134,7 +161,6 @@ class GroupCreatorBot:
             LOGGER.error(f"Error deleting directory for '{account_name}': {e}")
             return False
 
-    # --- UI Builder ---
     def _build_main_menu(self) -> List[List[Button]]:
         return [[Button.text(Config.BTN_MANAGE_ACCOUNTS)], [Button.text(Config.BTN_BACK)]]
 
@@ -163,7 +189,6 @@ class GroupCreatorBot:
         keyboard.append([Button.text(Config.BTN_BACK)])
         return keyboard
 
-    # --- Worker Tasks ---
     async def run_group_creation_worker_api(self, user_id: int, account_name: str):
         worker_key = f"{user_id}:{account_name}"
         session_path = self._get_api_session_path(account_name)
@@ -185,8 +210,9 @@ class GroupCreatorBot:
                     try:
                         await user_client(CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title))
                         self._write_counter(account_name, 'api', current_counter)
-                        await self.bot.send_message(user_id, f"✅ [API:{account_name}] گروه '{group_title}' ساخته شد. در حال انتظار...")
-                        await asyncio.sleep(Config.SLEEP_SECONDS)
+                        wait_time = random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS)
+                        await self.bot.send_message(user_id, f"✅ [API:{account_name}] گروه '{group_title}' ساخته شد. در حال انتظار برای {wait_time // 60} دقیقه و {wait_time % 60} ثانیه...")
+                        await asyncio.sleep(wait_time)
                     except Exception as e:
                         await self.bot.send_message(user_id, f"❌ [API:{account_name}] خطایی در ساخت گروه رخ داد: {e}")
                         break
@@ -203,8 +229,11 @@ class GroupCreatorBot:
         loop = asyncio.get_running_loop()
         try:
             async with self.selenium_semaphore:
+                proxy = self.get_random_proxy()
+                user_agent = self.get_random_user_agent()
+                
                 await self.bot.send_message(user_id, f"🚀 Starting browser for `{account_name}`...")
-                selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, None)
+                selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, proxy, user_agent)
                 
                 is_logged_in = await loop.run_in_executor(None, selenium_client.is_logged_in)
                 if not is_logged_in:
@@ -221,8 +250,9 @@ class GroupCreatorBot:
 
                     if success:
                         self._write_counter(account_name, 'selenium', current_counter)
-                        await self.bot.send_message(user_id, f"✅ [Selenium:{account_name}] گروه '{group_title}' ساخته شد. در حال انتظار...")
-                        await asyncio.sleep(Config.SLEEP_SECONDS)
+                        wait_time = random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS)
+                        await self.bot.send_message(user_id, f"✅ [Selenium:{account_name}] گروه '{group_title}' ساخته شد. در حال انتظار برای {wait_time // 60} دقیقه و {wait_time % 60} ثانیه...")
+                        await asyncio.sleep(wait_time)
                     else:
                         await self.bot.send_message(user_id, f"❌ [Selenium:{account_name}] خطایی در ساخت گروه رخ داد.")
                         break
@@ -233,7 +263,6 @@ class GroupCreatorBot:
             if worker_key in self.active_workers: del self.active_workers[worker_key]
             LOGGER.info(f"Selenium Worker finished for {worker_key}.")
 
-    # --- Bot Handlers & State Machine ---
     async def _start_handler(self, event):
         self.user_sessions[event.sender_id] = {'state': 'awaiting_master_password'}
         await event.reply(Config.MSG_PROMPT_MASTER_PASSWORD)
@@ -315,7 +344,6 @@ class GroupCreatorBot:
         await event.reply(f"✅ حساب API `{account_name}` با موفقیت اضافه شد.")
         await self._send_accounts_menu(event)
 
-    # --- Main Message Router ---
     async def _message_router(self, event: events.NewMessage.Event):
         user_id = event.sender_id
         text = event.text.strip()
@@ -329,7 +357,7 @@ class GroupCreatorBot:
             else:
                 if state == 'awaiting_master_password':
                     await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
-                else: # First time interaction
+                else: 
                     await self._start_handler(event)
             return
 
@@ -376,7 +404,7 @@ class GroupCreatorBot:
                 self.user_sessions[user_id] = {'state': 'adding_account', 'sub_state': 'awaiting_name', 'method': 'api'}
                 await event.reply("یک نام مستعار برای حساب API وارد کنید (فقط حروف انگلیسی و اعداد):")
             elif text == Config.METHOD_SELENIUM and SELENIUM_ENABLED:
-                self.user_sessions[user_id]['state'] = 'adding_account' # Lock state
+                self.user_sessions[user_id]['state'] = 'adding_account'
                 await event.reply("To add a Selenium account, please follow the steps. First, enter a nickname for the account:")
                 try:
                     async with self.bot.conversation(user_id, timeout=300) as conv:
@@ -396,7 +424,9 @@ class GroupCreatorBot:
                         await conv.send_message(f"🚀 Starting browser for `{account_name}`. This may take a moment.")
                         
                         loop = asyncio.get_running_loop()
-                        selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, None)
+                        proxy = self.get_random_proxy()
+                        user_agent = self.get_random_user_agent()
+                        selenium_client = await loop.run_in_executor(None, SeleniumClient, account_name, proxy, user_agent)
 
                         async def get_code():
                             await conv.send_message("Please enter the login code you received:")

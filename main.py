@@ -84,7 +84,6 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
-# --- DEBUGGING STEP: Check Environment Variables ---
 print("--- Checking Environment Variables ---")
 print(f"API_ID: {'Loaded' if API_ID else 'MISSING'}")
 print(f"API_HASH: {'Loaded' if API_HASH else 'MISSING'}")
@@ -121,7 +120,6 @@ class GroupCreatorBot:
         self._cleanup_stale_plugins()
 
     def _cleanup_stale_plugins(self):
-        """Deletes any lingering proxy plugin files from previous crashed runs."""
         LOGGER.info("Cleaning up stale proxy plugin files...")
         count = 0
         for f in Path.cwd().glob("proxy_plugin_*.zip"):
@@ -398,24 +396,19 @@ class GroupCreatorBot:
         
         print(f"DEBUG: user_id={user_id} state='{state}' text='{text}'")
 
-        # --- REVISED STATE LOGIC ---
-        # 1. Handle users who are not authenticated at all.
         if state not in ['authenticated', 'manage_accounts', 'awaiting_add_method', 'adding_account']:
             if text == Config.MASTER_PASSWORD:
                 await self._send_main_menu(event)
             else:
                 if state == 'awaiting_master_password':
                     await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
-                # For any other unknown state, force re-authentication.
                 await self._start_handler(event)
             return
 
-        # 2. Handle global commands for authenticated users.
         if text == Config.BTN_BACK:
             await self._send_main_menu(event)
             return
 
-        # 3. Handle state-specific commands.
         if state == 'authenticated':
             if text == Config.BTN_MANAGE_ACCOUNTS:
                 await self._send_accounts_menu(event)

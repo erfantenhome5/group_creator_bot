@@ -44,6 +44,7 @@ class Config:
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
     BTN_SERVER_STATUS = "📊 وضعیت سرور"
     BTN_HELP = "ℹ️ راهنما"
+    BTN_TEST_PROXIES = "🧪 تست پراکسی‌ها"
 
     # Account Management Menu
     BTN_ADD_ACCOUNT = "➕ افزودن حساب (API)"
@@ -214,7 +215,7 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
         return False
 
-    async def _create_new_user_client(self, session_string: Optional[str] = None) -> Optional[TelegramClient]:
+    async def _create_new_user_client(self, session_string: Optional[str] = None, is_test: bool = False) -> Optional[TelegramClient]:
         """Tries to connect with a proxy, falls back to no proxy."""
         session = StringSession(session_string) if session_string else StringSession()
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
@@ -225,23 +226,23 @@ class GroupCreatorBot:
 
         for proxy in shuffled_proxies:
             try:
-                LOGGER.info(f"Attempting to connect with proxy: {proxy['addr']}")
+                if not is_test: LOGGER.info(f"Attempting to connect with proxy: {proxy['addr']}")
                 client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
                 await client.connect()
-                LOGGER.info(f"Successfully connected using proxy: {proxy['addr']}")
+                if not is_test: LOGGER.info(f"Successfully connected using proxy: {proxy['addr']}")
                 return client
             except Exception as e:
-                LOGGER.warning(f"Failed to connect with proxy {proxy['addr']}: {e}")
+                if not is_test: LOGGER.warning(f"Failed to connect with proxy {proxy['addr']}: {e}")
                 continue
 
-        LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
+        if not is_test: LOGGER.warning("All proxies failed. Attempting to connect without a proxy...")
         try:
             client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
-            LOGGER.info("Successfully connected without a proxy.")
+            if not is_test: LOGGER.info("Successfully connected without a proxy.")
             return client
         except Exception as e:
-            LOGGER.error(f"Failed to connect without a proxy: {e}")
+            if not is_test: LOGGER.error(f"Failed to connect without a proxy: {e}")
             return None
 
 
@@ -250,6 +251,7 @@ class GroupCreatorBot:
         return [
             [Button.text(Config.BTN_MANAGE_ACCOUNTS)],
             [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)],
+            [Button.text(Config.BTN_TEST_PROXIES)],
         ]
 
     def _build_accounts_menu(self, user_id: int) -> List[List[Button]]:
@@ -405,6 +407,53 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
+    async def _test_proxies_handler(self, event: events.NewMessage.Event) -> None:
+        """Handles the proxy test command."""
+        msg = await event.reply("🧪 **شروع تست پراکسی‌ها...**\n\nلطفا صبر کنید، این عملیات ممکن است کمی طول بکشد.")
+        
+        results = "📝 **نتایج تست پراکسی:**\n\n"
+        
+        if not self.proxies:
+            results += "⚠️ هیچ پراکسی‌ای در فایل `proxy10` یافت نشد.\n"
+
+        for proxy in self.proxies:
+            proxy_addr = f"{proxy['addr']}:{proxy['port']}"
+            client = None
+            try:
+                # Use a temporary in-memory session for testing
+                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT)
+                await client.connect()
+                if await client.is_connected():
+                    results += f"✅ `{proxy_addr}`: **موفق**\n"
+                else:
+                    results += f"❌ `{proxy_addr}`: **ناموفق (خطای اتصال)**\n"
+            except Exception as e:
+                error_type = type(e).__name__
+                results += f"❌ `{proxy_addr}`: **ناموفق** ({error_type})\n"
+            finally:
+                if client and client.is_connected():
+                    await client.disconnect()
+
+        # Test direct connection
+        results += "\n---\n**تست اتصال مستقیم (بدون پراکسی):**\n"
+        client = None
+        try:
+            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT)
+            await client.connect()
+            if await client.is_connected():
+                results += "✅ **موفق**\n"
+            else:
+                results += "❌ **ناموفق (خطای اتصال)**\n"
+        except Exception as e:
+            error_type = type(e).__name__
+            results += f"❌ **ناموفق** ({error_type})\n"
+        finally:
+            if client and client.is_connected():
+                await client.disconnect()
+                
+        await msg.edit(results)
+        raise events.StopPropagation
+
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
         await event.reply('📞 لطفا شماره تلفن حساب جدید را با فرمت بین‌المللی ارسال کنید (مثال: `+989123456789`).', buttons=Button.clear())
@@ -453,10 +502,15 @@ class GroupCreatorBot:
             Config.BTN_BACK: self._start_handler,
             Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
-            Config.BTN_SERVER_STATUS: self._server_status_handler
+            Config.BTN_SERVER_STATUS: self._server_status_handler,
+            Config.BTN_TEST_PROXIES: self._test_proxies_handler,
+            "/test_proxies": self._test_proxies_handler,
         }
-        if text in route_map:
-            await route_map[text](event)
+        
+        # Match commands and buttons
+        handler = route_map.get(text)
+        if handler:
+            await handler(event)
             return
 
         start_match = re.match(rf"{re.escape(Config.BTN_START_PREFIX)} (.*)", text)

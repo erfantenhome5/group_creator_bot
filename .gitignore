@@ -1,0 +1,22 @@
+# --- Environment variables ---
+# Never commit your .env file!
+.env
+
+# --- Session data ---
+# These folders contain sensitive login sessions
+/telethon_sessions/
+/selenium_sessions/
+bot_session.session
+
+# --- Python specific ---
+# General Python cache files
+__pycache__/
+*.pyc
+
+# --- Log files ---
+# Bot activity logs
+*.log
+
+# --- IDE/Editor specific ---
+.vscode/
+.idea/

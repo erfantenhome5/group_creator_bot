@@ -188,8 +188,11 @@ class GroupCreatorBot:
                     await self.bot.send_message(user_id, f"🚀 در حال شبیه‌سازی مرورگر امن برای `{account_name}`...")
                 
                 await user_client.connect()
+                
+                # --- DEBUGGING FIX: Enhanced Authorization Check ---
                 if not await user_client.is_user_authorized():
-                    await self.bot.send_message(user_id, f"⚠️ نشست برای حساب `{account_name}` منقضی شده. لطفا حذف و دوباره اضافه کنید.")
+                    LOGGER.error(f"Session for {account_name} is not authorized. Skipping group creation.")
+                    await self.bot.send_message(user_id, f"⚠️ نشست برای حساب `{account_name}` منقضی شده یا معتبر نیست. لطفا حذف و دوباره اضافه کنید.")
                     return
 
                 await self.bot.send_message(user_id, f"✅ عملیات برای `{account_name}` آغاز شد.")
@@ -199,16 +202,22 @@ class GroupCreatorBot:
                     current_counter += 1
                     group_title = f"{Config.GROUP_NAME_BASE} {current_counter}"
                     try:
+                        # --- DEBUGGING FIX: Log attempt ---
+                        LOGGER.info(f"Attempting to create group '{group_title}' for {account_name} ({acc_type})")
                         await user_client(CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title))
                         self._write_counter(account_name, acc_type, current_counter)
                         wait_time = random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS)
                         await self.bot.send_message(user_id, f"✅ [{account_name}] گروه '{group_title}' ساخته شد. در حال انتظار برای {wait_time // 60} دقیقه و {wait_time % 60} ثانیه...")
                         await asyncio.sleep(wait_time)
                     except Exception as e:
+                        LOGGER.error(f"Error during group creation for {account_name}: {e}", exc_info=True)
                         await self.bot.send_message(user_id, f"❌ [{account_name}] خطایی در ساخت گروه رخ داد: {e}")
                         break
         except asyncio.CancelledError:
             await self.bot.send_message(user_id, f"⏹️ عملیات برای `{account_name}` متوقف شد.")
+        except Exception as e:
+            LOGGER.error(f"Critical error in worker for {account_name}: {e}", exc_info=True)
+            await self.bot.send_message(user_id, f"❌ خطای اساسی در پردازشگر حساب `{account_name}` رخ داد. عملیات متوقف شد.")
         finally:
             if user_client.is_connected(): await user_client.disconnect()
             async with self.workers_lock:

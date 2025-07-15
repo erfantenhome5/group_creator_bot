@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import random
@@ -32,8 +33,8 @@ class Config:
     MASTER_PASSWORD = "3935Eerfan@123"
     MAX_CONCURRENT_WORKERS = 5
     GROUPS_TO_CREATE = 50
-    MIN_SLEEP_SECONDS = 100  # 5 minutes
-    MAX_SLEEP_SECONDS = 240  # 10 minutes
+    MIN_SLEEP_SECONDS = 100  # 1.6 minutes
+    MAX_SLEEP_SECONDS = 240  # 4 minutes
     GROUP_MEMBER_TO_ADD = '@BotFather'
 
     # --- UI Text & Buttons ---
@@ -97,10 +98,47 @@ class GroupCreatorBot:
         self.user_sessions: Dict[int, Dict[str, Any]] = {} # Combined session state
         self.active_workers: Dict[str, asyncio.Task] = {}  # Key is "user_id:account_name"
         self.worker_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_WORKERS)
+        self.counts_file = SESSIONS_DIR / "group_counts.json"
+        self.group_counts = self._load_group_counts()
         try:
             self.fernet = Fernet(ENCRYPTION_KEY.encode())
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
+
+    # --- Group Count Helpers ---
+    def _load_group_counts(self) -> Dict[str, int]:
+        """Loads the group creation counts from a JSON file."""
+        if not self.counts_file.exists():
+            return {}
+        try:
+            with self.counts_file.open("r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            LOGGER.error("Could not read or parse group_counts.json. Starting with empty counts.")
+            return {}
+
+    def _save_group_counts(self) -> None:
+        """Saves the current group creation counts to a JSON file."""
+        try:
+            with self.counts_file.open("w") as f:
+                json.dump(self.group_counts, f, indent=4)
+        except IOError:
+            LOGGER.error("Could not save group_counts.json.")
+
+    def _get_group_count(self, worker_key: str) -> int:
+        """Gets the current group count for a specific worker."""
+        return self.group_counts.get(worker_key, 0)
+
+    def _set_group_count(self, worker_key: str, count: int) -> None:
+        """Sets the group count for a worker and saves it to the file."""
+        self.group_counts[worker_key] = count
+        self._save_group_counts()
+
+    def _remove_group_count(self, worker_key: str) -> None:
+        """Removes a worker's group count, typically on account deletion."""
+        if worker_key in self.group_counts:
+            del self.group_counts[worker_key]
+            self._save_group_counts()
 
     # --- Encryption & Session Helpers ---
     def _encrypt_data(self, data: str) -> bytes:
@@ -149,8 +187,6 @@ class GroupCreatorBot:
 
     def _create_new_user_client(self, session_string: Optional[str] = None) -> TelegramClient:
         session = StringSession(session_string) if session_string else StringSession()
-        # This part is now in TelegramClient.py but we could override here if needed
-        # For simplicity, we rely on the random choice in that file.
         device_params = [{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}]
         return TelegramClient(session, API_ID, API_HASH, **random.choice(device_params))
 
@@ -193,15 +229,31 @@ class GroupCreatorBot:
 
                 avg_sleep = (Config.MIN_SLEEP_SECONDS + Config.MAX_SLEEP_SECONDS) / 2
                 estimated_total_minutes = (Config.GROUPS_TO_CREATE * avg_sleep) / 60
+                
+                current_semester = self._get_group_count(worker_key)
 
                 await self.bot.send_message(user_id, f"✅ **عملیات برای حساب `{account_name}` آغاز شد!**\n\n⏳ تخمین زمان کل عملیات: حدود {estimated_total_minutes:.0f} دقیقه.")
 
                 for i in range(Config.GROUPS_TO_CREATE):
-                    group_title = f"{account_name} Group #{random.randint(1000, 9999)} - {i + 1}"
+                    current_semester += 1
+                    group_title = f"collage Semester {current_semester}"
                     try:
                         result = await user_client(CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title))
 
-                        group_id = result.chats[0].id
+                        chat = None
+                        if hasattr(result, 'chats') and result.chats:
+                            chat = result.chats[0]
+                        elif hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
+                            chat = result.updates.chats[0]
+                        else:
+                            LOGGER.error(f"Could not find chat in result of type {type(result)} for account {account_name}")
+                            await self.bot.send_message(user_id, f"❌ [{account_name}] خطای غیرمنتظره: اطلاعات گروه یافت نشد.")
+                            current_semester -= 1 # Roll back count since it failed
+                            continue
+
+                        # If successful, save the new count
+                        self._set_group_count(worker_key, current_semester)
+                        group_id = chat.id
                         invite_link = ""
                         try:
                             invite = await user_client(ExportChatInviteRequest(group_id))
@@ -215,7 +267,7 @@ class GroupCreatorBot:
                         time_remaining_minutes = (groups_remaining * avg_sleep) / 60
 
                         progress_message = (
-                            f"📊 [{account_name}] {groups_made}/{Config.GROUPS_TO_CREATE} گروه ساخته شد.\n"
+                            f"📊 [{account_name}] گروه '{group_title}' ساخته شد. ({groups_made}/{Config.GROUPS_TO_CREATE})\n"
                             f"🔗 لینک دعوت: {invite_link}\n"
                             f"⏳ زمان تقریبی باقی‌مانده: {time_remaining_minutes:.0f} دقیقه."
                         )
@@ -265,10 +317,8 @@ class GroupCreatorBot:
     async def _start_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         session = self.user_sessions.get(user_id, {})
-        # If user is authenticated or has just finished a flow, show main menu
         if session.get('state') == 'authenticated':
             await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
-        # Otherwise, assume they need to log in
         else:
             self.user_sessions[user_id] = {'state': 'awaiting_master_password'}
             await event.reply(Config.MSG_PROMPT_MASTER_PASSWORD)
@@ -309,9 +359,8 @@ class GroupCreatorBot:
         await event.reply('📞 لطفا شماره تلفن حساب جدید را با فرمت بین‌المللی ارسال کنید (مثال: `+989123456789`).', buttons=Button.clear())
 
     async def _initiate_selenium_login_flow(self, event: events.NewMessage.Event) -> None:
-        """Shows a fake 'browser running' message then starts the normal login flow."""
         await event.reply(Config.MSG_BROWSER_RUNNING)
-        await asyncio.sleep(2)  # A small delay to make the "loading" feel real
+        await asyncio.sleep(2)
         await self._initiate_login_flow(event)
 
     async def _message_router(self, event: events.NewMessage.Event) -> None:
@@ -323,15 +372,12 @@ class GroupCreatorBot:
         session = self.user_sessions.get(user_id, {})
         state = session.get('state')
 
-        # State 1: Awaiting the initial master password
         if state == 'awaiting_master_password':
             await self._handle_master_password(event)
             return
 
-        # State 2: User is in the middle of the multi-step login/add account process
         login_flow_states = ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']
         if state in login_flow_states:
-            # The back button is a special case to exit the flow
             if text == Config.BTN_BACK:
                 self.user_sessions[user_id]['state'] = 'authenticated'
                 await self._start_handler(event)
@@ -343,16 +389,13 @@ class GroupCreatorBot:
                 'awaiting_password': self._handle_password_input,
                 'awaiting_account_name': self._handle_account_name_input
             }
-            # The corresponding handler will manage the next state or errors
             await state_map[state](event)
             return
 
-        # State 3: User is not authenticated and not in a specific flow, re-prompt for password.
         if state != 'authenticated':
-            await self._start_handler(event)  # This will re-trigger the password prompt
+            await self._start_handler(event)
             return
 
-        # State 4: User is authenticated, process main menu commands
         route_map = {
             Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
             Config.BTN_HELP: self._help_handler,
@@ -365,7 +408,6 @@ class GroupCreatorBot:
             await route_map[text](event)
             return
 
-        # Handle dynamic buttons (start/stop/delete)
         start_match = re.match(rf"{re.escape(Config.BTN_START_PREFIX)} (.*)", text)
         if start_match:
             await self._start_process_handler(event, start_match.group(1))
@@ -405,6 +447,7 @@ class GroupCreatorBot:
                 await self._send_accounts_menu(event)
             else:
                 self._delete_session_file(user_id, account_name)
+                self._remove_group_count(worker_key)
                 await event.reply(f'⚠️ نشست برای حساب `{account_name}` منقضی شده و حذف شد. لطفا دوباره آن را اضافه کنید.')
         except Exception as e:
             LOGGER.error(f"Failed to start process for {worker_key}", exc_info=e)
@@ -430,6 +473,7 @@ class GroupCreatorBot:
             LOGGER.info(f"Worker cancelled for {worker_key} due to account deletion.")
 
         if self._delete_session_file(user_id, account_name):
+            self._remove_group_count(worker_key)
             await event.reply(f"✅ حساب `{account_name}` با موفقیت حذف شد و عملیات مرتبط متوقف گردید.")
         else:
             await event.reply(f"✅ عملیات برای حساب `{account_name}` متوقف شد (نشست از قبل وجود نداشت).")
@@ -438,7 +482,6 @@ class GroupCreatorBot:
 
     # --- Login Flow Handlers ---
     async def _handle_master_password(self, event: events.NewMessage.Event) -> None:
-        """Checks the entered master password."""
         user_id = event.sender_id
         if event.text.strip() == Config.MASTER_PASSWORD:
             self.user_sessions[user_id] = {'state': 'authenticated'}
@@ -478,7 +521,7 @@ class GroupCreatorBot:
             await event.reply('🔑 این حساب تایید دو مرحله‌ای دارد. لطفا رمز عبور را ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
             LOGGER.error(f"Code input error for {user_id}", exc_info=e)
-            self.user_sessions[user_id]['state'] = 'awaiting_phone' # Go back to phone input
+            self.user_sessions[user_id]['state'] = 'awaiting_phone'
             await event.reply('❌ **خطا:** کد وارد شده نامعتبر است. لطفا شماره تلفن را مجددا وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_password_input(self, event: events.NewMessage.Event) -> None:
@@ -489,11 +532,10 @@ class GroupCreatorBot:
             await event.reply('✅ ورود موفق! لطفاً یک نام مستعار برای این حساب وارد کنید (مثلا: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
             LOGGER.error(f"Password input error for {user_id}", exc_info=e)
-            self.user_sessions[user_id]['state'] = 'awaiting_password' # Stay on password input
+            self.user_sessions[user_id]['state'] = 'awaiting_password'
             await event.reply('❌ **خطا:** رمز عبور اشتباه است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_account_name_input(self, event: events.NewMessage.Event) -> None:
-        """Final step of login: gets the account nickname and saves the session."""
         user_id = event.sender_id
         account_name = event.text.strip()
         if not account_name:

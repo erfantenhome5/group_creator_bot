@@ -4,8 +4,8 @@ import logging
 import os
 import random
 import re
-import subprocess
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
 
@@ -54,6 +54,10 @@ class AIAnalyzer:
         repo_url = f"https://{self.github_username}:{self.github_token}@github.com/erfantenhome5/group_creator_bot.git"
         
         try:
+            LOGGER.info("Configuring git user identity...")
+            if not await self._run_git_command('git config --global user.name "AI Bot"'): return False
+            if not await self._run_git_command('git config --global user.email "ai-bot@example.com"'): return False
+
             LOGGER.info("Attempting to push changes to GitHub...")
             if not await self._run_git_command('git add main.py ai_analyzer.py'): return False
             if not await self._run_git_command(f'git commit -m "{commit_message}"'): return False
@@ -96,7 +100,7 @@ class AIAnalyzer:
                     commit_message = f"AI Fix: Resolve {exc_type.__name__}"
                     await self._git_push_changes(commit_message)
                     
-                    self.bot._save_active_workers()
+                    self.bot._save_worker_state()
                     await self.bot._broadcast_message("⚙️ ربات برای اعمال یک بروزرسانی مهم در حال راه‌اندازی مجدد است. لطفاً چند لحظه صبر کنید.")
                     await asyncio.sleep(2)
                     
@@ -208,6 +212,22 @@ class AIAnalyzer:
             f"### Recent Log Entries:\n```log\n{recent_logs}\n```\n\n"
             f"### Full Source Code:\n```python\n{source_code}\n```\n\n"
             "**Output Format:** Provide your analysis in Persian. First, the explanation, then the complete, corrected code in a `python` markdown block."
+        )
+    
+    def _construct_user_explanation_prompt(self, error: Exception) -> str:
+        """Constructs a prompt to generate a user-friendly explanation for an error."""
+        error_type = type(error).__name__
+        error_details = str(error)
+        return (
+            "You are a helpful assistant for a Telegram bot. An error occurred, and your task is to explain it to the user in simple, non-technical Persian.\n\n"
+            f"**Technical Error:**\n- **Type:** `{error_type}`\n- **Details:** `{error_details}`\n\n"
+            "**Your Task:**\n"
+            "1.  Read the technical error type and details.\n"
+            "2.  Write a very short, simple, one-sentence explanation in Persian for a non-technical user.\n"
+            "3.  If possible, suggest a simple action, like 'لطفاً دوباره تلاش کنید' (please try again).\n\n"
+            "**Example:**\n- If the error is `ConnectionError`, you could say: 'مشکلی در اتصال به سرورهای تلگرام پیش آمده است. لطفاً لحظاتی دیگر دوباره تلاش کنید.'\n"
+            "- If the error is `UserRestrictedError`, you could say: 'این حساب توسط تلگرام محدود شده و قادر به انجام این کار نیست.'\n\n"
+            "**Do not include technical terms like 'Error', 'Exception', 'Traceback', etc. in your final response.** Just provide the simple, helpful sentence."
         )
 
     async def _call_gemini_with_fallback(self, prompt: str, models: List[str]) -> (Optional[str], Optional[str]):

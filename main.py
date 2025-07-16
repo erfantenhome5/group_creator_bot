@@ -771,9 +771,13 @@ class GroupCreatorBot:
         await asyncio.sleep(2)
         await self._initiate_login_flow(event)
 
-    async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
+async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        self.user_sessions[user_id]['phone'] = event.text.strip()
+        phone_number = event.text.strip()
+        if not phone_number:
+            await event.reply('❌ شماره تلفن نمی‌تواند خالی باشد. لطفا شماره تلفن را با فرمت بین‌المللی ارسال کنید.', buttons=Button.clear())
+            return
+        self.user_sessions[user_id]['phone'] = phone_number
         selected_proxy = self._get_available_proxy()
         self.user_sessions[user_id]['login_proxy'] = selected_proxy
         user_client = await self._create_login_client(selected_proxy)
@@ -790,7 +794,6 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
             await event.reply('❌ **خطا:** شماره تلفن نامعتبر است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
             if user_client.is_connected(): await user_client.disconnect()
-
     async def _handle_code_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         user_client = self.user_sessions[user_id]['client']

@@ -40,8 +40,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# ADDED: Admin User ID for receiving AI suggestions
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+
+if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
+    raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, and ENCRYPTION_KEY are set.")
+
+API_ID = int(API_ID)
+SESSIONS_DIR = Path("sessions")
+SESSIONS_DIR.mkdir(exist_ok=True)
+
 
 # --- Global Proxy Loading Function ---
 def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
@@ -133,7 +140,6 @@ class GroupCreatorBot:
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
         
-        # MODIFIED: Sentry initialization moved here to access instance methods
         self._initialize_sentry()
 
     # --- Sentry and AI Methods ---
@@ -141,6 +147,28 @@ class GroupCreatorBot:
         """Initializes the Sentry SDK with instance-aware hooks."""
         if not SENTRY_DSN:
             return
+
+        def before_send_hook(event: Event, hint: Hint) -> Optional[Event]:
+            """Sentry hook to filter logs and trigger AI analysis on exceptions."""
+            if 'log_record' in hint:
+                log_record = hint['log_record']
+                if log_record.levelno == logging.DEBUG and log_record.name.startswith('telethon'):
+                    message = log_record.getMessage()
+                    noisy_patterns = [
+                        "Assigned msg_id", "Encrypting", "Encrypted messages put in a queue",
+                        "Waiting for messages to send", "Handling pong", "Receiving items from the network",
+                        "Handling gzipped data", "Handling update", "Handling RPC result",
+                        "stopped chain of propagation"
+                    ]
+                    for pattern in noisy_patterns:
+                        if pattern in message:
+                            return None
+            
+            if 'exc_info' in hint:
+                exc_type, exc_value, tb = hint['exc_info']
+                asyncio.create_task(self._analyze_error_with_ai(exc_type, exc_value, tb))
+
+            return event
 
         sentry_logging = LoggingIntegration(
             level=logging.INFO,
@@ -155,8 +183,7 @@ class GroupCreatorBot:
             "_experiments": {
                 "enable_logs": True,
             },
-            # MODIFIED: before_send now triggers the AI analysis
-            "before_send": self._before_send_hook,
+            "before_send": before_send_hook,
         }
 
         proxies_for_sentry = load_proxies_from_file("proxy10.txt")
@@ -171,31 +198,6 @@ class GroupCreatorBot:
 
         sentry_sdk.init(**sentry_options)
         LOGGER.info("Sentry initialized with proactive AI error analysis.")
-
-    def _before_send_hook(self, event: Event, hint: Hint) -> Optional[Event]:
-        """Sentry hook to filter logs and trigger AI analysis on exceptions."""
-        # First, handle log filtering
-        if 'log_record' in hint:
-            log_record = hint['log_record']
-            if log_record.levelno == logging.DEBUG and log_record.name.startswith('telethon'):
-                message = log_record.getMessage()
-                noisy_patterns = [
-                    "Assigned msg_id", "Encrypting", "Encrypted messages put in a queue",
-                    "Waiting for messages to send", "Handling pong", "Receiving items from the network",
-                    "Handling gzipped data", "Handling update", "Handling RPC result",
-                    "stopped chain of propagation"
-                ]
-                for pattern in noisy_patterns:
-                    if pattern in message:
-                        return None  # Discard noisy log
-        
-        # Now, handle exceptions
-        if 'exc_info' in hint:
-            exc_type, exc_value, tb = hint['exc_info']
-            # Trigger AI analysis in the background for any captured exception
-            asyncio.create_task(self._analyze_error_with_ai(exc_type, exc_value, tb))
-
-        return event
 
     async def _analyze_error_with_ai(self, exc_type, exc_value, tb):
         """Analyzes an error with Gemini and sends a report to the admin."""
@@ -239,7 +241,6 @@ class GroupCreatorBot:
 
         except Exception as e:
             LOGGER.error(f"The AI analysis process itself failed: {e}", exc_info=True)
-            # Avoid an infinite loop by not capturing this specific error in Sentry again
             
     async def _call_gemini_api(self, prompt: str) -> Optional[str]:
         """Generic function to call the Gemini API."""
@@ -264,7 +265,6 @@ class GroupCreatorBot:
             return result['candidates'][0]['content']['parts'][0]['text']
         except Exception as e:
             LOGGER.error(f"Failed to call Gemini API: {e}")
-            # Do not capture this in Sentry to avoid loops, as it's an infrastructure issue.
             return None
 
     # --- Proxy Helpers ---
@@ -768,7 +768,6 @@ class GroupCreatorBot:
         try:
             division_by_zero = 1 / 0
         except Exception as e:
-            # This will be captured by the before_send hook, which will trigger the AI analysis
             sentry_sdk.capture_exception(e)
             await event.reply("✅ Test error sent! The AI is now analyzing it...")
 

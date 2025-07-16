@@ -439,8 +439,11 @@ class GroupCreatorBot:
                         result = await self._send_request_with_reconnect(user_client, request, account_name)
 
                         chat = None
+                        # MODIFIED: Correctly parse the result from CreateChatRequest
                         if hasattr(result, 'chats') and result.chats:
                             chat = result.chats[0]
+                        elif hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
+                            chat = result.updates.chats[0]
                         else:
                             LOGGER.error(f"Could not find chat in result of type {type(result)} for account {account_name}")
                             await self.bot.send_message(user_id, f"❌ [{account_name}] Unexpected error: Group info not found.")

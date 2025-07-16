@@ -722,17 +722,13 @@ class GroupCreatorBot:
         LOGGER.info(f"Admin {event.sender_id} initiated a self-healing test.")
         await event.reply("🧪 Triggering a test error to check the AI self-healing function...")
         try:
-            await self._intentionally_broken_function()
+            # This will raise a ZeroDivisionError, which will be captured by Sentry
+            # and trigger the full AI analysis and self-healing process.
+            test_var = 1 / 0
         except Exception as e:
             LOGGER.info("Test error was triggered successfully. The AI is now analyzing it.")
             await event.reply("⚙️ یک مشکل شناسایی شد و سیستم در حال رفع خودکار آن است. ربات به زودی مجددا راه‌اندازی خواهد شد.")
             sentry_sdk.capture_exception(e)
-    
-    async def _intentionally_broken_function(self):
-        """This is a placeholder function with a deliberate bug for testing the AI."""
-        # This will raise a NameError because 'undefined_variable' does not exist.
-        # The AI should be able to identify this and suggest a fix.
-        print(undefined_variable)
 
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'

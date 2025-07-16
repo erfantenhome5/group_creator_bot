@@ -5,14 +5,17 @@ import os
 import random
 import re
 import shutil
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
 import sentry_sdk
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest
@@ -29,13 +32,16 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger(__name__)
 
-# --- Environment Loading & Sentry Initialization ---
+# --- Environment Loading ---
 load_dotenv()
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ADDED: Admin User ID for receiving AI suggestions
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 
 # --- Global Proxy Loading Function ---
 def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
@@ -61,54 +67,6 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
         LOGGER.warning(f"Proxy file '{proxy_file_path}' not found.")
     return proxy_list
 
-# MODIFIED: Sentry before_send function for more precise filtering
-def before_send(event, hint):
-    """
-    Filter out very specific, high-volume DEBUG logs from Telethon.
-    """
-    log_record = event.get('logentry', None)
-    if log_record and log_record.get('level') == 'debug':
-        logger_name = log_record.get('logger', '')
-        # Ignore only the noisiest network and packer logs
-        if logger_name in ['telethon.extensions.messagepacker', 'telethon.network.mtprotosender']:
-            return None
-    return event
-
-if SENTRY_DSN:
-    sentry_logging = LoggingIntegration(
-        level=logging.INFO,        # Capture info and above as breadcrumbs
-        event_level=logging.WARNING  # Send warnings and above as events
-    )
-    
-    sentry_options = {
-        "dsn": SENTRY_DSN,
-        "integrations": [sentry_logging],
-        "before_send": before_send,
-        "traces_sample_rate": 1.0,
-    }
-
-    # ADDED: Configure proxy for Sentry reports
-    proxies_for_sentry = load_proxies_from_file("proxy10.txt")
-    if proxies_for_sentry:
-        sentry_proxy = random.choice(proxies_for_sentry)
-        proxy_url = f"http://{sentry_proxy['addr']}:{sentry_proxy['port']}"
-        sentry_options["http_proxy"] = proxy_url
-        sentry_options["https_proxy"] = proxy_url
-        LOGGER.info(f"Sentry will use proxy: {proxy_url}")
-    else:
-        LOGGER.info("Sentry will not use a proxy (none found).")
-
-    sentry_sdk.init(**sentry_options)
-    LOGGER.info("Sentry initialized for error and log reporting.")
-
-if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
-    raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, and ENCRYPTION_KEY are set.")
-
-API_ID = int(API_ID)
-SESSIONS_DIR = Path("sessions")
-SESSIONS_DIR.mkdir(exist_ok=True)
-
-
 # --- Centralized Configuration ---
 class Config:
     """Holds all configurable values and UI strings for the bot."""
@@ -116,19 +74,16 @@ class Config:
     MASTER_PASSWORD = "3935Eerfan@123"
     MAX_CONCURRENT_WORKERS = 5
     GROUPS_TO_CREATE = 50
-    MIN_SLEEP_SECONDS = 60   # 1 minute
-    MAX_SLEEP_SECONDS = 240  # 4 minutes
+    MIN_SLEEP_SECONDS = 60
+    MAX_SLEEP_SECONDS = 240
     GROUP_MEMBER_TO_ADD = '@BotFather'
     PROXY_FILE = "proxy10.txt"
-    PROXY_TIMEOUT = 5 # Increased timeout for better reliability
+    PROXY_TIMEOUT = 5 
 
     # --- UI Text & Buttons ---
-    # Main Menu
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
     BTN_SERVER_STATUS = "📊 وضعیت سرور"
     BTN_HELP = "ℹ️ راهنما"
-
-    # Account Management Menu
     BTN_ADD_ACCOUNT = "➕ افزودن حساب (API)"
     BTN_ADD_ACCOUNT_SELENIUM = "✨ افزودن حساب (مرورگر امن)"
     BTN_BACK = "⬅️ بازگشت"
@@ -150,9 +105,9 @@ class Config:
         f"  - `{BTN_STOP_PREFIX} [نام حساب]`: عملیات در حال اجرا برای یک حساب را متوقف می‌کند.\n"
         f"  - `{BTN_DELETE_PREFIX} [نام حساب]`: یک حساب و تمام اطلاعات آن را برای همیشه حذف می‌کند.\n\n"
         f"**{BTN_SERVER_STATUS}**\n"
-        "این گزینه اطلاعات لحظه‌ای درباره وضعیت ربات را نمایش می‌دهد:\n"
-        "  - تعداد کل پردازش‌های فعال.\n"
-        "  - لیست حساب‌هایی که در حال حاضر مشغول به کار هستند."
+        "این گزینه اطلاعات لحظه‌ای درباره وضعیت ربات را نمایش می‌دهد.\n\n"
+        "**دستورات ویژه:**\n"
+        "  - `/refine_code`: از هوش مصنوعی برای تحلیل و پیشنهاد بهبود برای کد ربات استفاده کنید."
     )
     MSG_PROMPT_MASTER_PASSWORD = "🔑 لطفا برای دسترسی به ربات، رمز عبور اصلی را وارد کنید:"
     MSG_INCORRECT_MASTER_PASSWORD = "❌ رمز عبور اشتباه است. لطفا دوباره تلاش کنید."
@@ -165,8 +120,8 @@ class GroupCreatorBot:
     def __init__(self) -> None:
         """Initializes the bot instance and the encryption engine."""
         self.bot = TelegramClient('bot_session', API_ID, API_HASH)
-        self.user_sessions: Dict[int, Dict[str, Any]] = {} # Combined session state
-        self.active_workers: Dict[str, asyncio.Task] = {}  # Key is "user_id:account_name"
+        self.user_sessions: Dict[int, Dict[str, Any]] = {} 
+        self.active_workers: Dict[str, asyncio.Task] = {}  
         self.worker_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_WORKERS)
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
@@ -177,6 +132,140 @@ class GroupCreatorBot:
             self.fernet = Fernet(ENCRYPTION_KEY.encode())
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
+        
+        # MODIFIED: Sentry initialization moved here to access instance methods
+        self._initialize_sentry()
+
+    # --- Sentry and AI Methods ---
+    def _initialize_sentry(self):
+        """Initializes the Sentry SDK with instance-aware hooks."""
+        if not SENTRY_DSN:
+            return
+
+        sentry_logging = LoggingIntegration(
+            level=logging.INFO,
+            event_level=logging.ERROR,
+            sentry_logs_level=logging.DEBUG
+        )
+        
+        sentry_options = {
+            "dsn": SENTRY_DSN,
+            "integrations": [sentry_logging],
+            "traces_sample_rate": 1.0,
+            "_experiments": {
+                "enable_logs": True,
+            },
+            # MODIFIED: before_send now triggers the AI analysis
+            "before_send": self._before_send_hook,
+        }
+
+        proxies_for_sentry = load_proxies_from_file("proxy10.txt")
+        if proxies_for_sentry:
+            sentry_proxy = random.choice(proxies_for_sentry)
+            proxy_url = f"http://{sentry_proxy['addr']}:{sentry_proxy['port']}"
+            sentry_options["http_proxy"] = proxy_url
+            sentry_options["https_proxy"] = proxy_url
+            LOGGER.info(f"Sentry will use proxy: {proxy_url}")
+        else:
+            LOGGER.info("Sentry will not use a proxy (none found).")
+
+        sentry_sdk.init(**sentry_options)
+        LOGGER.info("Sentry initialized with proactive AI error analysis.")
+
+    def _before_send_hook(self, event: Event, hint: Hint) -> Optional[Event]:
+        """Sentry hook to filter logs and trigger AI analysis on exceptions."""
+        # First, handle log filtering
+        if 'log_record' in hint:
+            log_record = hint['log_record']
+            if log_record.levelno == logging.DEBUG and log_record.name.startswith('telethon'):
+                message = log_record.getMessage()
+                noisy_patterns = [
+                    "Assigned msg_id", "Encrypting", "Encrypted messages put in a queue",
+                    "Waiting for messages to send", "Handling pong", "Receiving items from the network",
+                    "Handling gzipped data", "Handling update", "Handling RPC result",
+                    "stopped chain of propagation"
+                ]
+                for pattern in noisy_patterns:
+                    if pattern in message:
+                        return None  # Discard noisy log
+        
+        # Now, handle exceptions
+        if 'exc_info' in hint:
+            exc_type, exc_value, tb = hint['exc_info']
+            # Trigger AI analysis in the background for any captured exception
+            asyncio.create_task(self._analyze_error_with_ai(exc_type, exc_value, tb))
+
+        return event
+
+    async def _analyze_error_with_ai(self, exc_type, exc_value, tb):
+        """Analyzes an error with Gemini and sends a report to the admin."""
+        if not GEMINI_API_KEY or not ADMIN_USER_ID:
+            LOGGER.warning("Cannot run AI analysis: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
+            return
+
+        try:
+            LOGGER.info(f"AI is analyzing an error: {exc_type.__name__}")
+            
+            source_code = Path(__file__).read_text()
+            traceback_str = "".join(traceback.format_exception(exc_type, exc_value, tb))
+
+            prompt = (
+                "You are an expert Python code reviewer specializing in robust, asynchronous Telegram bots using the Telethon library. "
+                "An error was just captured by Sentry. Analyze the traceback and the full source code to identify the root cause. "
+                "Provide a concise, bulleted list of actionable suggestions to fix the error and improve the code's robustness.\n\n"
+                "### Traceback:\n"
+                "```\n"
+                f"{traceback_str}\n"
+                "```\n\n"
+                "### Full Source Code:\n"
+                "```python\n"
+                f"{source_code}\n"
+                "```"
+            )
+            
+            suggestions = await self._call_gemini_api(prompt)
+            
+            if suggestions:
+                response_message = (
+                    f"🚨 **گزارش خودکار از هوش مصنوعی (Gemini):**\n\n"
+                    f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. در اینجا یک تحلیل و پیشنهاد برای رفع آن ارائه می‌شود:\n\n"
+                    f"{suggestions}"
+                )
+                
+                for i in range(0, len(response_message), 4096):
+                    await self.bot.send_message(int(ADMIN_USER_ID), response_message[i:i+4096])
+            else:
+                LOGGER.error("AI analysis returned no suggestions.")
+
+        except Exception as e:
+            LOGGER.error(f"The AI analysis process itself failed: {e}", exc_info=True)
+            # Avoid an infinite loop by not capturing this specific error in Sentry again
+            
+    async def _call_gemini_api(self, prompt: str) -> Optional[str]:
+        """Generic function to call the Gemini API."""
+        if not GEMINI_API_KEY:
+            return None
+            
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        headers = {'Content-Type': 'application/json'}
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+        proxy_url = None
+        if self.proxies:
+            proxy = random.choice(self.proxies)
+            proxy_url = f"http://{proxy['addr']}:{proxy['port']}"
+
+        try:
+            async with httpx.AsyncClient(proxies=proxy_url) as client:
+                response = await client.post(api_url, json=payload, headers=headers, timeout=120)
+                response.raise_for_status()
+            
+            result = response.json()
+            return result['candidates'][0]['content']['parts'][0]['text']
+        except Exception as e:
+            LOGGER.error(f"Failed to call Gemini API: {e}")
+            # Do not capture this in Sentry to avoid loops, as it's an infrastructure issue.
+            return None
 
     # --- Proxy Helpers ---
     def _load_account_proxies(self) -> Dict[str, Dict]:
@@ -421,6 +510,7 @@ class GroupCreatorBot:
                 for i in range(Config.GROUPS_TO_CREATE):
                     current_semester += 1
                     group_title = f"collage Semester {current_semester}"
+
                     try:
                         request = CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title)
                         result = await self._send_request_with_reconnect(user_client, request, account_name)
@@ -675,8 +765,65 @@ class GroupCreatorBot:
     async def _test_sentry_handler(self, event: events.NewMessage.Event) -> None:
         LOGGER.info(f"User {event.sender_id} initiated a Sentry test.")
         await event.reply("🧪 Sending a test error to Sentry. Please check your Sentry dashboard.")
-        # This will cause an unhandled exception that Sentry should capture.
-        division_by_zero = 1 / 0
+        try:
+            division_by_zero = 1 / 0
+        except Exception as e:
+            # This will be captured by the before_send hook, which will trigger the AI analysis
+            sentry_sdk.capture_exception(e)
+            await event.reply("✅ Test error sent! The AI is now analyzing it...")
+
+    async def _refine_code_handler(self, event: events.NewMessage.Event) -> None:
+        """Uses Gemini to analyze the bot's code and recent logs to suggest improvements."""
+        user_id = event.sender_id
+        if not GEMINI_API_KEY:
+            await event.reply("❌ قابلیت تحلیل کد با هوش مصنوعی غیرفعال است. لطفاً `GEMINI_API_KEY` را در فایل `.env` تنظیم کنید.")
+            return
+
+        await event.reply("🤖 در حال ارسال کد و لاگ‌ها برای تحلیل توسط هوش مصنوعی Gemini... این کار ممکن است کمی طول بکشد.")
+        
+        try:
+            source_code = Path(__file__).read_text()
+            
+            try:
+                with open("bot_activity.log", "r") as f:
+                    log_lines = f.readlines()
+                    recent_logs = "".join(log_lines[-50:])
+            except FileNotFoundError:
+                recent_logs = "Log file not found."
+
+            prompt = (
+                "You are an expert Python code reviewer specializing in robust, asynchronous Telegram bots using the Telethon library. "
+                "Analyze the following Python code and the recent log entries. Provide a concise, bulleted list of actionable suggestions "
+                "to improve the code's robustness, error handling, efficiency, or clarity. "
+                "Base your suggestions on both the code structure and any errors or patterns visible in the logs. "
+                "Do not rewrite the entire code. Focus on specific, impactful recommendations.\n\n"
+                "### Source Code:\n"
+                "```python\n"
+                f"{source_code}\n"
+                "```\n\n"
+                "### Recent Log Entries:\n"
+                "```log\n"
+                f"{recent_logs}\n"
+                "```"
+            )
+            
+            suggestions = await self._call_gemini_api(prompt)
+
+            if suggestions:
+                response_message = f"**💡 پیشنهادات Gemini برای بهبود کد (بر اساس کد و لاگ‌ها):**\n\n{suggestions}"
+                for i in range(0, len(response_message), 4096):
+                    await event.reply(response_message[i:i+4096])
+            else:
+                await event.reply("❌ هوش مصنوعی نتوانست پیشنهادی ارائه دهد. لطفاً دوباره تلاش کنید.")
+
+        except FileNotFoundError:
+            await event.reply("❌ خطا: فایل کد منبع ربات یافت نشد.")
+        except Exception as e:
+            LOGGER.error(f"AI code refinement failed: {e}", exc_info=True)
+            sentry_sdk.capture_exception(e)
+            await event.reply(f"❌ خطایی در هنگام ارتباط با سرویس Gemini رخ داد: `{type(e).__name__}`")
+        
+        raise events.StopPropagation
 
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
@@ -730,6 +877,7 @@ class GroupCreatorBot:
             "/debug_proxies": self._debug_test_proxies_handler,
             "/clean_sessions": self._clean_sessions_handler,
             "/test_sentry": self._test_sentry_handler,
+            "/refine_code": self._refine_code_handler,
         }
         
         handler = route_map.get(text)

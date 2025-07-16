@@ -151,24 +151,15 @@ class GroupCreatorBot:
 
         def before_send_hook(event: Event, hint: Hint) -> Optional[Event]:
             """Sentry hook to filter logs and trigger AI analysis on exceptions."""
-            is_test_error = event.get('tags', {}).get('test_error') == 'true'
-
-            if 'log_record' in hint:
-                log_record = hint['log_record']
-                if log_record.levelno == logging.DEBUG and log_record.name.startswith('telethon'):
-                    message = log_record.getMessage()
-                    noisy_patterns = [
-                        "Assigned msg_id", "Encrypting", "Encrypted messages put in a queue",
-                        "Waiting for messages to send", "Handling pong", "Receiving items from the network",
-                        "Handling gzipped data", "Handling update", "Handling RPC result",
-                        "stopped chain of propagation"
-                    ]
-                    for pattern in noisy_patterns:
-                        if pattern in message:
-                            return None
-            
-            if 'exc_info' in hint and not is_test_error:
+            # MODIFIED: This logic is now handled by the test command itself
+            if 'exc_info' in hint:
                 exc_type, exc_value, tb = hint['exc_info']
+                # Check if the error originated from the self-heal test
+                traceback_summary = traceback.extract_tb(tb)
+                if any('_test_self_heal_handler' in frame.name for frame in traceback_summary):
+                    # This is a deliberate test error, let the AI handle it but don't tag it.
+                    pass 
+                
                 asyncio.create_task(self.ai_analyzer.analyze_and_apply_fix(exc_type, exc_value, tb))
 
             return event
@@ -717,18 +708,18 @@ class GroupCreatorBot:
         await self.ai_analyzer.refine_code(event)
         raise events.StopPropagation
         
-    # ADDED: New handler to test the self-healing function
     async def _test_self_heal_handler(self, event: events.NewMessage.Event) -> None:
         """Intentionally triggers a fixable error to test the self-healing pipeline."""
         LOGGER.info(f"Admin {event.sender_id} initiated a self-healing test.")
         await event.reply("🧪 Triggering a test error to check the AI self-healing function...")
         try:
-            # This function is designed to have a bug that the AI can fix.
             await self._intentionally_broken_function()
         except Exception as e:
             # The error will be caught and sent to Sentry by the global handler,
             # which then triggers the AI analysis.
             LOGGER.info("Test error was triggered successfully. The AI is now analyzing it.")
+            # Inform user that maintenance is happening
+            await event.reply("⚙️ یک مشکل شناسایی شد و سیستم در حال رفع خودکار آن است. ربات به زودی مجددا راه‌اندازی خواهد شد.")
     
     async def _intentionally_broken_function(self):
         """This is a placeholder function with a deliberate bug for testing the AI."""

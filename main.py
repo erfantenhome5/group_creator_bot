@@ -87,7 +87,7 @@ class Config:
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 60
     MAX_SLEEP_SECONDS = 240
-    GROUP_MEMBER_TO_ADD = '@BotFather' # MODIFIED: Changed invited user
+    GROUP_MEMBER_TO_ADD = '@erfantenhome1' # MODIFIED: Changed invited user
     PROXY_FILE = "proxy10.txt"
     PROXY_TIMEOUT = 5 
 
@@ -416,6 +416,64 @@ class GroupCreatorBot:
         keyboard.append([Button.text(Config.BTN_BACK)])
         return keyboard
         
+    async def _generate_persian_messages(self) -> List[str]:
+        """Generates 10 Persian messages about life and God using the Gemini API."""
+        if not GEMINI_API_KEY:
+            LOGGER.warning("GEMINI_API_KEY not set. Skipping message generation.")
+            return []
+
+        prompt = (
+            "ایجاد ۱۰ پیام یا نقل قول منحصر به فرد و عمیق به زبان فارسی. "
+            "این پیام‌ها باید درباره موضوعات «زندگی»، «معنای زندگی» و «خدا» باشند. "
+            "لطفا پاسخ را در قالب یک آرایه JSON از رشته‌ها برگردانید. مثال: "
+            '["پیام اول", "پیام دوم", ...]'
+            "فقط و فقط آرایه JSON را بدون هیچ متن اضافی، توضیحات یا قالب‌بندی دیگری برگردانید."
+        )
+
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+            }
+        }
+        headers = {'Content-Type': 'application/json'}
+
+        proxy = None
+        if self.proxies:
+            proxy_choice = random.choice(self.proxies)
+            proxy = f"http://{proxy_choice['addr']}:{proxy_choice['port']}"
+            LOGGER.info(f"Using proxy {proxy} for Gemini message generation.")
+
+        try:
+            async with httpx.AsyncClient(proxies=proxy) as client:
+                response = await client.post(api_url, json=payload, headers=headers, timeout=40.0)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                if data.get("candidates") and data["candidates"][0].get("content", {}).get("parts"):
+                    json_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    messages = json.loads(json_text)
+                    
+                    if isinstance(messages, list) and all(isinstance(item, str) for item in messages):
+                        LOGGER.info(f"Successfully generated {len(messages)} messages from Gemini.")
+                        return messages
+                    else:
+                        LOGGER.warning(f"Gemini API returned an unexpected format inside JSON: {messages}")
+                else:
+                    LOGGER.warning(f"Unexpected Gemini API response structure: {data}")
+
+        except httpx.RequestError as e:
+            LOGGER.error(f"Error calling Gemini API for messages: {e}.")
+        except json.JSONDecodeError as e:
+            LOGGER.error(f"Error decoding JSON from Gemini response part: {e}.")
+        except Exception as e:
+            LOGGER.error(f"An unexpected error occurred during message generation: {e}.")
+
+        return []
+
     # --- Main Worker Task ---
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
         worker_key = f"{user_id}:{account_name}"
@@ -468,6 +526,21 @@ class GroupCreatorBot:
                         except Exception as e:
                             LOGGER.warning(f"Could not invite {Config.GROUP_MEMBER_TO_ADD} to {new_supergroup.title}. Error: {e}")
                         
+                        # 3. Send AI-generated messages to the new supergroup
+                        LOGGER.info(f"Generating AI messages for {new_supergroup.title}...")
+                        ai_messages = await self._generate_persian_messages()
+                        if ai_messages:
+                            LOGGER.info(f"Sending {len(ai_messages)} AI-generated messages to {new_supergroup.title}.")
+                            for message_text in ai_messages:
+                                try:
+                                    await user_client.send_message(new_supergroup.id, message_text)
+                                    await asyncio.sleep(random.uniform(2, 5)) # Sleep between messages
+                                except Exception as e:
+                                    LOGGER.error(f"Failed to send AI message to {new_supergroup.id}: {e}")
+                                    break # Stop sending if one fails
+                        else:
+                            LOGGER.warning(f"Failed to generate AI messages for {new_supergroup.title}. Skipping.")
+
                         # --- Update progress and sleep ---
                         self._set_group_count(worker_key, current_semester)
                         

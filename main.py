@@ -453,18 +453,7 @@ class GroupCreatorBot:
                         input_channel = await user_client.get_input_entity(new_supergroup.id)
                         LOGGER.info(f"Successfully created supergroup '{new_supergroup.title}' (ID: {new_supergroup.id}).")
 
-                        # 2. Make chat history visible to new members (TogglePreHistoryHidden)
-                        await self._send_request_with_reconnect(
-                            user_client,
-                            functions.channels.TogglePreHistoryHiddenRequest(
-                                channel=input_channel,
-                                enabled=False # False makes history visible
-                            ),
-                            account_name
-                        )
-                        LOGGER.info(f"Chat history for new members in supergroup {new_supergroup.id} is now visible.")
-
-                        # 3. Add the specified member to the new supergroup
+                        # 2. Add the specified member to the new supergroup
                         try:
                             member_to_add = await user_client.get_input_entity(Config.GROUP_MEMBER_TO_ADD)
                             await self._send_request_with_reconnect(

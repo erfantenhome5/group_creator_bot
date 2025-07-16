@@ -354,30 +354,39 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
         return False
 
-    async def _create_login_client(self) -> Optional[TelegramClient]:
-        """Creates a temporary client for the login flow, trying a random proxy."""
+    async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
+        """
+        Creates a temporary client for the login flow using a specific proxy or a direct connection.
+        This version is deterministic and does not fall back to random proxies.
+        """
         session = StringSession()
-        device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+        # Use a random device profile for the client to mimic a real device
+        device_params = random.choice([
+            {'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'},
+            {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}
+        ])
 
-        if self.proxies:
-            proxy = random.choice(self.proxies)
+        if proxy:
             proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             try:
-                LOGGER.debug(f"Attempting login connection with random proxy: {proxy_addr}")
+                LOGGER.debug(f"Attempting login connection with specified proxy: {proxy_addr}")
                 client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
                 await client.connect()
                 return client
             except Exception as e:
-                LOGGER.warning(f"Random proxy {proxy_addr} failed for login: {e}")
-        
-        LOGGER.warning("Login connection falling back to no proxy.")
-        try:
-            client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
-            await client.connect()
-            return client
-        except Exception as e:
-            LOGGER.error(f"Failed to connect without proxy for login: {e}")
-            return None
+                # If the specified proxy fails, we do not proceed.
+                LOGGER.error(f"Specified proxy {proxy_addr} failed for login: {e}")
+                return None
+        else:
+            # If no proxy was provided, attempt a direct connection.
+            LOGGER.warning("No proxy specified for login. Attempting direct connection.")
+            try:
+                client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
+                await client.connect()
+                return client
+            except Exception as e:
+                LOGGER.error(f"Failed to connect without proxy for login: {e}")
+                return None
 
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         """Creates a client for a worker, using its assigned proxy."""
@@ -552,23 +561,33 @@ class GroupCreatorBot:
         user_id = event.sender_id
         account_name = self.user_sessions[user_id]['account_name']
         worker_key = f"{user_id}:{account_name}"
-        
+
+        # Save the session string first.
         self._save_session_string(user_id, account_name, user_client.session.save())
 
-        assigned_proxy = self._get_available_proxy()
+        # Retrieve the proxy used during login and assign it permanently.
+        assigned_proxy = self.user_sessions[user_id].get('login_proxy')
         self.account_proxies[worker_key] = assigned_proxy
         self._save_account_proxies()
-        
+
         if assigned_proxy:
             proxy_addr = f"{assigned_proxy['addr']}:{assigned_proxy['port']}"
-            LOGGER.info(f"Assigned available proxy {proxy_addr} to account '{account_name}'.")
+            LOGGER.info(f"Assigned login proxy {proxy_addr} to account '{account_name}'.")
         else:
-            LOGGER.warning(f"No available proxies. Account '{account_name}' will run without a proxy.")
-            await self.bot.send_message(user_id, f"⚠️ **هشدار:** تمام پراکسی‌ها در حال استفاده هستند. حساب `{account_name}` بدون پراکسی اضافه شد.")
+            LOGGER.info(f"Account '{account_name}' was logged in directly and will run without a proxy.")
 
+        # Explicitly disconnect the temporary login client.
+        if user_client and user_client.is_connected():
+            await user_client.disconnect()
+            LOGGER.info(f"Login client for user {user_id} ('{account_name}') disconnected successfully.")
+
+        # Clean up all temporary session data.
         if 'client' in self.user_sessions[user_id]:
             del self.user_sessions[user_id]['client']
-        self.user_sessions[user_id]['state'] = 'authenticated' 
+        if 'login_proxy' in self.user_sessions[user_id]:
+            del self.user_sessions[user_id]['login_proxy']
+            
+        self.user_sessions[user_id]['state'] = 'authenticated'
 
         await self.bot.send_message(user_id, f"✅ حساب `{account_name}` با موفقیت اضافه شد!")
         await self._send_accounts_menu(event)
@@ -811,18 +830,24 @@ class GroupCreatorBot:
             await self._start_handler(event)
             return
 
+        # Handle admin commands
         admin_routes = {
             "/debug_proxies": self._debug_test_proxies_handler,
             "/clean_sessions": self._clean_sessions_handler,
             "/test_sentry": self._test_sentry_handler,
-            "/refine_code": self._refine_code_handler,
             "/test_self_heal": self._test_self_heal_handler,
         }
+        
+        # Handle /refine_code separately as it can take arguments
+        if text.startswith("/refine_code"):
+            await self._admin_command_handler(event, self._refine_code_handler)
+            return
 
         if text in admin_routes:
             await self._admin_command_handler(event, admin_routes[text])
             return
 
+        # Handle regular user buttons and commands
         route_map = {
             Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
             Config.BTN_HELP: self._help_handler,
@@ -950,14 +975,23 @@ class GroupCreatorBot:
     async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         self.user_sessions[user_id]['phone'] = event.text.strip()
-        
+
+        # Select and store the proxy for this entire login session.
+        selected_proxy = self._get_available_proxy()
+        self.user_sessions[user_id]['login_proxy'] = selected_proxy # Store the chosen proxy
+        proxy_msg = f" with proxy {selected_proxy['addr']}:{selected_proxy['port']}" if selected_proxy else " directly"
+
         user_client = None
         try:
-            user_client = await self._create_login_client()
+            # Pass the selected proxy to the login client creator.
+            user_client = await self._create_login_client(selected_proxy) 
             if not user_client:
-                await event.reply('❌ اتصال به تلگرام با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد. لطفا بعدا تلاش کنید.')
+                await event.reply(f'❌ اتصال به تلگرام{proxy_msg} با شکست مواجه شد. لطفا بعدا تلاش کنید.')
+                # Clean up session state if connection fails
+                if 'login_proxy' in self.user_sessions[user_id]:
+                    del self.user_sessions[user_id]['login_proxy']
                 return
-                
+
             self.user_sessions[user_id]['client'] = user_client
             sent_code = await user_client.send_code_request(self.user_sessions[user_id]['phone'])
             self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
@@ -966,12 +1000,13 @@ class GroupCreatorBot:
         except Exception as e:
             LOGGER.error(f"Phone input error for {user_id}", exc_info=True)
             sentry_sdk.capture_exception(e)
-            self.user_sessions[user_id]['state'] = 'awaiting_phone' 
+            self.user_sessions[user_id]['state'] = 'awaiting_phone'
             await event.reply(
                 '❌ **خطا:** شماره تلفن نامعتبر است یا مشکلی در ارسال کد رخ داد. لطفا دوباره با فرمت بین‌المللی (+کد کشور) تلاش کنید یا عملیات را لغو کنید.',
                 buttons=[[Button.text(Config.BTN_BACK)]]
             )
         finally:
+            # If the process did not proceed to awaiting code, disconnect the temporary client.
             if user_client and self.user_sessions.get(user_id, {}).get('state') != 'awaiting_code':
                  if user_client.is_connected():
                     await user_client.disconnect()

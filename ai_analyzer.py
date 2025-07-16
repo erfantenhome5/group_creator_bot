@@ -28,7 +28,7 @@ class AIAnalyzer:
 
     async def analyze_and_apply_fix(self, exc_type, exc_value, tb):
         """
-        Analyzes an error, generates a corrected function, and notifies the admin.
+        Analyzes an error, generates a corrected function, and replaces the old function in the source code.
         """
         if not self.gemini_api_key or not self.admin_user_id:
             LOGGER.warning("Cannot run AI error analysis: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
@@ -56,7 +56,7 @@ class AIAnalyzer:
             
             response_message = (
                 f"🚨 **گزارش خودکار از هوش مصنوعی ({used_model}):**\n\n"
-                f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. تحلیل و راه حل زیر تولید شد:\n\n"
+                f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. تحلیل و راه حل زیر تولید شد و در حال اعمال است:\n\n"
                 f"{suggestions}"
             )
             
@@ -111,7 +111,7 @@ class AIAnalyzer:
 
     def _apply_code_fix(self, file_path: Path, new_function_code: str) -> bool:
         """
-        Replaces an entire function in a file with new code.
+        Replaces an entire function in a file with new code. This is more robust than patching.
         """
         try:
             match = re.search(r"def\s+(\w+)\s*\(", new_function_code)
@@ -123,11 +123,14 @@ class AIAnalyzer:
             
             original_code = file_path.read_text()
             
+            # This regex finds the function definition, including decorators, and replaces it.
+            # It looks for the start of a function definition and continues until the next function
+            # or the end of the class, which is determined by indentation.
             pattern = re.compile(
-                rf"(?:@\w+\n)*\s*async\s+def\s+{func_name}\s*\([^)]*\):\s*.*?(?=\n\s*(?:@\w+\n)*\s*(?:async\s+)?def|\n\s*class|\Z)", 
-                re.DOTALL
+                rf"(^(\s*@\w+\s*\n)*\s*async\s+def\s+{func_name}\s*\([^)]*\):\s*\n(?:(?!\n^\s*def|\n^\s*class).*\n?)*)",
+                re.MULTILINE
             )
-            
+
             if not pattern.search(original_code):
                  pattern = re.compile(
                     rf"(?:@\w+\n)*\s*def\s+{func_name}\s*\([^)]*\):\s*.*?(?=\n\s*(?:@\w+\n)*\s*(?:async\s+)?def|\n\s*class|\Z)", 
@@ -138,8 +141,10 @@ class AIAnalyzer:
                 LOGGER.error(f"Could not find the original function '{func_name}' in the source code to replace it.")
                 return False
 
+            # Replace the old function with the new one
             modified_code = pattern.sub(new_function_code, original_code, count=1)
             
+            # Write the modified code back to the file
             file_path.write_text(modified_code)
             return True
 

@@ -7,6 +7,7 @@ import random
 import re
 import shutil
 import traceback
+import uuid  # Added for generating random usernames
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -430,7 +431,8 @@ class GroupCreatorBot:
 
                 for i in range(Config.GROUPS_TO_CREATE):
                     current_semester += 1
-                    group_title = f"ترم دانشگاه {current_semester}"
+                    # MODIFIED: Changed group title to English as requested
+                    group_title = f"collage Semester {current_semester}"
 
                     try:
                         request = CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title)
@@ -447,15 +449,44 @@ class GroupCreatorBot:
                             current_semester -= 1 
                             continue
                         
-                        # Make chat history visible after creation
+                        # MODIFIED: Replaced old history toggle with supergroup upgrade logic
+                        # --- Upgrade to Supergroup and set History Visibility ---
                         try:
+                            # Telethon needs an InputChannel for these operations, which we get from the chat entity
+                            input_channel = await user_client.get_input_entity(chat.id)
+
+                            # 1. Upgrade to a supergroup by making it public with a random username.
+                            # This is a reliable method. The username must start with a letter.
+                            random_username = 'a' + uuid.uuid4().hex 
+                            LOGGER.info(f"Attempting to upgrade group {chat.id} to a supergroup by setting username: {random_username}")
+                            
+                            await user_client(functions.channels.UpdateUsernameRequest(
+                                channel=input_channel,
+                                username=random_username
+                            ))
+                            LOGGER.info(f"Group {chat.id} successfully upgraded to a supergroup.")
+
+                            # 2. Now that it's a supergroup, make chat history visible to new members.
                             await user_client(functions.channels.TogglePreHistoryHiddenRequest(
-                                channel=chat,
+                                channel=input_channel,
                                 enabled=False
                             ))
-                            LOGGER.info(f"تاریخچه چت برای اعضای جدید در گروه {chat.id} قابل مشاهده شد.")
+                            LOGGER.info(f"Chat history for new members in group {chat.id} is now visible.")
+                            
+                            # 3. (Optional but good practice) Make the group private again to not leave public groups around.
+                            await user_client(functions.channels.UpdateUsernameRequest(
+                                channel=input_channel,
+                                username=""  # Setting username to empty string makes it private
+                            ))
+                            LOGGER.info(f"Group {chat.id} has been made private again.")
+
+                        except errors.UsernameOccupiedError as e:
+                            # This is unlikely with a UUID but handled just in case.
+                            LOGGER.error(f"Could not upgrade group {chat.id} because the random username was occupied. Skipping history toggle. Error: {e}")
                         except Exception as e:
-                            LOGGER.warning(f"نتوانست تاریخچه چت را برای گروه {chat.id} قابل مشاهده کند: {e}")
+                            # This will catch other potential errors during the upgrade/toggle process.
+                            LOGGER.warning(f"Could not make chat history visible for group {chat.id}. Error: {e}\n{traceback.format_exc()}")
+
 
                         self._set_group_count(worker_key, current_semester)
                         

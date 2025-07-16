@@ -135,7 +135,6 @@ class GroupCreatorBot:
         self.proxies = load_proxies_from_file(Config.PROXY_FILE)
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
-        # ADDED: User tracking for broadcasts
         self.known_users_file = SESSIONS_DIR / "known_users.json"
         self.known_users = self._load_known_users()
         try:
@@ -577,7 +576,6 @@ class GroupCreatorBot:
     # --- Bot Event Handlers ---
     async def _start_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        # ADDED: Track users who start the bot
         if user_id not in self.known_users:
             self.known_users.append(user_id)
             self._save_known_users()
@@ -1044,6 +1042,8 @@ class GroupCreatorBot:
         try:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service has started successfully.")
+            if self.known_users:
+                await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
             await self.bot.run_until_disconnected()
         finally:
             LOGGER.info("Bot service is shutting down. Disconnecting main bot client.")

@@ -440,7 +440,9 @@ class GroupCreatorBot:
 
                         chat = None
                         # MODIFIED: Correctly parse the result from CreateChatRequest
-                        if hasattr(result, 'chats') and result.chats:
+                                                if hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
+                            chat = result.updates.chats[0]
+                        elif hasattr(result, 'chats') and result.chats: # Keep old check as a fallback
                             chat = result.chats[0]
                         elif hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
                             chat = result.updates.chats[0]

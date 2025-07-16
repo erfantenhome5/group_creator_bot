@@ -14,15 +14,13 @@ from typing import Any, Dict, List, Optional
 import sentry_sdk
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
-from pyrogram.errors import (AuthKeyUnregistered, FloodWait, InputUserDeactivated,
-                             PhoneCodeExpired, SessionPasswordNeeded, UserIsBlocked)
-from pyrogram.handlers import MessageHandler
-from pyrogram.raw import functions
-from pyrogram.types import (KeyboardButton, Message, ReplyKeyboardMarkup,
-                            ReplyKeyboardRemove)
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.types import Event, Hint
+from telethon import Button, TelegramClient, errors, events
+from telethon.sessions import StringSession
+from telethon.tl import functions
+from telethon.tl.functions.messages import CreateChatRequest
+from telethon.tl.types import Message
 
 from ai_analyzer import AIAnalyzer
 from session_manager import SessionManager
@@ -47,7 +45,6 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
-MASTER_PASSWORD_HASH = os.getenv("MASTER_PASSWORD_HASH")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
     raise ValueError("Missing required environment variables.")
@@ -67,7 +64,7 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
                 if not line: continue
                 try:
                     ip, port = line.split(':', 1)
-                    proxy_list.append({"scheme": "http", "hostname": ip, "port": int(port)})
+                    proxy_list.append({'proxy_type': 'http', 'addr': ip, 'port': int(port)})
                 except ValueError:
                     LOGGER.warning(f"Skipping malformed proxy line: {line}.")
         LOGGER.info(f"Loaded {len(proxy_list)} proxies from {proxy_file_path}.")
@@ -82,8 +79,9 @@ class Config:
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 60
     MAX_SLEEP_SECONDS = 240
-    GROUP_MEMBER_TO_ADD = 'BotFather'
+    GROUP_MEMBER_TO_ADD = '@BotFather'
     PROXY_FILE = "proxy10.txt"
+    PROXY_TIMEOUT = 5 
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
     BTN_SERVER_STATUS = "📊 وضعیت سرور"
     BTN_HELP = "ℹ️ راهنما"
@@ -98,10 +96,11 @@ class Config:
     MSG_HELP_TEXT = "برای راهنمایی در مورد نحوه استفاده از ربات، با ادمین تماس بگیرید."
     MSG_PROMPT_MASTER_PASSWORD = "🔑 لطفا برای دسترسی به ربات، رمز عبور اصلی را وارد کنید:"
     MSG_INCORRECT_MASTER_PASSWORD = "❌ رمز عبور اشتباه است."
+    MSG_BROWSER_RUNNING = "⏳ در حال آماده‌سازی مرورگر امن... این کار ممکن است چند لحظه طول بکشد."
 
 class GroupCreatorBot:
     def __init__(self) -> None:
-        self.bot = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=str(SESSIONS_DIR))
+        self.bot = TelegramClient('bot_session', API_ID, API_HASH)
         self.user_sessions: Dict[int, Dict[str, Any]] = {} 
         self.active_workers: Dict[str, asyncio.Task] = {}  
         self.worker_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_WORKERS)
@@ -114,6 +113,11 @@ class GroupCreatorBot:
         self.known_users = self._load_json_file(self.known_users_file, default=[])
         self.active_workers_file = SESSIONS_DIR / "active_workers.json"
         self.active_workers_state = self._load_json_file(self.active_workers_file)
+        try:
+            fernet = Fernet(ENCRYPTION_KEY.encode())
+            self.session_manager = SessionManager(fernet, SESSIONS_DIR)
+        except (ValueError, TypeError):
+            raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
         
         self.ai_analyzer = AIAnalyzer(self)
         self._initialize_sentry()
@@ -149,46 +153,23 @@ class GroupCreatorBot:
 
     def _get_available_proxy(self) -> Optional[Dict]:
         if not self.proxies: return None
-        assigned_proxy_hosts = {p['hostname'] for p in self.account_proxies.values() if p}
+        assigned_proxy_hosts = {p['addr'] for p in self.account_proxies.values() if p}
         for proxy in self.proxies:
-            if proxy['hostname'] not in assigned_proxy_hosts:
+            if proxy['addr'] not in assigned_proxy_hosts:
                 return proxy
         return None
 
-    def get_user_accounts(self, user_id: int) -> List[str]:
-        accounts = []
-        for f in SESSIONS_DIR.glob(f"user_{user_id}_*.session"):
-            match = re.search(f"user_{user_id}__(.*)\\.session", f.name)
-            if match: accounts.append(match.group(1))
-        return sorted(accounts)
-
-    def delete_session_file(self, user_id: int, account_name: str) -> bool:
-        session_name = self._get_session_name(user_id, account_name)
-        session_path = SESSIONS_DIR / f"{session_name}.session"
-        if session_path.exists():
-            try:
-                session_path.unlink()
-                LOGGER.info(f"Deleted session file for {account_name}.")
-                return True
-            except OSError as e:
-                LOGGER.error(f"Error deleting session file for {account_name}: {e}")
-        return False
-
-    def _get_session_name(self, user_id: int, account_name: str) -> str:
-        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', account_name)
-        return f"user_{user_id}__{safe_name}"
-
-    async def _create_user_client(self, session_name: str, proxy: Optional[Dict]) -> Optional[Client]:
+    async def _create_user_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         try:
-            client = Client(session_name, api_id=API_ID, api_hash=API_HASH, workdir=str(SESSIONS_DIR), proxy=proxy)
-            await client.start()
+            client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy)
+            await client.connect()
             return client
         except Exception as e:
-            LOGGER.error(f"Failed to create client for {session_name}: {e}")
+            LOGGER.error(f"Failed to create client: {e}")
             sentry_sdk.capture_exception(e)
             return None
 
-    async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: Client) -> None:
+    async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
         worker_key = f"{user_id}:{account_name}"
         try:
             async with self.worker_semaphore:
@@ -198,15 +179,16 @@ class GroupCreatorBot:
                     current_semester += 1
                     group_title = f"collage Semester {current_semester}"
                     try:
-                        new_chat = await user_client.create_supergroup(group_title)
-                        await user_client.invoke(functions.channels.TogglePreHistoryHidden(channel=await user_client.resolve_peer(new_chat.id), enabled=False))
+                        result = await user_client(CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title))
+                        chat = result.chats[0]
+                        await user_client(functions.channels.TogglePreHistoryHiddenRequest(channel=chat.id, enabled=False))
                         self.group_counts[worker_key] = current_semester
                         self._save_json_file(self.counts_file, self.group_counts)
                         await self.bot.send_message(user_id, f"📊 [{account_name}] گروه '{group_title}' ساخته شد.")
                         await asyncio.sleep(random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS))
-                    except FloodWait as e:
-                        await self.bot.send_message(user_id, f"⏳ [{account_name}] محدودیت تلگرام. {e.value} ثانیه صبر می‌کنیم.")
-                        await asyncio.sleep(e.value)
+                    except errors.FloodWaitError as e:
+                        await self.bot.send_message(user_id, f"⏳ [{account_name}] محدودیت تلگرام. {e.seconds} ثانیه صبر می‌کنیم.")
+                        await asyncio.sleep(e.seconds)
                     except Exception as e:
                         LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
                         sentry_sdk.capture_exception(e)
@@ -220,44 +202,138 @@ class GroupCreatorBot:
                 del self.active_workers[worker_key]
                 self.active_workers_state.pop(worker_key, None)
                 self._save_json_file(self.active_workers_file, self.active_workers_state)
-            if user_client.is_connected:
-                await user_client.stop()
+            if user_client.is_connected():
+                await user_client.disconnect()
             LOGGER.info(f"Worker finished for {worker_key}.")
 
     def _build_main_menu(self):
-        return ReplyKeyboardMarkup([[KeyboardButton(Config.BTN_MANAGE_ACCOUNTS)], [KeyboardButton(Config.BTN_SERVER_STATUS), KeyboardButton(Config.BTN_HELP)]], resize_keyboard=True)
+        return [
+            [Button.text(Config.BTN_MANAGE_ACCOUNTS)],
+            [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)]
+        ]
 
     def _build_accounts_menu(self, user_id: int):
         keyboard = []
-        accounts = self.get_user_accounts(user_id)
+        accounts = self.session_manager.get_user_accounts(user_id)
         for acc_name in accounts:
             worker_key = f"{user_id}:{acc_name}"
             if worker_key in self.active_workers:
-                keyboard.append([KeyboardButton(f"{Config.BTN_STOP_PREFIX} {acc_name}")])
+                keyboard.append([Button.text(f"{Config.BTN_STOP_PREFIX} {acc_name}")])
             else:
-                keyboard.append([KeyboardButton(f"{Config.BTN_START_PREFIX} {acc_name}"), KeyboardButton(f"{Config.BTN_DELETE_PREFIX} {acc_name}")])
-        keyboard.append([KeyboardButton(Config.BTN_ADD_ACCOUNT), KeyboardButton(Config.BTN_ADD_ACCOUNT_SELENIUM)])
-        keyboard.append([KeyboardButton(Config.BTN_BACK)])
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                keyboard.append([Button.text(f"{Config.BTN_START_PREFIX} {acc_name}"), Button.text(f"{Config.BTN_DELETE_PREFIX} {acc_name}")])
+        keyboard.append([Button.text(Config.BTN_ADD_ACCOUNT), Button.text(Config.BTN_ADD_ACCOUNT_SELENIUM)])
+        keyboard.append([Button.text(Config.BTN_BACK)])
+        return keyboard
 
     async def register_handlers(self):
-        self.bot.add_handler(MessageHandler(self._message_router))
+        self.bot.add_event_handler(self._message_router)
 
-    async def _message_router(self, client, message):
-        # ... Implementation of all message routing and command handling ...
-        pass
+    async def _message_router(self, event: events.NewMessage.Event):
+        user_id = event.sender_id
+        text = event.raw_text
+
+        if user_id not in self.known_users:
+            self.known_users.append(user_id)
+            self._save_json_file(self.known_users_file, self.known_users)
+
+        session = self.user_sessions.get(user_id, {})
+        state = session.get('state')
+
+        if text == '/cancel':
+            if 'state' in self.user_sessions.get(user_id, {}):
+                del self.user_sessions[user_id]['state']
+            await event.reply("✅ عملیات فعلی لغو شد.", buttons=self._build_main_menu())
+            return
+
+        if state == 'awaiting_master_password':
+            await self._handle_master_password(event)
+            return
+            
+        if state == 'awaiting_refine_prompt':
+            await self._handle_refine_prompt(event)
+            return
+
+        login_flow_states = ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']
+        if state in login_flow_states:
+            if text == Config.BTN_BACK:
+                self.user_sessions[user_id]['state'] = 'authenticated'
+                await self._start_handler(event)
+                return
+
+            state_map = {
+                'awaiting_phone': self._handle_phone_input,
+                'awaiting_code': self._handle_code_input,
+                'awaiting_password': self._handle_password_input,
+                'awaiting_account_name': self._handle_account_name_input
+            }
+            await state_map[state](event)
+            return
+
+        if state != 'authenticated':
+            await self._start_handler(event)
+            return
+
+        admin_routes = {
+            "/debug_proxies": self._debug_test_proxies_handler,
+            "/clean_sessions": self._clean_sessions_handler,
+            "/test_sentry": self._test_sentry_handler,
+            "/refine_code": self._refine_code_handler,
+            "/test_self_heal": self._test_self_heal_handler,
+        }
+
+        if text in admin_routes:
+            await self._admin_command_handler(event, admin_routes[text])
+            return
+
+        route_map = {
+            Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
+            Config.BTN_HELP: self._help_handler,
+            Config.BTN_BACK: self._start_handler,
+            Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
+            Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
+            Config.BTN_SERVER_STATUS: self._server_status_handler,
+        }
+        
+        handler = route_map.get(text)
+        if handler:
+            await handler(event)
+            return
+
+        if text.startswith(Config.BTN_START_PREFIX):
+            account_name = text.replace(f"{Config.BTN_START_PREFIX} ", "")
+            await self._start_process_handler(event, account_name)
+        elif text.startswith(Config.BTN_STOP_PREFIX):
+            account_name = text.replace(f"{Config.BTN_STOP_PREFIX} ", "")
+            await self._cancel_worker_handler(event, account_name)
+        elif text.startswith(Config.BTN_DELETE_PREFIX):
+            account_name = text.replace(f"{Config.BTN_DELETE_PREFIX} ", "")
+            await self._delete_account_handler(event, account_name)
+
+    async def _start_handler(self, event):
+        user_id = event.sender_id
+        if user_id not in self.known_users:
+            self.known_users.append(user_id)
+            self._save_json_file(self.known_users_file, self.known_users)
+        
+        session = self.user_sessions.get(user_id, {})
+        if session.get('state') == 'authenticated':
+            await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
+        else:
+            self.user_sessions[user_id] = {'state': 'awaiting_master_password'}
+            await event.reply(Config.MSG_PROMPT_MASTER_PASSWORD, buttons=ReplyKeyboardRemove())
 
     async def run(self) -> None:
         await self.register_handlers()
         LOGGER.info("Starting bot...")
-        await self.bot.start()
+        await self.bot.start(bot_token=BOT_TOKEN)
         LOGGER.info("Bot service has started successfully.")
         
         for worker_key, data in list(self.active_workers_state.items()):
             user_id = data['user_id']
             account_name = data['account_name']
             LOGGER.info(f"Resuming worker for {account_name}")
-            await self._start_process_handler(self.bot, None, account_name, user_id=user_id, is_resume=True)
+            dummy_event = events.NewMessage.Event(self.bot.build_in_message(user_id))
+            await self._start_process_handler(dummy_event, account_name, is_resume=True)
         
         if self.known_users:
             await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
@@ -267,6 +343,17 @@ class GroupCreatorBot:
         LOGGER.info("Bot service is shutting down.")
         self._save_json_file(self.active_workers_file, self.active_workers_state)
         await self.bot.stop()
+
+    async def _handle_master_password(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        if event.raw_text.strip() == Config.MASTER_PASSWORD:
+            self.user_sessions[user_id] = {'state': 'authenticated'}
+            await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
+        else:
+            await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
+        raise events.StopPropagation
+    
+    # ... Other handlers ...
 
 if __name__ == "__main__":
     bot_instance = GroupCreatorBot()

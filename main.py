@@ -21,7 +21,7 @@ from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events
 from telethon.sessions import StringSession
 from telethon.tl import functions
-from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest, MigrateChatRequest
+from telethon.tl.functions.channels import CreateChannelRequest, InviteToChannelRequest
 from telethon.tl.types import Message
 
 from session_manager import SessionManager
@@ -416,69 +416,6 @@ class GroupCreatorBot:
         keyboard.append([Button.text(Config.BTN_BACK)])
         return keyboard
         
-    async def _generate_unique_username(self) -> str:
-        """Generates a unique username using the Gemini API or falls back to a random one."""
-        if not GEMINI_API_KEY:
-            LOGGER.warning("GEMINI_API_KEY not set. Falling back to random UUID for username.")
-            return 'a' + uuid.uuid4().hex[:15]
-
-        # Keywords provided by the user
-        keywords = ["erfan", "king", "tenhome", "god", "1234567890", "Oldchannelsbuy", "mmd", "mohammad", "2000", "apr", "afkari"]
-        
-        prompt = (
-            "Create a unique, available, and creative public Telegram channel username. "
-            "The username must start with a letter and can only contain letters, numbers, and underscores. "
-            "It must be between 5 and 32 characters long. "
-            f"Use a creative combination of the following keywords: {', '.join(keywords)}. "
-            "Do not just join them. Be creative. "
-            "Only return the username itself, with no extra text, symbols, or explanations."
-        )
-
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}]
-        }
-        headers = {'Content-Type': 'application/json'}
-
-        # MODIFIED: Select a random proxy for the Gemini API call
-        proxy = None
-        if self.proxies:
-            proxy_choice = random.choice(self.proxies)
-            proxy = f"http://{proxy_choice['addr']}:{proxy_choice['port']}"
-            LOGGER.info(f"Using proxy {proxy} for Gemini API call.")
-
-        try:
-            # MODIFIED: Use the selected proxy with httpx
-            async with httpx.AsyncClient(proxies=proxy) as client:
-                response = await client.post(api_url, json=payload, headers=headers, timeout=20.0)
-                response.raise_for_status() # Raise an exception for bad status codes
-                
-                data = response.json()
-                
-                if data.get("candidates") and data["candidates"][0].get("content", {}).get("parts"):
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    # Clean the response: remove quotes, newlines, and other unwanted characters
-                    username = re.sub(r'[^a-zA-Z0-9_]', '', text).strip()
-                    # Ensure it starts with a letter
-                    if username and not username[0].isalpha():
-                        username = 'a' + username
-                    
-                    if 5 <= len(username) <= 32:
-                        LOGGER.info(f"Generated username with Gemini: {username}")
-                        return username
-                    else:
-                        LOGGER.warning(f"Gemini generated an invalid username '{username}'. Falling back to random.")
-                else:
-                    LOGGER.warning(f"Unexpected Gemini API response format: {data}. Falling back to random.")
-        
-        except httpx.RequestError as e:
-            LOGGER.error(f"Error calling Gemini API: {e}. Falling back to random username.")
-        except Exception as e:
-            LOGGER.error(f"An unexpected error occurred during username generation: {e}. Falling back to random.")
-
-        # Fallback in case of any error
-        return 'a' + uuid.uuid4().hex[:15]
-
     # --- Main Worker Task ---
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
         worker_key = f"{user_id}:{account_name}"
@@ -496,78 +433,53 @@ class GroupCreatorBot:
                 for i in range(Config.GROUPS_TO_CREATE):
                     current_semester += 1
                     group_title = f"collage Semester {current_semester}"
+                    group_description = f"Official group for semester {current_semester}."
 
                     try:
-                        # 1. Create the basic group
-                        create_request = CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title)
-                        create_result = await self._send_request_with_reconnect(user_client, create_request, account_name)
-
-                        basic_chat = None
-                        if hasattr(create_result, 'updates') and hasattr(create_result.updates, 'chats') and create_result.updates.chats:
-                            basic_chat = create_result.updates.chats[0]
-                        elif hasattr(create_result, 'chats') and create_result.chats:
-                            basic_chat = create_result.chats[0]
+                        # 1. Create the supergroup directly
+                        LOGGER.info(f"Attempting to create supergroup '{group_title}' for account {account_name}.")
+                        create_result = await self._send_request_with_reconnect(
+                            user_client,
+                            CreateChannelRequest(
+                                title=group_title,
+                                about=group_description,
+                                megagroup=True  # This is crucial for creating a supergroup
+                            ),
+                            account_name
+                        )
                         
-                        if not basic_chat:
-                            LOGGER.error(f"Could not find chat in result of type {type(create_result)} for account {account_name}")
-                            await self.bot.send_message(user_id, f"❌ [{account_name}] Unexpected error: Group info not found after creation.")
-                            current_semester -= 1 
-                            continue
-                        
-                        LOGGER.info(f"Successfully created basic group '{basic_chat.title}' (ID: {basic_chat.id}).")
+                        # Extract the newly created channel object
+                        new_supergroup = create_result.chats[0]
+                        input_channel = await user_client.get_input_entity(new_supergroup.id)
+                        LOGGER.info(f"Successfully created supergroup '{new_supergroup.title}' (ID: {new_supergroup.id}).")
 
-                        # --- Upgrade to Supergroup and set History Visibility ---
-                        try:
-                            # 2. Migrate the basic group to a supergroup
-                            LOGGER.info(f"Attempting to migrate chat {basic_chat.id} to a supergroup.")
-                            await user_client(MigrateChatRequest(chat_id=basic_chat.id))
-                            await asyncio.sleep(2) # Wait for backend to process the migration
-
-                            # 3. Get the new supergroup entity using a more robust method
-                            exported_invite = await user_client(ExportChatInviteRequest(peer=basic_chat.id))
-                            if not hasattr(exported_invite, 'chat') or not exported_invite.chat:
-                                LOGGER.error(f"Failed to retrieve new supergroup info via invite export for original chat {basic_chat.id}.")
-                                raise Exception("Supergroup migration failed or details not retrievable.")
-                            
-                            new_supergroup = exported_invite.chat
-                            LOGGER.info(f"Successfully migrated to supergroup '{new_supergroup.title}' (New ID: {new_supergroup.id}).")
-                            input_channel = await user_client.get_input_entity(new_supergroup.id)
-
-                            # 4. Set a public username for the new supergroup
-                            username_set = False
-                            for attempt in range(5): # Try up to 5 times
-                                generated_username = await self._generate_unique_username()
-                                LOGGER.info(f"Attempting to set username for supergroup {new_supergroup.id}: @{generated_username} (Attempt {attempt + 1}/5)")
-                                
-                                try:
-                                    await user_client(functions.channels.UpdateUsernameRequest(
-                                        channel=input_channel,
-                                        username=generated_username
-                                    ))
-                                    LOGGER.info(f"Successfully set username for supergroup {new_supergroup.id} to @{generated_username}.")
-                                    username_set = True
-                                    break
-                                except errors.UsernameOccupiedError:
-                                    LOGGER.warning(f"Username '{generated_username}' is occupied. Retrying...")
-                                    await asyncio.sleep(1)
-                            
-                            if not username_set:
-                                LOGGER.error(f"Failed to set a public username for supergroup {new_supergroup.id} after multiple attempts.")
-                                # Continue without a username if all attempts fail
-                            
-                            # 5. Make chat history visible to new members
-                            await user_client(functions.channels.TogglePreHistoryHiddenRequest(
+                        # 2. Make chat history visible to new members (TogglePreHistoryHidden)
+                        await self._send_request_with_reconnect(
+                            user_client,
+                            functions.channels.TogglePreHistoryHiddenRequest(
                                 channel=input_channel,
-                                enabled=False
-                            ))
-                            LOGGER.info(f"Chat history for new members in supergroup {new_supergroup.id} is now visible.")
+                                enabled=False # False makes history visible
+                            ),
+                            account_name
+                        )
+                        LOGGER.info(f"Chat history for new members in supergroup {new_supergroup.id} is now visible.")
 
-                        except errors.ChatAdminRequiredError as e:
-                            LOGGER.error(f"Migration failed for chat {basic_chat.id}: Not admin. {e}")
+                        # 3. Add the specified member to the new supergroup
+                        try:
+                            member_to_add = await user_client.get_input_entity(Config.GROUP_MEMBER_TO_ADD)
+                            await self._send_request_with_reconnect(
+                                user_client,
+                                InviteToChannelRequest(
+                                    channel=input_channel,
+                                    users=[member_to_add]
+                                ),
+                                account_name
+                            )
+                            LOGGER.info(f"Successfully invited {Config.GROUP_MEMBER_TO_ADD} to {new_supergroup.title}.")
                         except Exception as e:
-                            LOGGER.warning(f"Could not complete supergroup upgrade/history toggle for chat {basic_chat.id}. Error: {e}\n{traceback.format_exc()}")
-
-
+                            LOGGER.warning(f"Could not invite {Config.GROUP_MEMBER_TO_ADD} to {new_supergroup.title}. Error: {e}")
+                        
+                        # --- Update progress and sleep ---
                         self._set_group_count(worker_key, current_semester)
                         
                         groups_made = i + 1
@@ -588,23 +500,23 @@ class GroupCreatorBot:
                         sentry_sdk.capture_exception(e)
                         self.session_manager.delete_session_file(user_id, account_name)
                         self._remove_group_count(worker_key)
-                        await self.bot.send_message(user_id, f"🚨 **Security Alert:** The session for account `{account_name}` was revoked by Telegram, likely due to concurrent use. The operation has been stopped and the account removed. Please add it again.")
+                        await self.bot.send_message(user_id, f"🚨 **Security Alert:** The session for account `{account_name}` was revoked. Operation stopped and account removed.")
                         break 
                     except errors.UserRestrictedError as e:
                         LOGGER.error(f"Worker for {worker_key} failed: User is restricted.")
                         sentry_sdk.capture_exception(e)
-                        await self.bot.send_message(user_id, f"❌ Account `{account_name}` is restricted by Telegram and cannot create groups. Operation stopped.")
+                        await self.bot.send_message(user_id, f"❌ Account `{account_name}` is restricted and cannot create groups. Operation stopped.")
                         break
                     except errors.FloodWaitError as e:
                         LOGGER.warning(f"Flood wait error for {worker_key}. Sleeping for {e.seconds} seconds.")
                         sentry_sdk.capture_exception(e)
                         resume_time = datetime.now() + timedelta(seconds=e.seconds)
-                        await self.bot.send_message(user_id, f"⏳ [{account_name}] Paused due to Telegram limits for {e.seconds / 60:.1f} minutes. Resuming at {resume_time:%H:%M:%S}.")
+                        await self.bot.send_message(user_id, f"⏳ [{account_name}] Paused for {e.seconds / 60:.1f} minutes. Resuming at {resume_time:%H:%M:%S}.")
                         await asyncio.sleep(e.seconds)
                     except Exception as e:
                         LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
                         sentry_sdk.capture_exception(e)
-                        await self.bot.send_message(user_id, "❌ **Unexpected Error:** An issue occurred. Please try again.")
+                        await self.bot.send_message(user_id, "❌ **Unexpected Error:** An issue occurred. Please check the logs and try again.")
                         break
         except asyncio.CancelledError:
             LOGGER.info(f"Task for {worker_key} was cancelled by the user.")

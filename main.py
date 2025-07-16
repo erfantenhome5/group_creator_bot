@@ -86,7 +86,7 @@ class Config:
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 60
     MAX_SLEEP_SECONDS = 240
-    GROUP_MEMBER_TO_ADD = '@Erfantenhome1'
+    GROUP_MEMBER_TO_ADD = '@BotFather'
     PROXY_FILE = "proxy10.txt"
     PROXY_TIMEOUT = 5 
 
@@ -439,13 +439,11 @@ class GroupCreatorBot:
                         result = await self._send_request_with_reconnect(user_client, request, account_name)
 
                         chat = None
-                        # MODIFIED: Correctly parse the result from CreateChatRequest
-                                                if hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
+                        # MODIFIED: Correctly parse the result from CreateChatRequest, checking for updates object first.
+                        if hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
                             chat = result.updates.chats[0]
-                        elif hasattr(result, 'chats') and result.chats: # Keep old check as a fallback
+                        elif hasattr(result, 'chats') and result.chats: # Fallback for other response types
                             chat = result.chats[0]
-                        elif hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
-                            chat = result.updates.chats[0]
                         else:
                             LOGGER.error(f"Could not find chat in result of type {type(result)} for account {account_name}")
                             await self.bot.send_message(user_id, f"❌ [{account_name}] Unexpected error: Group info not found.")

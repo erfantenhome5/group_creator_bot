@@ -10,7 +10,7 @@ from typing import Optional, Dict, List
 
 import httpx
 import sentry_sdk
-from telethon import errors
+from telethon import errors, events
 
 # Use the same logger as the main script
 LOGGER = logging.getLogger(__name__)
@@ -64,9 +64,8 @@ class AIAnalyzer:
                 await self.bot.bot.send_message(int(self.admin_user_id), response_message[i:i+4096])
 
             if corrected_function:
-                # MODIFIED: Broadcast maintenance message to all users before applying the fix
                 await self.bot._broadcast_message("⚙️ ربات برای اعمال یک بروزرسانی مهم در حال راه‌اندازی مجدد است. لطفاً چند لحظه صبر کنید...")
-                await asyncio.sleep(2) # Give messages a chance to be sent
+                await asyncio.sleep(2)
 
                 if self._apply_code_fix(main_py_path, corrected_function):
                     LOGGER.info("Code fix applied successfully. Restarting bot service...")
@@ -81,6 +80,50 @@ class AIAnalyzer:
 
         except Exception as e:
             LOGGER.error(f"The AI self-healing process itself failed: {e}", exc_info=True)
+
+    async def refine_code(self, event: events.NewMessage.Event):
+        """
+        Performs a general or prompted code review using Gemini AI.
+        """
+        if not self.gemini_api_key or not self.admin_user_id:
+            LOGGER.warning("Cannot run AI code refinement: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
+            return
+
+        try:
+            command_parts = event.text.split(' ', 1)
+            admin_prompt = command_parts[1] if len(command_parts) > 1 else None
+
+            main_py_path = Path(__file__).parent.joinpath("main.py")
+            source_code = main_py_path.read_text()
+            
+            log_path = Path("bot_activity.log")
+            recent_logs = ""
+            if log_path.exists():
+                with open(log_path, "r") as f:
+                    recent_logs = "".join(f.readlines()[-100:])
+
+            if admin_prompt:
+                prompt = self._construct_prompted_code_refinement_prompt(source_code, recent_logs, admin_prompt)
+                await self.bot.bot.send_message(int(self.admin_user_id), f"🤖 **درخواست شما دریافت شد.**\nهوش مصنوعی در حال بررسی کد با توجه به دستور شماست: `{admin_prompt}`")
+            else:
+                prompt = self._construct_code_refinement_prompt(source_code, recent_logs)
+                await self.bot.bot.send_message(int(self.admin_user_id), "🤖 **درخواست شما دریافت شد.**\nهوش مصنوعی در حال انجام یک بررسی کلی روی کد است...")
+
+            suggestions, used_model = await self._call_gemini_with_fallback(prompt, ["gemini-pro", "gemini-2.0-flash"])
+
+            if not suggestions:
+                await self.bot.bot.send_message(int(self.admin_user_id), "❌ هوش مصنوعی نتوانست پیشنهادی ارائه دهد.")
+                return
+            
+            response_message = f"📝 **گزارش بهبود کد از هوش مصنوعی ({used_model}):**\n\n{suggestions}"
+            for i in range(0, len(response_message), 4096):
+                await self.bot.bot.send_message(int(self.admin_user_id), response_message[i:i+4096])
+
+        except Exception as e:
+            LOGGER.error(f"Code refinement process failed: {e}", exc_info=True)
+            sentry_sdk.capture_exception(e)
+            await self.bot.bot.send_message(int(self.admin_user_id), f"❌ **خطا در فرآیند بهبود کد:**\n`{e}`")
+
 
     async def explain_error_for_user(self, error: Exception) -> str:
         """
@@ -228,6 +271,32 @@ class AIAnalyzer:
             "```\n\n"
             "---"
             "**Output Format:** Please provide your analysis in Persian, using clear headings for each suggestion."
+        )
+
+    def _construct_prompted_code_refinement_prompt(self, source_code: str, recent_logs: str, admin_prompt: str) -> str:
+        """Constructs a prompt for a targeted code review based on an admin's request."""
+        return (
+            "You are an expert Python developer and a specialist in optimizing asynchronous applications, "
+            "particularly Telegram bots built with the Telethon library. Your task is to perform a targeted code modification based on an admin's request.\n\n"
+            "**Context:** The admin is running a multi-account Telegram bot. They have provided the full source code, recent logs, and a specific instruction for a change.\n\n"
+            "**Admin's Request:**\n"
+            f"```\n{admin_prompt}\n```\n\n"
+            "**Your Task:**\n"
+            "1.  **Understand the Request:** Carefully analyze the admin's prompt to understand the desired change.\n"
+            "2.  **Analyze the Code and Logs:** Use the source code and logs to implement the change correctly and safely.\n"
+            "3.  **Generate the Corrected Function(s):** Rewrite the *entire Python function or functions* that need to be modified to fulfill the request. The code must be complete and syntactically correct. If the change affects a configuration class or constant, provide the entire updated class or block.\n"
+            "4.  **Explain the Changes:** In a separate section, explain what you changed and how it addresses the admin's request.\n\n"
+            "---"
+            "### Recent Log Entries:\n"
+            "```log\n"
+            f"{recent_logs}\n"
+            "```\n\n"
+            "### Full Source Code:\n"
+            "```python\n"
+            f"{source_code}\n"
+            "```\n\n"
+            "---"
+            "**Output Format:** Provide your analysis in Persian. First, provide the explanation under a 'تغییرات اعمال شده' heading. Then, provide the complete, corrected Python code inside a `python` markdown block."
         )
 
     def _construct_user_explanation_prompt(self, error: Exception) -> str:

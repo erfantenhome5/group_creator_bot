@@ -520,22 +520,20 @@ class GroupCreatorBot:
                         try:
                             # 2. Migrate the basic group to a supergroup
                             LOGGER.info(f"Attempting to migrate chat {basic_chat.id} to a supergroup.")
-                            migrate_result = await user_client(MigrateChatRequest(chat_id=basic_chat.id))
-                            
-                            new_supergroup = None
-                            for chat in migrate_result.chats:
-                                if hasattr(chat, 'migrated_from_chat_id') and chat.migrated_from_chat_id == basic_chat.id:
-                                    new_supergroup = chat
-                                    break
-                            
-                            if not new_supergroup:
-                                LOGGER.error(f"Failed to find new supergroup info in migration response for original chat {basic_chat.id}.")
-                                raise Exception("Supergroup migration failed.")
+                            await user_client(MigrateChatRequest(chat_id=basic_chat.id))
+                            await asyncio.sleep(2) # Wait for backend to process the migration
 
+                            # 3. Get the new supergroup entity using a more robust method
+                            exported_invite = await user_client(ExportChatInviteRequest(peer=basic_chat.id))
+                            if not hasattr(exported_invite, 'chat') or not exported_invite.chat:
+                                LOGGER.error(f"Failed to retrieve new supergroup info via invite export for original chat {basic_chat.id}.")
+                                raise Exception("Supergroup migration failed or details not retrievable.")
+                            
+                            new_supergroup = exported_invite.chat
                             LOGGER.info(f"Successfully migrated to supergroup '{new_supergroup.title}' (New ID: {new_supergroup.id}).")
                             input_channel = await user_client.get_input_entity(new_supergroup.id)
 
-                            # 3. Set a public username for the new supergroup
+                            # 4. Set a public username for the new supergroup
                             username_set = False
                             for attempt in range(5): # Try up to 5 times
                                 generated_username = await self._generate_unique_username()
@@ -557,7 +555,7 @@ class GroupCreatorBot:
                                 LOGGER.error(f"Failed to set a public username for supergroup {new_supergroup.id} after multiple attempts.")
                                 # Continue without a username if all attempts fail
                             
-                            # 4. Make chat history visible to new members
+                            # 5. Make chat history visible to new members
                             await user_client(functions.channels.TogglePreHistoryHiddenRequest(
                                 channel=input_channel,
                                 enabled=False

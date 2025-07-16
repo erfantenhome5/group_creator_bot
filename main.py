@@ -135,6 +135,9 @@ class GroupCreatorBot:
         self.proxies = load_proxies_from_file(Config.PROXY_FILE)
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
+        # ADDED: User tracking for broadcasts
+        self.known_users_file = SESSIONS_DIR / "known_users.json"
+        self.known_users = self._load_known_users()
         try:
             self.fernet = Fernet(ENCRYPTION_KEY.encode())
         except (ValueError, TypeError):
@@ -274,6 +277,38 @@ class GroupCreatorBot:
         if worker_key in self.group_counts:
             del self.group_counts[worker_key]
             self._save_group_counts()
+
+    # --- User Tracking for Broadcasts ---
+    def _load_known_users(self) -> List[int]:
+        """Loads the list of known user IDs from a file."""
+        if not self.known_users_file.exists():
+            return []
+        try:
+            with self.known_users_file.open("r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            LOGGER.error("Could not read known_users.json.")
+            return []
+
+    def _save_known_users(self) -> None:
+        """Saves the list of known user IDs to a file."""
+        try:
+            with self.known_users_file.open("w") as f:
+                json.dump(self.known_users, f)
+        except IOError:
+            LOGGER.error("Could not save known_users.json.")
+
+    async def _broadcast_message(self, message_text: str):
+        """Sends a message to all known users."""
+        LOGGER.info(f"Broadcasting message to {len(self.known_users)} users.")
+        for user_id in self.known_users:
+            try:
+                await self.bot.send_message(user_id, message_text)
+                await asyncio.sleep(0.1) # Avoid hitting rate limits
+            except (errors.UserIsBlockedError, errors.InputUserDeactivatedError):
+                LOGGER.warning(f"User {user_id} has blocked the bot or is deactivated. Cannot send broadcast.")
+            except Exception as e:
+                LOGGER.error(f"Failed to send broadcast to {user_id}: {e}")
 
     # --- Encryption & Session Helpers ---
     def _encrypt_data(self, data: str) -> bytes:
@@ -542,6 +577,12 @@ class GroupCreatorBot:
     # --- Bot Event Handlers ---
     async def _start_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
+        # ADDED: Track users who start the bot
+        if user_id not in self.known_users:
+            self.known_users.append(user_id)
+            self._save_known_users()
+            LOGGER.info(f"New user started the bot: {user_id}")
+            
         session = self.user_sessions.get(user_id, {})
         if session.get('state') == 'authenticated':
             await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
@@ -682,6 +723,7 @@ class GroupCreatorBot:
         
         self.group_counts.clear()
         self.account_proxies.clear()
+        self.known_users.clear() # Also clear the known users
 
         report.append(f"🗑️ **فایل‌های داده حذف شده:** {deleted_files_count} عدد\n")
         LOGGER.info(f"Deleted {deleted_files_count} data files from {SESSIONS_DIR}.")
@@ -720,14 +762,13 @@ class GroupCreatorBot:
     async def _test_self_heal_handler(self, event: events.NewMessage.Event) -> None:
         """Intentionally triggers a fixable error to test the self-healing pipeline."""
         LOGGER.info(f"Admin {event.sender_id} initiated a self-healing test.")
-        await event.reply("🧪 Triggering a test error to check the AI self-healing function...")
         try:
             # This will raise a ZeroDivisionError, which will be captured by Sentry
             # and trigger the full AI analysis and self-healing process.
             test_var = 1 / 0
         except Exception as e:
             LOGGER.info("Test error was triggered successfully. The AI is now analyzing it.")
-            await event.reply("⚙️ یک مشکل شناسایی شد و سیستم در حال رفع خودکار آن است. ربات به زودی مجددا راه‌اندازی خواهد شد.")
+            await self._broadcast_message("⚙️ ربات برای اعمال یک بروزرسانی مهم در حال راه‌اندازی مجدد است. لطفاً چند لحظه صبر کنید.")
             sentry_sdk.capture_exception(e)
 
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:

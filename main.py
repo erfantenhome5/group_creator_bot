@@ -307,15 +307,15 @@ class GroupCreatorBot:
 
     async def _broadcast_message(self, message_text: str):
         """Sends a message to all known users."""
-        LOGGER.info(f"ارسال پیام به {len(self.known_users)} کاربر.")
+        LOGGER.info(f"Broadcasting message to {len(self.known_users)} users.")
         for user_id in self.known_users:
             try:
                 await self.bot.send_message(user_id, message_text)
                 await asyncio.sleep(0.1) 
             except (errors.UserIsBlockedError, errors.InputUserDeactivatedError):
-                LOGGER.warning(f"کاربر {user_id} ربات را بلاک کرده یا غیرفعال است. امکان ارسال پیام وجود ندارد.")
+                LOGGER.warning(f"User {user_id} has blocked the bot or is deactivated. Cannot send message.")
             except Exception as e:
-                LOGGER.error(f"خطا در ارسال پیام به {user_id}: {e}")
+                LOGGER.error(f"Error sending message to {user_id}: {e}")
 
     async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         """Creates a temporary client for the login flow, using the specified proxy."""
@@ -323,13 +323,13 @@ class GroupCreatorBot:
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
 
         try:
-            proxy_info = f"پروکسی {proxy['addr']}:{proxy['port']}" if proxy else "بدون پروکسی"
-            LOGGER.debug(f"تلاش برای اتصال ورود با {proxy_info}")
+            proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy"
+            LOGGER.debug(f"Attempting login connection {proxy_info}")
             client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
             return client
         except Exception as e:
-            LOGGER.error(f"اتصال ورود با {proxy_info} ناموفق بود: {e}")
+            LOGGER.error(f"Login connection {proxy_info} failed: {e}")
             return None
 
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
@@ -348,13 +348,13 @@ class GroupCreatorBot:
         )
         
         try:
-            proxy_info = f"پروکسی {proxy['addr']}:{proxy['port']}" if proxy else "بدون پروکسی"
-            LOGGER.debug(f"تلاش برای اتصال کارگر با {proxy_info}")
+            proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy"
+            LOGGER.debug(f"Attempting worker connection {proxy_info}")
             await client.connect()
-            LOGGER.info(f"کارگر با موفقیت با {proxy_info} متصل شد")
+            LOGGER.info(f"Worker connected successfully {proxy_info}")
             return client
         except Exception as e:
-            LOGGER.error(f"اتصال کارگر با {proxy_info} ناموفق بود: {e}")
+            LOGGER.error(f"Worker connection {proxy_info} failed: {e}")
             sentry_sdk.capture_exception(e)
             if isinstance(e, errors.AuthKeyUnregisteredError):
                 raise
@@ -367,21 +367,21 @@ class GroupCreatorBot:
         """
         try:
             if not client.is_connected():
-                LOGGER.warning(f"مشتری برای '{account_name}' قطع شده است. تلاش برای اتصال مجدد...")
+                LOGGER.warning(f"Client for '{account_name}' is disconnected. Reconnecting...")
                 await client.connect()
                 if client.is_connected():
-                    LOGGER.info(f"اتصال مجدد مشتری برای '{account_name}' با موفقیت انجام شد.")
+                    LOGGER.info(f"Client for '{account_name}' reconnected successfully.")
                 else:
-                    LOGGER.error(f"اتصال مجدد مشتری برای '{account_name}' ناموفق بود.")
-                    raise ConnectionError("اتصال مجدد مشتری ناموفق بود.")
+                    LOGGER.error(f"Failed to reconnect client for '{account_name}'.")
+                    raise ConnectionError("Client reconnection failed.")
             
             return await client(request)
         except ConnectionError as e:
-            LOGGER.error(f"خطای اتصال برای '{account_name}' حتی پس از بررسی: {e}")
+            LOGGER.error(f"Connection error for '{account_name}' even after check: {e}")
             sentry_sdk.capture_exception(e)
             raise 
         except Exception as e:
-            LOGGER.error(f"خطای غیرمنتظره در ارسال درخواست برای '{account_name}': {e}")
+            LOGGER.error(f"Unexpected error sending request for '{account_name}': {e}")
             sentry_sdk.capture_exception(e)
             raise
 
@@ -420,14 +420,14 @@ class GroupCreatorBot:
         worker_key = f"{user_id}:{account_name}"
         try:
             async with self.worker_semaphore:
-                LOGGER.info(f"کارگر برای {worker_key} شروع شد. قفل سماforر گرفته شد.")
+                LOGGER.info(f"Worker for {worker_key} started. Semaphore acquired.")
 
                 avg_sleep = (Config.MIN_SLEEP_SECONDS + Config.MAX_SLEEP_SECONDS) / 2
                 estimated_total_minutes = (Config.GROUPS_TO_CREATE * avg_sleep) / 60
                 
                 current_semester = self._get_group_count(worker_key)
 
-                await self.bot.send_message(user_id, f"✅ **عملیات برای حساب `{account_name}` آغاز شد!**\n\n⏳ تخمین زمان کل عملیات: حدود {estimated_total_minutes:.0f} دقیقه.")
+                await self.bot.send_message(user_id, f"✅ **Operation for account `{account_name}` has started!**\n\n⏳ Estimated total time: ~{estimated_total_minutes:.0f} minutes.")
 
                 for i in range(Config.GROUPS_TO_CREATE):
                     current_semester += 1
@@ -441,22 +441,19 @@ class GroupCreatorBot:
                         chat = None
                         if hasattr(result, 'chats') and result.chats:
                             chat = result.chats[0]
-                        elif hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
-                            chat = result.updates.chats[0]
                         else:
-                            LOGGER.error(f"چت در نتیجه نوع {type(result)} برای حساب {account_name} یافت نشد")
-                            await self.bot.send_message(user_id, f"❌ [{account_name}] خطای غیرمنتظره: اطلاعات گروه یافت نشد.")
+                            LOGGER.error(f"Could not find chat in result of type {type(result)} for account {account_name}")
+                            await self.bot.send_message(user_id, f"❌ [{account_name}] Unexpected error: Group info not found.")
                             current_semester -= 1 
                             continue
                         
-                        # MODIFIED: Replaced old history toggle with supergroup upgrade logic
                         # --- Upgrade to Supergroup and set History Visibility ---
                         try:
-                            # Telethon needs an InputChannel for these operations, which we get from the chat entity
-                            input_channel = await user_client.get_input_entity(chat.id)
+                            # CRITICAL FIX: Use the negative chat ID to get the correct entity.
+                            # This tells Telethon it's a chat/channel, not a user.
+                            input_channel = await user_client.get_input_entity(-chat.id)
 
                             # 1. Upgrade to a supergroup by making it public with a random username.
-                            # This is a reliable method. The username must start with a letter.
                             random_username = 'a' + uuid.uuid4().hex 
                             LOGGER.info(f"Attempting to upgrade group {chat.id} to a supergroup by setting username: {random_username}")
                             
@@ -473,7 +470,7 @@ class GroupCreatorBot:
                             ))
                             LOGGER.info(f"Chat history for new members in group {chat.id} is now visible.")
                             
-                            # 3. (Optional but good practice) Make the group private again to not leave public groups around.
+                            # 3. (Optional but good practice) Make the group private again.
                             await user_client(functions.channels.UpdateUsernameRequest(
                                 channel=input_channel,
                                 username=""  # Setting username to empty string makes it private
@@ -481,10 +478,8 @@ class GroupCreatorBot:
                             LOGGER.info(f"Group {chat.id} has been made private again.")
 
                         except errors.UsernameOccupiedError as e:
-                            # This is unlikely with a UUID but handled just in case.
                             LOGGER.error(f"Could not upgrade group {chat.id} because the random username was occupied. Skipping history toggle. Error: {e}")
                         except Exception as e:
-                            # This will catch other potential errors during the upgrade/toggle process.
                             LOGGER.warning(f"Could not make chat history visible for group {chat.id}. Error: {e}\n{traceback.format_exc()}")
 
 
@@ -495,8 +490,8 @@ class GroupCreatorBot:
                         time_remaining_minutes = (groups_remaining * avg_sleep) / 60
 
                         progress_message = (
-                            f"📊 [{account_name}] گروه '{group_title}' ساخته شد. ({groups_made}/{Config.GROUPS_TO_CREATE})\n"
-                            f"⏳ زمان تقریبی باقی‌مانده: {time_remaining_minutes:.0f} دقیقه."
+                            f"📊 [{account_name}] Group '{group_title}' created. ({groups_made}/{Config.GROUPS_TO_CREATE})\n"
+                            f"⏳ Approx. time remaining: {time_remaining_minutes:.0f} minutes."
                         )
                         await self.bot.send_message(user_id, progress_message)
 
@@ -504,33 +499,33 @@ class GroupCreatorBot:
                         await asyncio.sleep(sleep_time)
 
                     except errors.AuthKeyUnregisteredError as e:
-                        LOGGER.error(f"کلید احراز هویت برای حساب '{account_name}' ثبت نشده است. حذف نشست.")
+                        LOGGER.error(f"Auth key is unregistered for account '{account_name}'. Deleting session.")
                         sentry_sdk.capture_exception(e)
                         self.session_manager.delete_session_file(user_id, account_name)
                         self._remove_group_count(worker_key)
-                        await self.bot.send_message(user_id, f"🚨 **خطای امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند نقطه، توسط تلگرام باطل شد. عملیات متوقف و حساب حذف گردید. لطفاً آن را دوباره اضافه کنید.")
+                        await self.bot.send_message(user_id, f"🚨 **Security Alert:** The session for account `{account_name}` was revoked by Telegram, likely due to concurrent use. The operation has been stopped and the account removed. Please add it again.")
                         break 
                     except errors.UserRestrictedError as e:
-                        LOGGER.error(f"کارگر برای {worker_key} شکست خورد: کاربر محدود شده است.")
+                        LOGGER.error(f"Worker for {worker_key} failed: User is restricted.")
                         sentry_sdk.capture_exception(e)
-                        await self.bot.send_message(user_id, f"❌ حساب `{account_name}` توسط تلگرام محدود شده و قادر به ساخت گروه نیست. عملیات متوقف شد.")
+                        await self.bot.send_message(user_id, f"❌ Account `{account_name}` is restricted by Telegram and cannot create groups. Operation stopped.")
                         break
                     except errors.FloodWaitError as e:
-                        LOGGER.warning(f"خطای انتظار سیل برای {worker_key}. خواب برای {e.seconds} ثانیه.")
+                        LOGGER.warning(f"Flood wait error for {worker_key}. Sleeping for {e.seconds} seconds.")
                         sentry_sdk.capture_exception(e)
                         resume_time = datetime.now() + timedelta(seconds=e.seconds)
-                        await self.bot.send_message(user_id, f"⏳ [{account_name}] به دلیل محدودیت تلگرام، عملیات به مدت {e.seconds / 60:.1f} دقیقه تا ساعت {resume_time:%H:%M:%S} متوقف شد.")
+                        await self.bot.send_message(user_id, f"⏳ [{account_name}] Paused due to Telegram limits for {e.seconds / 60:.1f} minutes. Resuming at {resume_time:%H:%M:%S}.")
                         await asyncio.sleep(e.seconds)
                     except Exception as e:
-                        LOGGER.error(f"خطای کارگر برای {worker_key}", exc_info=True)
+                        LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
                         sentry_sdk.capture_exception(e)
-                        await self.bot.send_message(user_id, "❌ **خطای غیرمنتظره:** مشکلی در انجام عملیات رخ داد. لطفاً دوباره تلاش کنید.")
+                        await self.bot.send_message(user_id, "❌ **Unexpected Error:** An issue occurred. Please try again.")
                         break
         except asyncio.CancelledError:
-            LOGGER.info(f"وظیفه برای {worker_key} توسط کاربر لغو شد.")
-            await self.bot.send_message(user_id, f"⏹️ عملیات برای حساب `{account_name}` توسط شما متوقف شد.")
+            LOGGER.info(f"Task for {worker_key} was cancelled by the user.")
+            await self.bot.send_message(user_id, f"⏹️ Operation for account `{account_name}` was stopped by you.")
         finally:
-            LOGGER.info(f"کارگر برای {worker_key} به پایان رسید.")
+            LOGGER.info(f"Worker for {worker_key} finished.")
             if worker_key in self.active_workers:
                 del self.active_workers[worker_key]
                 self.active_workers_state.pop(worker_key, None)
@@ -551,13 +546,13 @@ class GroupCreatorBot:
         
         if assigned_proxy:
             proxy_addr = f"{assigned_proxy['addr']}:{assigned_proxy['port']}"
-            LOGGER.info(f"پروکسی ورود {proxy_addr} به حساب '{account_name}' اختصاص یافت.")
+            LOGGER.info(f"Login proxy {proxy_addr} assigned to account '{account_name}'.")
         else:
-            LOGGER.info(f"حساب '{account_name}' مستقیماً وارد شد و بدون پروکسی اجرا خواهد شد.")
+            LOGGER.info(f"Account '{account_name}' logged in directly and will run without a proxy.")
 
         if user_client and user_client.is_connected():
             await user_client.disconnect()
-            LOGGER.info(f"مشتری ورود برای کاربر {user_id} ('{account_name}') با موفقیت قطع شد.")
+            LOGGER.info(f"Login client for user {user_id} ('{account_name}') disconnected successfully.")
 
         if 'client' in self.user_sessions[user_id]:
             del self.user_sessions[user_id]['client']
@@ -565,7 +560,7 @@ class GroupCreatorBot:
             del self.user_sessions[user_id]['login_proxy']
         self.user_sessions[user_id]['state'] = 'authenticated' 
 
-        await self.bot.send_message(user_id, f"✅ حساب `{account_name}` با موفقیت اضافه شد!")
+        await self.bot.send_message(user_id, f"✅ Account `{account_name}` added successfully!")
         await self._send_accounts_menu(event)
 
     # --- Bot Event Handlers ---
@@ -574,7 +569,7 @@ class GroupCreatorBot:
         if user_id not in self.known_users:
             self.known_users.append(user_id)
             self._save_known_users()
-            LOGGER.info(f"کاربر جدید ربات را شروع کرد: {user_id}")
+            LOGGER.info(f"New user started the bot: {user_id}")
             
         session = self.user_sessions.get(user_id, {})
         if session.get('state') == 'authenticated':
@@ -596,18 +591,18 @@ class GroupCreatorBot:
         active_count = len(self.active_workers)
         max_workers = Config.MAX_CONCURRENT_WORKERS
 
-        status_text = f"**📊 وضعیت سرور**\n\n"
-        status_text += f"**کارگران فعال:** {active_count} / {max_workers}\n"
+        status_text = f"**📊 Server Status**\n\n"
+        status_text += f"**Active Workers:** {active_count} / {max_workers}\n"
 
         if active_count > 0:
-            status_text += "\n**حساب‌های در حال عملیات:**\n"
+            status_text += "\n**Accounts in Operation:**\n"
             for worker_key in self.active_workers.keys():
                 _, acc_name = worker_key.split(":", 1)
                 proxy_info = self.account_proxies.get(worker_key)
-                proxy_str = f" (پروکسی: {proxy_info['addr']})" if proxy_info else ""
+                proxy_str = f" (Proxy: {proxy_info['addr']})" if proxy_info else ""
                 status_text += f"- `{acc_name}`{proxy_str}\n"
         else:
-            status_text += "\nℹ️ در حال حاضر هیچ حسابی در حال عملیات نیست."
+            status_text += "\nℹ️ No accounts are currently in operation."
 
         await event.reply(status_text, buttons=self._build_main_menu())
         raise events.StopPropagation
@@ -619,87 +614,87 @@ class GroupCreatorBot:
     async def _admin_command_handler(self, event: events.NewMessage.Event, handler: callable):
         """Wrapper to check for admin privileges before running a command."""
         if str(event.sender_id) != ADMIN_USER_ID:
-            await event.reply("❌ شما مجوز استفاده از این دستور را ندارید.")
+            await event.reply("❌ You are not authorized to use this command.")
             return
         await handler(event)
 
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
-        LOGGER.info(f"ادمین {event.sender_id} تست بی‌صدا پروکسی‌ها را آغاز کرد.")
+        LOGGER.info(f"Admin {event.sender_id} initiated silent proxy test.")
         
         if not self.proxies:
-            LOGGER.debug("تست پروکسی: هیچ پروکسی‌ای در فایل یافت نشد.")
-            await self.bot.send_message(event.sender_id, "⚠️ هیچ پروکسی‌ای در فایل برای تست یافت نشد.")
+            LOGGER.debug("Proxy test: No proxies found in file.")
+            await self.bot.send_message(event.sender_id, "⚠️ No proxies found in the file to test.")
             return
         
-        await self.bot.send_message(event.sender_id, "🧪 شروع تست بی‌صدا پروکسی‌ها... نتایج در لاگ‌های سیستمی خواهد بود.")
+        await self.bot.send_message(event.sender_id, "🧪 Starting silent proxy test... Results will be in system logs.")
 
-        LOGGER.debug("--- شروع تست پروکسی ---")
+        LOGGER.debug("--- PROXY TEST START ---")
         for proxy in self.proxies:
             proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             client = None
             try:
                 device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
                 
-                LOGGER.debug(f"تست پروکسی: {proxy} با دستگاه: {device_params}")
+                LOGGER.debug(f"Testing proxy: {proxy} with device: {device_params}")
                 
                 client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
                 await client.connect()
                 if client.is_connected():
-                    LOGGER.info(f"  ✅ موفقیت: {proxy_addr}")
+                    LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
             except Exception as e:
-                LOGGER.warning(f"  ❌ شکست ({type(e).__name__}): {proxy_addr} - {e}")
+                LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy_addr} - {e}")
             finally:
                 if client and client.is_connected():
                     await client.disconnect()
 
-        LOGGER.debug("--- تست اتصال مستقیم ---")
+        LOGGER.debug("--- DIRECT CONNECTION TEST ---")
         client = None
         try:
             device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
-            LOGGER.debug(f"تست اتصال مستقیم با دستگاه: {device_params}")
+            LOGGER.debug(f"Testing direct connection with device: {device_params}")
             client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
             if client.is_connected():
-                LOGGER.info("  ✅ موفقیت: اتصال مستقیم")
+                LOGGER.info("  ✅ SUCCESS: Direct Connection")
         except Exception as e:
-            LOGGER.warning(f"  ❌ شکست ({type(e).__name__}): اتصال مستقیم - {e}")
+            LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): Direct Connection - {e}")
         finally:
             if client and client.is_connected():
                 await client.disconnect()
         
-        LOGGER.info("تست بی‌صدا پروکسی‌ها به پایان رسید.")
-        await self.bot.send_message(event.sender_id, "🏁 تست بی‌صدا پروکسی‌ها به پایان رسید. نتایج را در لاگ‌های سیستمی بررسی کنید.")
+        LOGGER.info("Silent proxy test finished.")
+        await self.bot.send_message(event.sender_id, "🏁 Silent proxy test finished. Check system logs for results.")
         raise events.StopPropagation
 
     async def _clean_sessions_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        LOGGER.info(f"ادمین {user_id} پاکسازی نشست‌ها را آغاز کرد.")
+        LOGGER.info(f"Admin {user_id} initiated session cleanup.")
 
         try:
             async with self.bot.conversation(user_id, timeout=30) as conv:
-                await conv.send_message("⚠️ **هشدار:** این عملیات تمام نشست‌های کاربر، شمارنده‌ها و تخصیص‌های پروکسی را حذف کرده و تمام عملیات در حال اجرا را متوقف می‌کند. لطفاً با ارسال `تأیید` در عرض 30 ثانیه تأیید کنید.")
+                await conv.send_message("⚠️ **WARNING:** This will delete all user sessions, counters, proxy assignments, and stop all running workers. Please confirm by sending `confirm` within 30 seconds.")
                 response = await conv.get_response()
-                if response.text.lower() != 'تأیید':
-                    await conv.send_message("❌ عملیات لغو شد.")
+                if response.text.lower() != 'confirm':
+                    await conv.send_message("❌ Operation cancelled.")
                     return
         except asyncio.TimeoutError:
-            await self.bot.send_message(user_id, "❌ زمان تأیید تمام شد. عملیات لغو شد.")
+            await self.bot.send_message(user_id, "❌ Confirmation timed out. Operation cancelled.")
             return
 
-        msg = await self.bot.send_message(user_id, "🧹 پاکسازی نشست‌ها و توقف عملیات...")
+        msg = await self.bot.send_message(user_id, "🧹 Cleaning sessions and stopping workers...")
         
         stopped_workers = []
         if self.active_workers:
-            LOGGER.info("توقف تمام کارگران فعال قبل از پاکسازی نشست‌ها.")
+            LOGGER.info("Stopping all active workers before session cleanup.")
             for worker_key, task in list(self.active_workers.items()):
                 task.cancel()
                 stopped_workers.append(worker_key.split(":", 1)[1])
             self.active_workers.clear()
             await asyncio.sleep(1) 
 
-        report = ["**📝 گزارش پاکسازی:**\n"]
+        report = ["**📝 Cleanup Report:**\n"]
         if stopped_workers:
-            report.append(f"⏹️ **عملیات متوقف شده:** {', '.join(f'`{name}`' for name in stopped_workers)}\n")
+            report.append(f"⏹️ **Stopped Workers:** {', '.join(f'`{name}`' for name in stopped_workers)}\n")
 
         deleted_files_count = 0
         
@@ -710,16 +705,16 @@ class GroupCreatorBot:
                         if item.is_file():
                             item.unlink()
                             deleted_files_count += 1
-                            LOGGER.debug(f"فایل حذف شد: {item.name}")
+                            LOGGER.debug(f"Deleted file: {item.name}")
                     except OSError as e:
-                        LOGGER.error(f"ناتوانی در حذف فایل {item}: {e}")
+                        LOGGER.error(f"Failed to delete file {item}: {e}")
         
         self.group_counts.clear()
         self.account_proxies.clear()
         self.known_users.clear()
 
-        report.append(f"🗑️ **فایل‌های داده حذف شده:** {deleted_files_count} فایل\n")
-        LOGGER.info(f"{deleted_files_count} فایل داده از {SESSIONS_DIR} حذف شد.")
+        report.append(f"🗑️ **Deleted Data Files:** {deleted_files_count} files\n")
+        LOGGER.info(f"Deleted {deleted_files_count} data files from {SESSIONS_DIR}.")
 
         folders_to_clean = ["selenium_sessions", "api_sessions", "telethon_sessions"]
         for folder_name in folders_to_clean:
@@ -727,28 +722,28 @@ class GroupCreatorBot:
             if folder_path.exists() and folder_path.is_dir():
                 try:
                     shutil.rmtree(folder_path)
-                    report.append(f"📁 **پوشه حذف شده:** `{folder_name}`\n")
-                    LOGGER.info(f"پوشه حذف شد: {folder_name}")
+                    report.append(f"📁 **Deleted Folder:** `{folder_name}`\n")
+                    LOGGER.info(f"Deleted folder: {folder_name}")
                 except OSError as e:
-                    LOGGER.error(f"ناتوانی در حذف پوشه {folder_path}: {e}")
+                    LOGGER.error(f"Failed to delete folder {folder_path}: {e}")
             
-        report.append("\n✅ پاکسازی با موفقیت تکمیل شد.")
+        report.append("\n✅ Cleanup completed successfully.")
         
         await msg.edit(''.join(report))
         raise events.StopPropagation
 
     async def _test_sentry_handler(self, event: events.NewMessage.Event) -> None:
-        LOGGER.info(f"ادمین {event.sender_id} تست Sentry را آغاز کرد.")
-        await event.reply("🧪 ارسال یک خطای آزمایشی به Sentry. لطفاً داشبورد Sentry خود را بررسی کنید.")
+        LOGGER.info(f"Admin {event.sender_id} initiated Sentry test.")
+        await event.reply("🧪 Sending a test exception to Sentry. Please check your Sentry dashboard.")
         try:
             division_by_zero = 1 / 0
         except Exception as e:
             sentry_sdk.capture_exception(e)
-            await event.reply("✅ خطای آزمایشی به Sentry ارسال شد!")
+            await event.reply("✅ Test exception sent to Sentry!")
 
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
-        await event.reply('📞 لطفاً شماره تلفن حساب جدید را با فرمت بین‌المللی (مثلاً `+989123456789`) ارسال کنید.', buttons=Button.clear())
+        await event.reply('📞 Please send the phone number for the new account in international format (e.g., `+15551234567`).', buttons=Button.clear())
 
     async def _initiate_selenium_login_flow(self, event: events.NewMessage.Event) -> None:
         await event.reply(Config.MSG_BROWSER_RUNNING)
@@ -768,7 +763,7 @@ class GroupCreatorBot:
         if text == '/cancel':
             if 'state' in self.user_sessions.get(user_id, {}):
                 del self.user_sessions[user_id]['state']
-            await event.reply("✅ عملیات جاری لغو شد.", buttons=self._build_main_menu())
+            await event.reply("✅ Current operation cancelled.", buttons=self._build_main_menu())
             return
 
         if state == 'awaiting_master_password':
@@ -839,15 +834,15 @@ class GroupCreatorBot:
         worker_key = f"{user_id}:{account_name}"
 
         if worker_key in self.active_workers:
-            await event.reply('⏳ عملیات برای این حساب در حال انجام است.')
+            await event.reply('⏳ An operation for this account is already in progress.')
             return
 
         session_str = self.session_manager.load_session_string(user_id, account_name)
         if not session_str:
-            await event.reply('❌ هیچ نشستی برای این حساب یافت نشد. لطفاً آن را حذف و دوباره اضافه کنید.')
+            await event.reply('❌ No session found for this account. Please delete and add it again.')
             return
 
-        await event.reply(f'🚀 آماده‌سازی برای شروع عملیات برای حساب `{account_name}`...')
+        await event.reply(f'🚀 Preparing to start operation for account `{account_name}`...')
         
         user_client = None
         try:
@@ -855,7 +850,7 @@ class GroupCreatorBot:
             user_client = await self._create_worker_client(session_str, assigned_proxy)
             
             if not user_client:
-                await event.reply(f'❌ اتصال به تلگرام برای حساب `{account_name}` با استفاده از پروکسی اختصاصی ناموفق بود.')
+                await event.reply(f'❌ Failed to connect to Telegram for account `{account_name}` using its assigned proxy.')
                 return
                 
             if await user_client.is_user_authorized():
@@ -867,18 +862,18 @@ class GroupCreatorBot:
             else:
                 self.session_manager.delete_session_file(user_id, account_name)
                 self._remove_group_count(worker_key)
-                await event.reply(f'⚠️ نشست برای حساب `{account_name}` منقضی شده و حذف شده است. لطفاً آن را دوباره اضافه کنید.')
+                await event.reply(f'⚠️ The session for account `{account_name}` has expired and was deleted. Please add it again.')
         except errors.AuthKeyUnregisteredError as e:
-            LOGGER.error(f"کلید احراز هویت برای حساب '{account_name}' ثبت نشده است. حذف نشست.")
+            LOGGER.error(f"Auth key is unregistered for account '{account_name}'. Deleting session.")
             sentry_sdk.capture_exception(e)
             self.session_manager.delete_session_file(user_id, account_name)
             self._remove_group_count(worker_key)
-            await event.reply(f"🚨 **هشدار امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند مکان توسط تلگرام باطل شد. حساب حذف شده است. لطفاً دوباره آن را اضافه کنید.")
+            await event.reply(f"🚨 **Security Alert:** The session for account `{account_name}` was revoked by Telegram, likely due to concurrent use. The account has been removed. Please add it again.")
             await self._send_accounts_menu(event)
         except Exception as e:
-            LOGGER.error(f"خطا در شروع فرآیند برای {worker_key}", exc_info=True)
+            LOGGER.error(f"Error starting process for {worker_key}", exc_info=True)
             sentry_sdk.capture_exception(e)
-            await event.reply(f'❌ خطایی در اتصال به حساب `{account_name}` رخ داد.')
+            await event.reply(f'❌ An error occurred while connecting to account `{account_name}`.')
         finally:
             if user_client and not self.active_workers.get(worker_key):
                 if user_client.is_connected():
@@ -891,15 +886,15 @@ class GroupCreatorBot:
         if worker_key in self.active_workers:
             task = self.active_workers[worker_key]
             task.cancel()
-            LOGGER.info(f"کاربر لغو عملیات را برای کارگر {worker_key} آغاز کرد.")
+            LOGGER.info(f"User initiated cancellation for worker {worker_key}.")
             try:
                 await task
             except asyncio.CancelledError:
-                LOGGER.info(f"وظیفه کارگر {worker_key} با موفقیت لغو و پاکسازی شد.")
+                LOGGER.info(f"Worker task {worker_key} successfully cancelled and cleaned up.")
             
             await self._send_accounts_menu(event)
         else:
-            await event.reply(f"ℹ️ هیچ عملیات فعالی برای توقف برای حساب `{account_name}` وجود ندارد.")
+            await event.reply(f"ℹ️ No active operation to stop for account `{account_name}`.")
 
     async def _delete_account_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
         user_id = event.sender_id
@@ -907,16 +902,16 @@ class GroupCreatorBot:
 
         if worker_key in self.active_workers:
             self.active_workers[worker_key].cancel()
-            LOGGER.info(f"کارگر برای {worker_key} به دلیل حذف حساب لغو شد.")
+            LOGGER.info(f"Worker for {worker_key} cancelled due to account deletion.")
 
         if self.session_manager.delete_session_file(user_id, account_name):
             self._remove_group_count(worker_key)
             if worker_key in self.account_proxies:
                 del self.account_proxies[worker_key]
                 self._save_account_proxies()
-            await event.reply(f"✅ حساب `{account_name}` با موفقیت حذف شد و تمام عملیات مرتبط متوقف شد.")
+            await event.reply(f"✅ Account `{account_name}` deleted successfully and any related operation was stopped.")
         else:
-            await event.reply(f"✅ عملیات برای حساب `{account_name}` متوقف شد (نشست وجود نداشت).")
+            await event.reply(f"✅ Operation for account `{account_name}` stopped (session did not exist).")
 
         await self._send_accounts_menu(event)
 
@@ -944,8 +939,8 @@ class GroupCreatorBot:
 
         if not re.match(r'^\+\d{10,}$', phone_number):
             await event.reply(
-                '❌ **فرمت شماره تلفن نامعتبر است.**\n'
-                'لطفاً شماره را با فرمت بین‌المللی کامل (مثلاً `+989123456789`) وارد کنید.',
+                '❌ **Invalid phone number format.**\n'
+                'Please enter the full number in international format (e.g., `+15551234567`).',
                 buttons=[[Button.text(Config.BTN_BACK)]]
             )
             return
@@ -959,21 +954,21 @@ class GroupCreatorBot:
         try:
             user_client = await self._create_login_client(selected_proxy)
             if not user_client:
-                proxy_msg = f" با پروکسی {selected_proxy['addr']}:{selected_proxy['port']}" if selected_proxy else " مستقیماً"
-                await event.reply(f'❌ اتصال به تلگرام{proxy_msg} ناموفق بود. لطفاً بعداً دوباره تلاش کنید.')
+                proxy_msg = f" with proxy {selected_proxy['addr']}:{selected_proxy['port']}" if selected_proxy else " directly"
+                await event.reply(f'❌ Failed to connect to Telegram{proxy_msg}. Please try again later.')
                 return
                 
             self.user_sessions[user_id]['client'] = user_client
             sent_code = await user_client.send_code_request(self.user_sessions[user_id]['phone'])
             self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
             self.user_sessions[user_id]['state'] = 'awaiting_code'
-            await event.reply('💬 یک کد ورود ارسال شده است. لطفاً آن را اینجا بفرستید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('💬 A login code has been sent. Please send it here.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"خطای ورودی تلفن برای {user_id}", exc_info=True)
+            LOGGER.error(f"Phone input error for {user_id}", exc_info=True)
             sentry_sdk.capture_exception(e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone' 
             await event.reply(
-                '❌ **خطا:** شماره تلفن نامعتبر یا مشکلی در ارسال کد. لطفاً با فرمت بین‌المللی (+کد کشور) دوباره تلاش کنید یا عملیات را لغو کنید.',
+                '❌ **Error:** Invalid phone number or issue sending code. Please try again with the international format (+countrycode) or cancel.',
                 buttons=[[Button.text(Config.BTN_BACK)]]
             )
         finally:
@@ -987,49 +982,49 @@ class GroupCreatorBot:
         try:
             await user_client.sign_in(self.user_sessions[user_id]['phone'], code=event.message.text.strip(), phone_code_hash=self.user_sessions[user_id].get('phone_code_hash'))
             self.user_sessions[user_id]['state'] = 'awaiting_account_name'
-            await event.reply('✅ ورود با موفقیت انجام شد! لطفاً یک نام مستعار برای این حساب وارد کنید (مثلاً `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('✅ Login successful! Please enter a nickname for this account (e.g., `Main Account` or `Second Number`).', buttons=[[Button.text(Config.BTN_BACK)]])
         except errors.SessionPasswordNeededError:
             self.user_sessions[user_id]['state'] = 'awaiting_password'
-            await event.reply('🔑 این حساب احراز هویت دو مرحله‌ای دارد. لطفاً رمز عبور را ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('🔑 This account has two-step verification enabled. Please send the password.', buttons=[[Button.text(Config.BTN_BACK)]])
         except errors.PhoneCodeExpiredError:
             try:
-                LOGGER.warning(f"کد تلفن برای {user_id} منقضی شده است. درخواست کد جدید.")
+                LOGGER.warning(f"Phone code for {user_id} expired. Requesting new code.")
                 sent_code = await user_client.send_code_request(self.user_sessions[user_id]['phone'])
                 self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
                 self.user_sessions[user_id]['state'] = 'awaiting_code'
-                await event.reply('⚠️ کد منقضی شده (احتمالاً به دلیل تغییر سرور). یک کد جدید ارسال شده است. لطفاً کد جدید را وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+                await event.reply('⚠️ The code expired. A new code has been sent. Please enter the new code.', buttons=[[Button.text(Config.BTN_BACK)]])
             except Exception as e:
-                LOGGER.error(f"ناتوانی در ارسال مجدد کد برای {user_id} پس از انقضا: {e}", exc_info=True)
+                LOGGER.error(f"Failed to resend code for {user_id} after expiration: {e}", exc_info=True)
                 sentry_sdk.capture_exception(e)
                 self.user_sessions[user_id]['state'] = 'awaiting_phone'
-                await event.reply('❌ **خطا:** کد قبلی منقضی شده و ارسال مجدد ناموفق بود. لطفاً شماره تلفن را دوباره وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+                await event.reply('❌ **Error:** The previous code expired and resending failed. Please enter the phone number again.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"خطای ورودی کد برای {user_id}", exc_info=True)
+            LOGGER.error(f"Code input error for {user_id}", exc_info=True)
             sentry_sdk.capture_exception(e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
-            await event.reply('❌ **خطا:** کد نامعتبر است. لطفاً شماره تلفن را دوباره وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('❌ **Error:** The code is invalid. Please enter the phone number again.', buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_password_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         try:
             await self.user_sessions[user_id]['client'].sign_in(password=event.message.text.strip())
             self.user_sessions[user_id]['state'] = 'awaiting_account_name'
-            await event.reply('✅ ورود با موفقیت انجام شد! لطفاً یک نام مستعار برای این حساب وارد کنید (مثلاً `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('✅ Login successful! Please enter a nickname for this account (e.g., `Main Account` or `Second Number`).', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"خطای ورودی رمز عبور برای {user_id}", exc_info=True)
+            LOGGER.error(f"Password input error for {user_id}", exc_info=True)
             sentry_sdk.capture_exception(e)
             self.user_sessions[user_id]['state'] = 'awaiting_password'
-            await event.reply('❌ **خطا:** رمز عبور اشتباه است. لطفاً دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('❌ **Error:** Incorrect password. Please try again.', buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_account_name_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         account_name = event.message.text.strip()
         if not account_name:
-            await event.reply("❌ نام مستعار نمی‌تواند خالی باشد. لطفاً یک نام وارد کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply("❌ Nickname cannot be empty. Please enter a name.", buttons=[[Button.text(Config.BTN_BACK)]])
             return
 
         if account_name in self.session_manager.get_user_accounts(user_id):
-            await event.reply(f"❌ شما قبلاً حساب با نام مستعار `{account_name}` دارید. لطفاً نام دیگری انتخاب کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply(f"❌ You already have an account with the nickname `{account_name}`. Please choose another name.", buttons=[[Button.text(Config.BTN_BACK)]])
             return
 
         self.user_sessions[user_id]['account_name'] = account_name
@@ -1043,23 +1038,23 @@ class GroupCreatorBot:
 
     async def run(self) -> None:
         self.register_handlers()
-        LOGGER.info("شروع ربات...")
+        LOGGER.info("Starting bot...")
         try:
             await self.bot.start(bot_token=BOT_TOKEN)
-            LOGGER.info("سرویس ربات با موفقیت شروع شد.")
+            LOGGER.info("Bot service started successfully.")
             # Resume any workers that were active before a restart
             for worker_key, worker_data in self.active_workers_state.items():
                 user_id = worker_data["user_id"]
                 account_name = worker_data["account_name"]
-                LOGGER.info(f"از سرگیری کارگر برای حساب '{account_name}' پس از راه‌اندازی مجدد.")
+                LOGGER.info(f"Resuming worker for account '{account_name}' after restart.")
                 dummy_event = events.NewMessage.Event(self.bot.build_in_message(user_id))
                 await self._start_process_handler(dummy_event, account_name)
 
             if self.known_users:
-                await self._broadcast_message("✅ ربات با موفقیت شروع شد و اکنون در دسترس است.")
+                await self._broadcast_message("✅ Bot has started successfully and is now online.")
             await self.bot.run_until_disconnected()
         finally:
-            LOGGER.info("سرویس ربات در حال تعطیل شدن است. قطع اتصال مشتری اصلی ربات.")
+            LOGGER.info("Bot service is shutting down. Disconnecting main bot client.")
             if self.bot.is_connected():
                 await self.bot.disconnect()
 

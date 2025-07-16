@@ -28,7 +28,7 @@ class AIAnalyzer:
 
     async def analyze_and_apply_fix(self, exc_type, exc_value, tb):
         """
-        Analyzes an error, generates a corrected function, and applies the fix.
+        Analyzes an error, generates a corrected function, and notifies the admin.
         """
         if not self.gemini_api_key or not self.admin_user_id:
             LOGGER.warning("Cannot run AI error analysis: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
@@ -52,31 +52,17 @@ class AIAnalyzer:
                 LOGGER.error("AI error analysis returned no suggestions after trying all fallback models.")
                 return
 
-            corrected_function = self._extract_python_code_from_response(suggestions)
-            
             response_message = (
                 f"🚨 **گزارش خودکار از هوش مصنوعی ({used_model}):**\n\n"
-                f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. تحلیل و راه حل زیر تولید شد و در حال اعمال است:\n\n"
+                f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. تحلیل و راه حل زیر تولید شد:\n\n"
                 f"{suggestions}"
             )
             
             for i in range(0, len(response_message), 4096):
                 await self.bot.bot.send_message(int(self.admin_user_id), response_message[i:i+4096])
 
-            if corrected_function:
-                if self._apply_code_fix(main_py_path, corrected_function):
-                    LOGGER.info("Code fix applied successfully. Restarting bot service...")
-                    await self.bot.bot.send_message(int(self.admin_user_id), "✅ **اصلاحیه با موفقیت اعمال شد. ربات در حال راه‌اندازی مجدد است...**")
-                    process = await asyncio.create_subprocess_shell('sudo systemctl restart telegram_bot.service')
-                    await process.wait()
-                else:
-                    LOGGER.error("Failed to apply the AI-generated code fix.")
-                    await self.bot.bot.send_message(int(self.admin_user_id), "❌ **خطا در اعمال خودکار اصلاحیه.** لطفاً کد پیشنهادی را به صورت دستی بررسی و اعمال کنید.")
-            else:
-                LOGGER.warning("AI analysis was generated, but no code block was found to apply.")
-
         except Exception as e:
-            LOGGER.error(f"The AI self-healing process itself failed: {e}", exc_info=True)
+            LOGGER.error(f"The AI analysis process itself failed: {e}", exc_info=True)
 
     async def explain_error_for_user(self, error: Exception) -> str:
         """
@@ -98,94 +84,15 @@ class AIAnalyzer:
             LOGGER.error(f"AI user explanation generation failed: {e}")
             return default_message
 
-    def _extract_python_code_from_response(self, response: str) -> Optional[str]:
-        """Extracts a Python code block from the AI's markdown response."""
-        try:
-            match = re.search(r"```python\n(.*?)```", response, re.DOTALL)
-            if match:
-                return match.group(1).strip()
-            return None
-        except Exception:
-            return None
-
-    def _apply_code_fix(self, file_path: Path, new_function_code: str) -> bool:
-        """
-        Replaces an entire function in a file with new code by identifying its start and end lines.
-        """
-        try:
-            match = re.search(r"def\s+(\w+)\s*\(", new_function_code)
-            if not match:
-                LOGGER.error("AI fix did not contain a valid function definition.")
-                return False
-            
-            func_name = match.group(1)
-            
-            lines = file_path.read_text().splitlines()
-            
-            start_line_idx = -1
-            func_indentation = -1
-
-            for i, line in enumerate(lines):
-                if re.search(rf"^\s*def\s+{func_name}\s*\(", line) or re.search(rf"^\s*async\s+def\s+{func_name}\s*\(", line):
-                    start_of_func_block = i
-                    for j in range(i - 1, -1, -1):
-                        if lines[j].strip().startswith('@'):
-                            start_of_func_block = j
-                        elif lines[j].strip() == "":
-                            continue
-                        else:
-                            break
-                    start_line_idx = start_of_func_block
-                    func_indentation = len(lines[i]) - len(lines[i].lstrip(' '))
-                    break
-            
-            if start_line_idx == -1:
-                LOGGER.error(f"Could not find the start of function '{func_name}' in the source code.")
-                return False
-
-            end_line_idx = -1
-            for i in range(start_line_idx + 1, len(lines)):
-                line = lines[i]
-                if not line.strip():
-                    continue
-                
-                line_indentation = len(line) - len(line.lstrip(' '))
-                
-                if line_indentation <= func_indentation:
-                    end_line_idx = i
-                    break
-            
-            if end_line_idx == -1:
-                end_line_idx = len(lines)
-
-            pre_func_lines = lines[:start_line_idx]
-            post_func_lines = lines[end_line_idx:]
-            
-            new_function_lines = new_function_code.splitlines()
-            
-            indented_new_function_lines = [f"{' ' * func_indentation}{line}" for line in new_function_lines]
-
-            modified_lines = pre_func_lines + indented_new_function_lines + post_func_lines
-            modified_code = "\n".join(modified_lines)
-            
-            file_path.write_text(modified_code)
-            LOGGER.info(f"Successfully applied fix for function '{func_name}'.")
-            return True
-
-        except Exception as e:
-            LOGGER.error(f"Failed to apply code fix to file {file_path}: {e}", exc_info=True)
-            return False
-
     def _construct_error_analysis_prompt(self, source_code: str, traceback_str: str) -> str:
         """Constructs a sophisticated prompt for analyzing a specific error and generating a fix."""
         return (
             "You are an expert Python developer and a specialist in debugging asynchronous applications, "
-            "particularly Telegram bots built with the Telethon library. Your task is to perform a root cause analysis of an error that was just captured and generate a fix.\n\n"
+            "particularly Telegram bots built with the Telethon library. Your task is to perform a root cause analysis of an error that was just captured.\n\n"
             "**Context:** The user is running a multi-account Telegram bot that creates groups. The bot uses proxies and runs multiple operations concurrently.\n\n"
             "**Your Task:**\n"
             "1.  **Analyze the Traceback and Source Code:** Carefully examine the provided traceback and the full source code to identify the exact root cause of the error.\n"
-            "2.  **Generate the Corrected Function:** Rewrite the *entire Python function* where the error occurred, with the fix applied. The function should be complete and syntactically correct.\n"
-            "3.  **Explain the Fix:** In a separate section, explain the root cause of the error and how your corrected function resolves it.\n\n"
+            "2.  **Explain the Fix:** Explain the root cause of the error and how to resolve it.\n\n"
             "---"
             "### Traceback:\n"
             "```\n"
@@ -196,8 +103,49 @@ class AIAnalyzer:
             f"{source_code}\n"
             "```\n\n"
             "---"
-            "**Output Format:** Provide your analysis in Persian. First, provide the explanation under a 'تحلیل و راه حل' heading. Then, provide the complete, corrected Python function inside a `python` markdown block."
+            "**Output Format:** Provide your analysis in Persian, using clear headings for 'Root Cause' and 'Recommended Fixes'."
         )
+
+    async def refine_code(self, event, custom_prompt: str):
+        """
+        Handles the /refine_code command, analyzing the bot's code and recent logs based on user instructions.
+        """
+        if not self.gemini_api_key:
+            await event.reply("❌ قابلیت بهبود کد فعال نیست: کلید API Gemini تنظیم نشده است.")
+            return
+
+        await event.reply("🤖 در حال ارسال کد، لاگ‌ها و دستورالعمل شما برای تحلیل توسط هوش مصنوعی Gemini... این کار ممکن است کمی طول بکشد.")
+        
+        try:
+            main_py_path = Path(__file__).parent.joinpath("main.py")
+            source_code = main_py_path.read_text()
+
+            log_file_path = Path("bot_activity.log")
+            recent_logs = ""
+            if log_file_path.exists():
+                with open(log_file_path, 'r') as f:
+                    lines = f.readlines()
+                    recent_logs = "".join(lines[-50:])
+            
+            prompt = self._construct_code_refinement_prompt(source_code, recent_logs, custom_prompt)
+            suggestions, used_model = await self._call_gemini_with_fallback(prompt, ["gemini-pro", "gemini-2.0-flash"])
+
+            if suggestions:
+                response_message = (
+                    f"✨ **پیشنهادات بهبود کد از هوش مصنوعی ({used_model}):**\n\n"
+                    f"{suggestions}"
+                )
+                for i in range(0, len(response_message), 4096):
+                    await event.reply(response_message[i:i+4096])
+            else:
+                await event.reply("❌ هوش مصنوعی نتوانست پیشنهادی برای بهبود کد ارائه دهد. لطفاً دستورالعمل‌های دقیق‌تری ارائه دهید.")
+
+        except FileNotFoundError:
+            await event.reply("❌ خطا: فایل کد منبع ربات یافت نشد.")
+        except Exception as e:
+            LOGGER.error(f"AI code refinement failed: {e}", exc_info=True)
+            sentry_sdk.capture_exception(e)
+            await event.reply(f"❌ خطایی در هنگام ارتباط با سرویس Gemini رخ داد: `{type(e).__name__}`")
 
     def _construct_code_refinement_prompt(self, source_code: str, recent_logs: str, custom_prompt: str) -> str:
         """Constructs a sophisticated prompt for a general code review, including user instructions."""

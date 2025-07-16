@@ -25,7 +25,7 @@ from ai_analyzer import AIAnalyzer
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("bot_activity.log"),
@@ -87,7 +87,7 @@ class Config:
     MAX_SLEEP_SECONDS = 240
     GROUP_MEMBER_TO_ADD = '@BotFather'
     PROXY_FILE = "proxy10.txt"
-    PROXY_TIMEOUT = 10 
+    PROXY_TIMEOUT = 15
     PROXY_BLACKLIST_DURATION = timedelta(minutes=5)
 
     # --- UI Text & Buttons ---
@@ -167,20 +167,14 @@ class GroupCreatorBot:
 
             if 'log_record' in hint:
                 log_record = hint['log_record']
-                if log_record.levelno == logging.DEBUG and log_record.name.startswith('telethon'):
-                    message = log_record.getMessage()
-                    noisy_patterns = [
-                        "Assigned msg_id", "Encrypting", "Encrypted messages put in a queue",
-                        "Waiting for messages to send", "Handling pong", "Receiving items from the network",
-                        "Handling gzipped data", "Handling update", "Handling RPC result",
-                        "stopped chain of propagation"
-                    ]
-                    if any(pattern in message for pattern in noisy_patterns):
-                        return None
+                if log_record.levelno < logging.INFO:
+                    return None
             
             if 'exc_info' in hint and not is_test_error:
                 exc_type, exc_value, tb = hint['exc_info']
-                asyncio.create_task(self.ai_analyzer.analyze_and_apply_fix(exc_type, exc_value, tb))
+                # Avoid self-healing for simple, expected errors during login
+                if not isinstance(exc_value, (errors.PhoneNumberInvalidError, errors.PhoneCodeInvalidError, errors.SessionPasswordNeededError)):
+                    asyncio.create_task(self.ai_analyzer.analyze_and_apply_fix(exc_type, exc_value, tb))
 
             return event
 
@@ -218,11 +212,9 @@ class GroupCreatorBot:
         for user_id in self.known_users:
             try:
                 await self.bot.send_message(user_id, message_text)
-                await asyncio.sleep(0.1) # Avoid hitting rate limits
-            except (errors.UserIsBlockedError, errors.InputUserDeactivatedError):
-                LOGGER.warning(f"User {user_id} has blocked the bot or is deactivated. Cannot send broadcast.")
+                await asyncio.sleep(0.1)
             except Exception as e:
-                LOGGER.error(f"Failed to send broadcast to {user_id}: {e}")
+                LOGGER.warning(f"Could not send broadcast to {user_id}: {e}")
 
     # --- Proxy Management Helpers ---
     def _mark_proxy_as_bad(self, proxy: Dict):
@@ -306,17 +298,15 @@ class GroupCreatorBot:
                 user_id_str, account_name = worker_key.split(":", 1)
                 user_id = int(user_id_str)
                 
-                # Create a dummy event to pass to the handler
-                dummy_event = events.NewMessage.Event(message=Message(id=0, peer_id=user_id, message=''), out=False)
+                dummy_event = events.NewMessage.Event(message=Message(id=0, peer_id=user_id, from_id=user_id, message=''), out=False)
                 dummy_event.sender_id = user_id
                 
                 LOGGER.info(f"Resuming worker for account '{account_name}' (User ID: {user_id}).")
                 await self._start_process_handler(dummy_event, account_name, is_resume=True)
-                await asyncio.sleep(2) # Stagger resumption
+                await asyncio.sleep(2)
             except Exception as e:
                 LOGGER.error(f"Failed to resume worker for key '{worker_key}': {e}")
         
-        # Clean up the state file after attempting resumption
         self.active_workers_file.unlink(missing_ok=True)
 
     # --- Encryption & Session Helpers ---
@@ -771,13 +761,14 @@ class GroupCreatorBot:
         await asyncio.sleep(2)
         await self._initiate_login_flow(event)
 
-async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
+    async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        phone_number = event.text.strip()
-        if not phone_number:
-            await event.reply('❌ شماره تلفن نمی‌تواند خالی باشد. لطفا شماره تلفن را با فرمت بین‌المللی ارسال کنید.', buttons=Button.clear())
+        phone = event.text.strip()
+        if not phone:
+            await event.reply('❌ شماره تلفن نمی‌تواند خالی باشد. لطفا دوباره تلاش کنید.')
             return
-        self.user_sessions[user_id]['phone'] = phone_number
+
+        self.user_sessions[user_id]['phone'] = phone
         selected_proxy = self._get_available_proxy()
         self.user_sessions[user_id]['login_proxy'] = selected_proxy
         user_client = await self._create_login_client(selected_proxy)
@@ -794,6 +785,7 @@ async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
             await event.reply('❌ **خطا:** شماره تلفن نامعتبر است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
             if user_client.is_connected(): await user_client.disconnect()
+
     async def _handle_code_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         user_client = self.user_sessions[user_id]['client']

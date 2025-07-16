@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import sentry_sdk
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
+from sentry_sdk.integrations.logging import LoggingIntegration
 from telethon import Button, TelegramClient, errors, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest
@@ -36,15 +37,69 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 
-# ADDED: Sentry Initialization
+# --- Global Proxy Loading Function ---
+def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
+    """Loads proxies from the specified file."""
+    proxy_list = []
+    try:
+        with open(proxy_file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ip, port = line.split(':', 1)
+                    proxy_list.append({
+                        'proxy_type': 'http',
+                        'addr': ip,
+                        'port': int(port)
+                    })
+                except ValueError:
+                    LOGGER.warning(f"Skipping malformed proxy line: {line}. Expected format is IP:PORT.")
+        LOGGER.info(f"Loaded {len(proxy_list)} proxies from {proxy_file_path}.")
+    except FileNotFoundError:
+        LOGGER.warning(f"Proxy file '{proxy_file_path}' not found.")
+    return proxy_list
+
+# MODIFIED: Sentry before_send function for more precise filtering
+def before_send(event, hint):
+    """
+    Filter out very specific, high-volume DEBUG logs from Telethon.
+    """
+    log_record = event.get('logentry', None)
+    if log_record and log_record.get('level') == 'debug':
+        logger_name = log_record.get('logger', '')
+        # Ignore only the noisiest network and packer logs
+        if logger_name in ['telethon.extensions.messagepacker', 'telethon.network.mtprotosender']:
+            return None
+    return event
+
 if SENTRY_DSN:
-    sentry_sdk.init(
-        dsn=SENTRY_DSN,
-        # Set traces_sample_rate to 1.0 to capture 100%
-        # of transactions for performance monitoring.
-        traces_sample_rate=1.0,
+    sentry_logging = LoggingIntegration(
+        level=logging.INFO,        # Capture info and above as breadcrumbs
+        event_level=logging.WARNING  # Send warnings and above as events
     )
-    LOGGER.info("Sentry initialized for error reporting.")
+    
+    sentry_options = {
+        "dsn": SENTRY_DSN,
+        "integrations": [sentry_logging],
+        "before_send": before_send,
+        "traces_sample_rate": 1.0,
+    }
+
+    # ADDED: Configure proxy for Sentry reports
+    proxies_for_sentry = load_proxies_from_file("proxy10.txt")
+    if proxies_for_sentry:
+        sentry_proxy = random.choice(proxies_for_sentry)
+        proxy_url = f"http://{sentry_proxy['addr']}:{sentry_proxy['port']}"
+        sentry_options["http_proxy"] = proxy_url
+        sentry_options["https_proxy"] = proxy_url
+        LOGGER.info(f"Sentry will use proxy: {proxy_url}")
+    else:
+        LOGGER.info("Sentry will not use a proxy (none found).")
+
+    sentry_sdk.init(**sentry_options)
+    LOGGER.info("Sentry initialized for error and log reporting.")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
     raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, and ENCRYPTION_KEY are set.")
@@ -115,7 +170,7 @@ class GroupCreatorBot:
         self.worker_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_WORKERS)
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
-        self.proxies = self._load_proxies()
+        self.proxies = load_proxies_from_file(Config.PROXY_FILE)
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
         try:
@@ -124,29 +179,6 @@ class GroupCreatorBot:
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
 
     # --- Proxy Helpers ---
-    def _load_proxies(self) -> List[Dict]:
-        """Loads proxies from the specified file."""
-        proxy_list = []
-        try:
-            with open(Config.PROXY_FILE, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ip, port = line.split(':', 1)
-                        proxy_list.append({
-                            'proxy_type': 'http',
-                            'addr': ip,
-                            'port': int(port)
-                        })
-                    except ValueError:
-                        LOGGER.warning(f"Skipping malformed proxy line: {line}. Expected format is IP:PORT.")
-            LOGGER.info(f"Loaded {len(proxy_list)} proxies from {Config.PROXY_FILE}.")
-        except FileNotFoundError:
-            LOGGER.warning(f"Proxy file '{Config.PROXY_FILE}' not found. Continuing without proxies.")
-        return proxy_list
-    
     def _load_account_proxies(self) -> Dict[str, Dict]:
         """Loads the account-to-proxy assignments from a JSON file."""
         if not self.account_proxy_file.exists():
@@ -440,7 +472,6 @@ class GroupCreatorBot:
                     except Exception as e:
                         LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
                         sentry_sdk.capture_exception(e)
-                        # MODIFIED: Send more descriptive error message
                         error_type = type(e).__name__
                         await self.bot.send_message(user_id, f"❌ **خطای غیرمنتظره در ساخت گروه برای `{account_name}`:**\n`{error_type}`")
                         break
@@ -641,6 +672,12 @@ class GroupCreatorBot:
         await msg.edit(''.join(report))
         raise events.StopPropagation
 
+    async def _test_sentry_handler(self, event: events.NewMessage.Event) -> None:
+        LOGGER.info(f"User {event.sender_id} initiated a Sentry test.")
+        await event.reply("🧪 Sending a test error to Sentry. Please check your Sentry dashboard.")
+        # This will cause an unhandled exception that Sentry should capture.
+        division_by_zero = 1 / 0
+
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
         await event.reply('📞 لطفا شماره تلفن حساب جدید را با فرمت بین‌المللی ارسال کنید (مثال: `+989123456789`).', buttons=Button.clear())
@@ -692,6 +729,7 @@ class GroupCreatorBot:
             Config.BTN_SERVER_STATUS: self._server_status_handler,
             "/debug_proxies": self._debug_test_proxies_handler,
             "/clean_sessions": self._clean_sessions_handler,
+            "/test_sentry": self._test_sentry_handler,
         }
         
         handler = route_map.get(text)

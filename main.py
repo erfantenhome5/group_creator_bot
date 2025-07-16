@@ -86,7 +86,7 @@ class Config:
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 60
     MAX_SLEEP_SECONDS = 240
-    GROUP_MEMBER_TO_ADD = '@BotFather'
+    GROUP_MEMBER_TO_ADD = '@Erfantenhome1'
     PROXY_FILE = "proxy10.txt"
     PROXY_TIMEOUT = 5 
 

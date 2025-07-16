@@ -21,7 +21,7 @@ from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events
 from telethon.sessions import StringSession
 from telethon.tl import functions
-from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest
+from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest, MigrateChatRequest
 from telethon.tl.types import Message
 
 from session_manager import SessionManager
@@ -87,7 +87,7 @@ class Config:
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 60
     MAX_SLEEP_SECONDS = 240
-    GROUP_MEMBER_TO_ADD = '@BotFather'
+    GROUP_MEMBER_TO_ADD = '@erfantenhome1' # MODIFIED: Changed invited user
     PROXY_FILE = "proxy10.txt"
     PROXY_TIMEOUT = 5 
 
@@ -440,8 +440,16 @@ class GroupCreatorBot:
         }
         headers = {'Content-Type': 'application/json'}
 
+        # MODIFIED: Select a random proxy for the Gemini API call
+        proxy = None
+        if self.proxies:
+            proxy_choice = random.choice(self.proxies)
+            proxy = f"http://{proxy_choice['addr']}:{proxy_choice['port']}"
+            LOGGER.info(f"Using proxy {proxy} for Gemini API call.")
+
         try:
-            async with httpx.AsyncClient() as client:
+            # MODIFIED: Use the selected proxy with httpx
+            async with httpx.AsyncClient(proxies=proxy) as client:
                 response = await client.post(api_url, json=payload, headers=headers, timeout=20.0)
                 response.raise_for_status() # Raise an exception for bad status codes
                 
@@ -487,62 +495,79 @@ class GroupCreatorBot:
 
                 for i in range(Config.GROUPS_TO_CREATE):
                     current_semester += 1
-                    # MODIFIED: Changed group title to English as requested
                     group_title = f"collage Semester {current_semester}"
 
                     try:
-                        request = CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title)
-                        result = await self._send_request_with_reconnect(user_client, request, account_name)
+                        # 1. Create the basic group
+                        create_request = CreateChatRequest(users=[Config.GROUP_MEMBER_TO_ADD], title=group_title)
+                        create_result = await self._send_request_with_reconnect(user_client, create_request, account_name)
 
-                        chat = None
-                        # MODIFIED: Correctly parse the result from CreateChatRequest, checking for updates object first.
-                        if hasattr(result, 'updates') and hasattr(result.updates, 'chats') and result.updates.chats:
-                            chat = result.updates.chats[0]
-                        elif hasattr(result, 'chats') and result.chats: # Fallback for other response types
-                            chat = result.chats[0]
-                        else:
-                            LOGGER.error(f"Could not find chat in result of type {type(result)} for account {account_name}")
-                            await self.bot.send_message(user_id, f"❌ [{account_name}] Unexpected error: Group info not found.")
+                        basic_chat = None
+                        if hasattr(create_result, 'updates') and hasattr(create_result.updates, 'chats') and create_result.updates.chats:
+                            basic_chat = create_result.updates.chats[0]
+                        elif hasattr(create_result, 'chats') and create_result.chats:
+                            basic_chat = create_result.chats[0]
+                        
+                        if not basic_chat:
+                            LOGGER.error(f"Could not find chat in result of type {type(create_result)} for account {account_name}")
+                            await self.bot.send_message(user_id, f"❌ [{account_name}] Unexpected error: Group info not found after creation.")
                             current_semester -= 1 
                             continue
                         
+                        LOGGER.info(f"Successfully created basic group '{basic_chat.title}' (ID: {basic_chat.id}).")
+
                         # --- Upgrade to Supergroup and set History Visibility ---
                         try:
-                            input_channel = await user_client.get_input_entity(-chat.id)
+                            # 2. Migrate the basic group to a supergroup
+                            LOGGER.info(f"Attempting to migrate chat {basic_chat.id} to a supergroup.")
+                            migrate_result = await user_client(MigrateChatRequest(chat_id=basic_chat.id))
+                            
+                            new_supergroup = None
+                            for chat in migrate_result.chats:
+                                if hasattr(chat, 'migrated_from_chat_id') and chat.migrated_from_chat_id == basic_chat.id:
+                                    new_supergroup = chat
+                                    break
+                            
+                            if not new_supergroup:
+                                LOGGER.error(f"Failed to find new supergroup info in migration response for original chat {basic_chat.id}.")
+                                raise Exception("Supergroup migration failed.")
 
-                            # 1. Upgrade to a supergroup by making it public with a generated username.
+                            LOGGER.info(f"Successfully migrated to supergroup '{new_supergroup.title}' (New ID: {new_supergroup.id}).")
+                            input_channel = await user_client.get_input_entity(new_supergroup.id)
+
+                            # 3. Set a public username for the new supergroup
                             username_set = False
-                            for attempt in range(5): # Try up to 5 times to find an available username
+                            for attempt in range(5): # Try up to 5 times
                                 generated_username = await self._generate_unique_username()
-                                LOGGER.info(f"Attempting to upgrade group {chat.id} with username: {generated_username} (Attempt {attempt + 1}/5)")
+                                LOGGER.info(f"Attempting to set username for supergroup {new_supergroup.id}: @{generated_username} (Attempt {attempt + 1}/5)")
                                 
                                 try:
                                     await user_client(functions.channels.UpdateUsernameRequest(
                                         channel=input_channel,
                                         username=generated_username
                                     ))
-                                    LOGGER.info(f"Group {chat.id} successfully upgraded to a supergroup with username @{generated_username}.")
+                                    LOGGER.info(f"Successfully set username for supergroup {new_supergroup.id} to @{generated_username}.")
                                     username_set = True
-                                    break # Exit loop on success
+                                    break
                                 except errors.UsernameOccupiedError:
-                                    LOGGER.warning(f"Username '{generated_username}' is occupied. Retrying with a new one.")
-                                    await asyncio.sleep(1) # Small delay before retrying
+                                    LOGGER.warning(f"Username '{generated_username}' is occupied. Retrying...")
+                                    await asyncio.sleep(1)
                             
                             if not username_set:
-                                LOGGER.error(f"Failed to set a public username for group {chat.id} after multiple attempts. Skipping history toggle.")
-                                raise Exception("Could not set public username.")
-
-                            # 2. Now that it's a supergroup, make chat history visible to new members.
+                                LOGGER.error(f"Failed to set a public username for supergroup {new_supergroup.id} after multiple attempts.")
+                                # Continue without a username if all attempts fail
+                            
+                            # 4. Make chat history visible to new members
                             await user_client(functions.channels.TogglePreHistoryHiddenRequest(
                                 channel=input_channel,
                                 enabled=False
                             ))
-                            LOGGER.info(f"Chat history for new members in group {chat.id} is now visible.")
-                            
-                            # 3. As requested, DO NOT make the group private again. It will remain public.
+                            LOGGER.info(f"Chat history for new members in supergroup {new_supergroup.id} is now visible.")
 
+                        except errors.ChatAdminRequiredError as e:
+                            LOGGER.error(f"Migration failed for chat {basic_chat.id}: Not admin. {e}")
                         except Exception as e:
-                            LOGGER.warning(f"Could not complete supergroup upgrade/history toggle for group {chat.id}. Error: {e}\n{traceback.format_exc()}")
+                            LOGGER.warning(f"Could not complete supergroup upgrade/history toggle for chat {basic_chat.id}. Error: {e}\n{traceback.format_exc()}")
 
 
                         self._set_group_count(worker_key, current_semester)

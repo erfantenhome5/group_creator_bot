@@ -87,7 +87,7 @@ class Config:
     MAX_SLEEP_SECONDS = 240
     GROUP_MEMBER_TO_ADD = '@BotFather'
     PROXY_FILE = "proxy10.txt"
-    PROXY_TIMEOUT = 10 # Increased timeout for more resilience
+    PROXY_TIMEOUT = 10 
     PROXY_BLACKLIST_DURATION = timedelta(minutes=5)
 
     # --- UI Text & Buttons ---
@@ -208,6 +208,19 @@ class GroupCreatorBot:
                 json.dump(data, f, indent=4)
         except IOError:
             LOGGER.error(f"Could not save {name} to {file_path.name}.")
+
+    # --- User Tracking and Broadcast ---
+    async def _broadcast_message(self, message_text: str):
+        """Sends a message to all known users."""
+        LOGGER.info(f"Broadcasting message to {len(self.known_users)} users.")
+        for user_id in self.known_users:
+            try:
+                await self.bot.send_message(user_id, message_text)
+                await asyncio.sleep(0.1) # Avoid hitting rate limits
+            except (errors.UserIsBlockedError, errors.InputUserDeactivatedError):
+                LOGGER.warning(f"User {user_id} has blocked the bot or is deactivated. Cannot send broadcast.")
+            except Exception as e:
+                LOGGER.error(f"Failed to send broadcast to {user_id}: {e}")
 
     # --- Proxy Management Helpers ---
     def _mark_proxy_as_bad(self, proxy: Dict):
@@ -571,7 +584,18 @@ class GroupCreatorBot:
         await handler(event)
 
     async def _clean_sessions_handler(self, event: events.NewMessage.Event) -> None:
-        # ... (confirmation logic)
+        user_id = event.sender_id
+        try:
+            async with self.bot.conversation(user_id, timeout=30) as conv:
+                await conv.send_message("⚠️ **هشدار:** این عملیات تمام نشست‌های کاربری، شمارنده‌ها و تخصیص پراکسی‌ها را حذف کرده و تمام عملیات‌های در حال اجرا را متوقف می‌کند. لطفاً با ارسال `confirm` در 30 ثانیه آینده تایید کنید.")
+                response = await conv.get_response()
+                if response.text.lower() != 'confirm':
+                    await conv.send_message("❌ عملیات لغو شد.")
+                    return
+        except asyncio.TimeoutError:
+            await self.bot.send_message(user_id, "❌ زمان انتظار برای تایید به پایان رسید. عملیات لغو شد.")
+            return
+
         for task in self.active_workers.values():
             task.cancel()
         self.active_workers.clear()
@@ -783,7 +807,8 @@ class GroupCreatorBot:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service has started successfully.")
             await self._resume_active_workers()
-            await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
+            if self.known_users:
+                await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
             await self.bot.run_until_disconnected()
         finally:
             LOGGER.info("Bot service is shutting down. Saving worker state...")

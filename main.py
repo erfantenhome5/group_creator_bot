@@ -87,7 +87,6 @@ class Config:
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 60
     MAX_SLEEP_SECONDS = 240
-    GROUP_MEMBER_TO_ADD = '@erfantenhome1' # MODIFIED: Changed invited user
     PROXY_FILE = "proxy10.txt"
     PROXY_TIMEOUT = 5 
 
@@ -417,13 +416,13 @@ class GroupCreatorBot:
         return keyboard
         
     async def _generate_persian_messages(self) -> List[str]:
-        """Generates 10 Persian messages about life and God using the Gemini API."""
+        """Generates 20 Persian messages about life and God using the Gemini API."""
         if not GEMINI_API_KEY:
             LOGGER.warning("GEMINI_API_KEY not set. Skipping message generation.")
             return []
 
         prompt = (
-            "ایجاد ۱۰ پیام یا نقل قول منحصر به فرد و عمیق به زبان فارسی. "
+            "ایجاد ۲۰ پیام یا نقل قول منحصر به فرد و عمیق به زبان فارسی. "
             "این پیام‌ها باید درباره موضوعات «زندگی»، «معنای زندگی» و «خدا» باشند. "
             "لطفا پاسخ را در قالب یک آرایه JSON از رشته‌ها برگردانید. مثال: "
             '["پیام اول", "پیام دوم", ...]'
@@ -447,7 +446,8 @@ class GroupCreatorBot:
             LOGGER.info(f"Using proxy {proxy} for Gemini message generation.")
 
         try:
-            async with httpx.AsyncClient(proxies=proxy) as client:
+            # MODIFIED: Corrected parameter from 'proxies' to 'proxy'
+            async with httpx.AsyncClient(proxy=proxy) as client:
                 response = await client.post(api_url, json=payload, headers=headers, timeout=40.0)
                 response.raise_for_status()
                 
@@ -501,32 +501,17 @@ class GroupCreatorBot:
                             CreateChannelRequest(
                                 title=group_title,
                                 about=group_description,
-                                megagroup=True  # This is crucial for creating a supergroup
+                                megagroup=True,  # This is crucial for creating a supergroup
+                                for_import=True # Recommended for inviting users later
                             ),
                             account_name
                         )
                         
                         # Extract the newly created channel object
                         new_supergroup = create_result.chats[0]
-                        input_channel = await user_client.get_input_entity(new_supergroup.id)
                         LOGGER.info(f"Successfully created supergroup '{new_supergroup.title}' (ID: {new_supergroup.id}).")
-
-                        # 2. Add the specified member to the new supergroup
-                        try:
-                            member_to_add = await user_client.get_input_entity(Config.GROUP_MEMBER_TO_ADD)
-                            await self._send_request_with_reconnect(
-                                user_client,
-                                InviteToChannelRequest(
-                                    channel=input_channel,
-                                    users=[member_to_add]
-                                ),
-                                account_name
-                            )
-                            LOGGER.info(f"Successfully invited {Config.GROUP_MEMBER_TO_ADD} to {new_supergroup.title}.")
-                        except Exception as e:
-                            LOGGER.warning(f"Could not invite {Config.GROUP_MEMBER_TO_ADD} to {new_supergroup.title}. Error: {e}")
                         
-                        # 3. Send AI-generated messages to the new supergroup
+                        # 2. Send AI-generated messages to the new supergroup
                         LOGGER.info(f"Generating AI messages for {new_supergroup.title}...")
                         ai_messages = await self._generate_persian_messages()
                         if ai_messages:

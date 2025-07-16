@@ -64,6 +64,10 @@ class AIAnalyzer:
                 await self.bot.bot.send_message(int(self.admin_user_id), response_message[i:i+4096])
 
             if corrected_function:
+                # MODIFIED: Broadcast maintenance message to all users before applying the fix
+                await self.bot._broadcast_message("⚙️ ربات برای اعمال یک بروزرسانی مهم در حال راه‌اندازی مجدد است. لطفاً چند لحظه صبر کنید...")
+                await asyncio.sleep(2) # Give messages a chance to be sent
+
                 if self._apply_code_fix(main_py_path, corrected_function):
                     LOGGER.info("Code fix applied successfully. Restarting bot service...")
                     await self.bot.bot.send_message(int(self.admin_user_id), "✅ **اصلاحیه با موفقیت اعمال شد. ربات در حال راه‌اندازی مجدد است...**")

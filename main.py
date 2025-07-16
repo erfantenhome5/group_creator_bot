@@ -726,7 +726,6 @@ class GroupCreatorBot:
         except Exception as e:
             LOGGER.info("Test error was triggered successfully. The AI is now analyzing it.")
             await event.reply("⚙️ یک مشکل شناسایی شد و سیستم در حال رفع خودکار آن است. ربات به زودی مجددا راه‌اندازی خواهد شد.")
-            # The error is captured by Sentry's global handler, which triggers the AI
             sentry_sdk.capture_exception(e)
     
     async def _intentionally_broken_function(self):

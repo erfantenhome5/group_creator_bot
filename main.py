@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import sentry_sdk
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, errors, events
@@ -26,6 +27,32 @@ logging.basicConfig(
     ]
 )
 LOGGER = logging.getLogger(__name__)
+
+# --- Environment Loading & Sentry Initialization ---
+load_dotenv()
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+
+# ADDED: Sentry Initialization
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        # Set traces_sample_rate to 1.0 to capture 100%
+        # of transactions for performance monitoring.
+        traces_sample_rate=1.0,
+    )
+    LOGGER.info("Sentry initialized for error reporting.")
+
+if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
+    raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, and ENCRYPTION_KEY are set.")
+
+API_ID = int(API_ID)
+SESSIONS_DIR = Path("sessions")
+SESSIONS_DIR.mkdir(exist_ok=True)
+
 
 # --- Centralized Configuration ---
 class Config:
@@ -75,21 +102,6 @@ class Config:
     MSG_PROMPT_MASTER_PASSWORD = "🔑 لطفا برای دسترسی به ربات، رمز عبور اصلی را وارد کنید:"
     MSG_INCORRECT_MASTER_PASSWORD = "❌ رمز عبور اشتباه است. لطفا دوباره تلاش کنید."
     MSG_BROWSER_RUNNING = "⏳ در حال آماده‌سازی مرورگر امن... این کار ممکن است چند لحظه طول بکشد."
-
-
-# --- Environment Loading ---
-load_dotenv()
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
-
-if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
-    raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, and ENCRYPTION_KEY are set.")
-
-API_ID = int(API_ID)
-SESSIONS_DIR = Path("sessions")
-SESSIONS_DIR.mkdir(exist_ok=True)
 
 
 class GroupCreatorBot:
@@ -154,19 +166,16 @@ class GroupCreatorBot:
         except IOError:
             LOGGER.error("Could not save account_proxies.json.")
 
-    # MODIFIED: This function now finds an unassigned proxy
     def _get_available_proxy(self) -> Optional[Dict]:
         """Finds the first available proxy that is not currently assigned to any account."""
         if not self.proxies:
             return None
 
-        # Get a set of all currently assigned proxy addresses for quick lookup
         assigned_proxy_addrs = set()
         for proxy_data in self.account_proxies.values():
-            if proxy_data: # Ensure proxy_data is not None
+            if proxy_data:
                 assigned_proxy_addrs.add(proxy_data['addr'])
 
-        # Find the first proxy that is not in the assigned set
         for proxy in self.proxies:
             if proxy['addr'] not in assigned_proxy_addrs:
                 LOGGER.info(f"Found available proxy: {proxy['addr']}")
@@ -303,6 +312,7 @@ class GroupCreatorBot:
             return client
         except Exception as e:
             LOGGER.error(f"Worker connection failed with {proxy_info}: {e}")
+            sentry_sdk.capture_exception(e)
             if isinstance(e, errors.AuthKeyUnregisteredError):
                 raise
             return None
@@ -316,14 +326,20 @@ class GroupCreatorBot:
             if not client.is_connected():
                 LOGGER.warning(f"Client for '{account_name}' was disconnected. Attempting to reconnect...")
                 await client.connect()
-                LOGGER.info(f"Successfully reconnected client for '{account_name}'.")
+                if client.is_connected():
+                    LOGGER.info(f"Successfully reconnected client for '{account_name}'.")
+                else:
+                    LOGGER.error(f"Failed to reconnect client for '{account_name}'.")
+                    raise ConnectionError("Failed to reconnect client.")
             
             return await client(request)
         except ConnectionError as e:
             LOGGER.error(f"Connection error for '{account_name}' even after checking: {e}")
+            sentry_sdk.capture_exception(e)
             raise 
         except Exception as e:
             LOGGER.error(f"An unexpected error occurred while sending a request for '{account_name}': {e}")
+            sentry_sdk.capture_exception(e)
             raise
 
     # --- Dynamic UI Builder ---
@@ -403,23 +419,30 @@ class GroupCreatorBot:
                         sleep_time = random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS)
                         await asyncio.sleep(sleep_time)
 
-                    except errors.AuthKeyUnregisteredError:
-                        LOGGER.error(f"Authentication key for account '{account_name}' is unregistered during worker execution. Deleting session.")
+                    except errors.AuthKeyUnregisteredError as e:
+                        LOGGER.error(f"Authentication key for account '{account_name}' is unregistered. Deleting session.")
+                        sentry_sdk.capture_exception(e)
                         self._delete_session_file(user_id, account_name)
                         self._remove_group_count(worker_key)
                         await self.bot.send_message(user_id, f"🚨 **خطای امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند نقطه، توسط تلگرام باطل شد. عملیات متوقف و حساب حذف گردید. لطفاً آن را دوباره اضافه کنید.")
                         break 
-                    except errors.UserRestrictedError:
+                    except errors.UserRestrictedError as e:
                         LOGGER.error(f"Worker for {worker_key} failed: User is restricted.")
+                        sentry_sdk.capture_exception(e)
                         await self.bot.send_message(user_id, f"❌ حساب `{account_name}` توسط تلگرام محدود شده و قادر به ساخت گروه نیست. عملیات متوقف شد.")
                         break
-                    except errors.FloodWaitError as fwe:
-                        resume_time = datetime.now() + timedelta(seconds=fwe.seconds)
-                        await self.bot.send_message(user_id, f"⏳ [{account_name}] به دلیل محدودیت تلگرام، عملیات به مدت {fwe.seconds / 60:.1f} دقیقه تا ساعت {resume_time:%H:%M:%S} متوقف شد.")
-                        await asyncio.sleep(fwe.seconds)
+                    except errors.FloodWaitError as e:
+                        LOGGER.warning(f"Flood wait error for {worker_key}. Sleeping for {e.seconds} seconds.")
+                        sentry_sdk.capture_exception(e)
+                        resume_time = datetime.now() + timedelta(seconds=e.seconds)
+                        await self.bot.send_message(user_id, f"⏳ [{account_name}] به دلیل محدودیت تلگرام، عملیات به مدت {e.seconds / 60:.1f} دقیقه تا ساعت {resume_time:%H:%M:%S} متوقف شد.")
+                        await asyncio.sleep(e.seconds)
                     except Exception as e:
-                        LOGGER.error(f"Worker error for {worker_key}", exc_info=e)
-                        await self.bot.send_message(user_id, f"❌ [{account_name}] خطای غیرمنتظره در ساخت گروه رخ داد.")
+                        LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
+                        sentry_sdk.capture_exception(e)
+                        # MODIFIED: Send more descriptive error message
+                        error_type = type(e).__name__
+                        await self.bot.send_message(user_id, f"❌ **خطای غیرمنتظره در ساخت گروه برای `{account_name}`:**\n`{error_type}`")
                         break
         except asyncio.CancelledError:
             LOGGER.info(f"Task for {worker_key} was cancelled by user.")
@@ -442,7 +465,6 @@ class GroupCreatorBot:
         
         self._save_session_string(user_id, account_name, user_client.session.save())
 
-        # MODIFIED: Use the new available proxy logic
         assigned_proxy = self._get_available_proxy()
         self.account_proxies[worker_key] = assigned_proxy
         self._save_account_proxies()
@@ -725,21 +747,22 @@ class GroupCreatorBot:
                 self._delete_session_file(user_id, account_name)
                 self._remove_group_count(worker_key)
                 await event.reply(f'⚠️ نشست برای حساب `{account_name}` منقضی شده و حذف شد. لطفا دوباره آن را اضافه کنید.')
-        except errors.AuthKeyUnregisteredError:
+        except errors.AuthKeyUnregisteredError as e:
             LOGGER.error(f"Authentication key for account '{account_name}' is unregistered. Deleting session.")
+            sentry_sdk.capture_exception(e)
             self._delete_session_file(user_id, account_name)
             self._remove_group_count(worker_key)
             await event.reply(f"🚨 **خطای امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند نقطه، توسط تلگرام باطل شد. این حساب حذف گردید. لطفاً آن را دوباره اضافه کنید.")
             await self._send_accounts_menu(event)
         except Exception as e:
-            LOGGER.error(f"Failed to start process for {worker_key}", exc_info=e)
+            LOGGER.error(f"Failed to start process for {worker_key}", exc_info=True)
+            sentry_sdk.capture_exception(e)
             await event.reply(f'❌ خطایی در اتصال به حساب `{account_name}` رخ داد.')
         finally:
             if user_client and not self.active_workers.get(worker_key):
                 if user_client.is_connected():
                     await user_client.disconnect()
 
-    # MODIFIED: This function now waits for the task to finish before updating the UI
     async def _cancel_worker_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
         user_id = event.sender_id
         worker_key = f"{user_id}:{account_name}"
@@ -749,12 +772,10 @@ class GroupCreatorBot:
             task.cancel()
             LOGGER.info(f"User initiated cancellation for worker {worker_key}.")
             try:
-                # Wait for the task to acknowledge cancellation and finish its finally block
                 await task
             except asyncio.CancelledError:
                 LOGGER.info(f"Worker task {worker_key} successfully cancelled and cleaned up.")
             
-            # Now the worker should be removed from the active list, so the menu will be correct.
             await self._send_accounts_menu(event)
         else:
             await event.reply(f"ℹ️ هیچ عملیات فعالی برای حساب `{account_name}` جهت توقف وجود ندارد.")
@@ -805,7 +826,8 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['state'] = 'awaiting_code'
             await event.reply('💬 کد ورود ارسال شد. لطفا آن را اینجا ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"Phone input error for {user_id}", exc_info=e)
+            LOGGER.error(f"Phone input error for {user_id}", exc_info=True)
+            sentry_sdk.capture_exception(e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone' 
             await event.reply(
                 '❌ **خطا:** شماره تلفن نامعتبر است یا مشکلی در ارسال کد رخ داد. لطفا دوباره با فرمت بین‌المللی (+کد کشور) تلاش کنید یا عملیات را لغو کنید.',
@@ -827,7 +849,8 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['state'] = 'awaiting_password'
             await event.reply('🔑 این حساب تایید دو مرحله‌ای دارد. لطفا رمز عبور را ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"Code input error for {user_id}", exc_info=e)
+            LOGGER.error(f"Code input error for {user_id}", exc_info=True)
+            sentry_sdk.capture_exception(e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
             await event.reply('❌ **خطا:** کد وارد شده نامعتبر است. لطفا شماره تلفن را مجددا وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
 
@@ -838,7 +861,8 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['state'] = 'awaiting_account_name'
             await event.reply('✅ ورود موفق! لطفاً یک نام مستعار برای این حساب وارد کنید (مثلا: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"Password input error for {user_id}", exc_info=e)
+            LOGGER.error(f"Password input error for {user_id}", exc_info=True)
+            sentry_sdk.capture_exception(e)
             self.user_sessions[user_id]['state'] = 'awaiting_password'
             await event.reply('❌ **خطا:** رمز عبور اشتباه است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
 

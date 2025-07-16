@@ -28,7 +28,7 @@ class AIAnalyzer:
 
     async def analyze_and_apply_fix(self, exc_type, exc_value, tb):
         """
-        Analyzes an error, generates a corrected function, and replaces the old function in the source code.
+        Analyzes an error, generates a corrected function, and notifies the admin.
         """
         if not self.gemini_api_key or not self.admin_user_id:
             LOGGER.warning("Cannot run AI error analysis: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
@@ -55,8 +55,8 @@ class AIAnalyzer:
             corrected_function = self._extract_python_code_from_response(suggestions)
             
             response_message = (
-                f"🚨 **گزارش خودکار و اقدام اصلاحی از هوش مصنوعی ({used_model}):**\n\n"
-                f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. تحلیل و راه حل زیر تولید و در حال اعمال است:\n\n"
+                f"🚨 **گزارش خودکار از هوش مصنوعی ({used_model}):**\n\n"
+                f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. تحلیل و راه حل زیر تولید شد:\n\n"
                 f"{suggestions}"
             )
             
@@ -79,6 +79,26 @@ class AIAnalyzer:
         except Exception as e:
             LOGGER.error(f"The AI self-healing process itself failed: {e}", exc_info=True)
 
+    async def explain_error_for_user(self, error: Exception) -> str:
+        """
+        Uses Gemini to generate a simple, user-friendly explanation for an error.
+        """
+        default_message = "❌ **خطای غیرمنتظره:** مشکلی در انجام عملیات رخ داد. لطفاً دوباره تلاش کنید."
+        if not self.gemini_api_key:
+            return default_message
+
+        try:
+            prompt = self._construct_user_explanation_prompt(error)
+            explanation, _ = await self._call_gemini_with_fallback(prompt, ["gemini-2.0-flash"])
+            
+            if explanation:
+                return f"❌ **خطا:** {explanation}"
+            else:
+                return default_message
+        except Exception as e:
+            LOGGER.error(f"AI user explanation generation failed: {e}")
+            return default_message
+
     def _extract_python_code_from_response(self, response: str) -> Optional[str]:
         """Extracts a Python code block from the AI's markdown response."""
         try:
@@ -94,7 +114,6 @@ class AIAnalyzer:
         Replaces an entire function in a file with new code.
         """
         try:
-            # Extract the function name from the new code (e.g., "def my_function(...")
             match = re.search(r"def\s+(\w+)\s*\(", new_function_code)
             if not match:
                 LOGGER.error("AI fix did not contain a valid function definition.")
@@ -104,8 +123,6 @@ class AIAnalyzer:
             
             original_code = file_path.read_text()
             
-            # Create a robust regex to find the whole function block, accounting for decorators
-            # This looks for 'async def' or 'def' and captures until the next function definition or end of class.
             pattern = re.compile(
                 rf"(?:@\w+\n)*\s*async\s+def\s+{func_name}\s*\([^)]*\):\s*.*?(?=\n\s*(?:@\w+\n)*\s*(?:async\s+)?def|\n\s*class|\Z)", 
                 re.DOTALL
@@ -121,54 +138,14 @@ class AIAnalyzer:
                 LOGGER.error(f"Could not find the original function '{func_name}' in the source code to replace it.")
                 return False
 
-            # Replace the old function with the new one
             modified_code = pattern.sub(new_function_code, original_code, count=1)
             
-            # Write the modified code back to the file
             file_path.write_text(modified_code)
             return True
 
         except Exception as e:
             LOGGER.error(f"Failed to apply code fix to file {file_path}: {e}", exc_info=True)
             return False
-
-    async def refine_code(self, event):
-        """
-        Handles the /refine_code command, analyzing the bot's code and recent logs.
-        """
-        if not self.gemini_api_key:
-            await event.reply("❌ قابلیت تحلیل کد با هوش مصنوعی غیرفعال است. لطفاً `GEMINI_API_KEY` را در فایل `.env` تنظیم کنید.")
-            return
-
-        await event.reply("🤖 در حال ارسال کد و لاگ‌ها برای تحلیل توسط هوش مصنوعی Gemini... این کار ممکن است کمی طول بکشد.")
-        
-        try:
-            source_code = Path(__file__).parent.joinpath("main.py").read_text()
-            
-            try:
-                with open("bot_activity.log", "r") as f:
-                    log_lines = f.readlines()
-                    recent_logs = "".join(log_lines[-50:])
-            except FileNotFoundError:
-                recent_logs = "Log file not found."
-
-            prompt = self._construct_code_refinement_prompt(source_code, recent_logs)
-            
-            suggestions, _ = await self._call_gemini_with_fallback(prompt, ["gemini-2.0-flash"])
-
-            if suggestions:
-                response_message = f"**💡 پیشنهادات Gemini برای بهبود کد (بر اساس کد و لاگ‌ها):**\n\n{suggestions}"
-                for i in range(0, len(response_message), 4096):
-                    await event.reply(response_message[i:i+4096])
-            else:
-                await event.reply("❌ هوش مصنوعی نتوانست پیشنهادی ارائه دهد. لطفاً دوباره تلاش کنید.")
-
-        except FileNotFoundError:
-            await event.reply("❌ خطا: فایل کد منبع ربات یافت نشد.")
-        except Exception as e:
-            LOGGER.error(f"AI code refinement failed: {e}", exc_info=True)
-            sentry_sdk.capture_exception(e)
-            await event.reply(f"❌ خطایی در هنگام ارتباط با سرویس Gemini رخ داد: `{type(e).__name__}`")
 
     def _construct_error_analysis_prompt(self, source_code: str, traceback_str: str) -> str:
         """Constructs a sophisticated prompt for analyzing a specific error and generating a fix."""
@@ -218,6 +195,22 @@ class AIAnalyzer:
             "```\n\n"
             "---"
             "**Output Format:** Please provide your analysis in Persian, using clear headings for each suggestion."
+        )
+
+    def _construct_user_explanation_prompt(self, error: Exception) -> str:
+        """Constructs a prompt to generate a user-friendly explanation for an error."""
+        error_type = type(error).__name__
+        error_details = str(error)
+        return (
+            "You are a helpful assistant for a Telegram bot. An error occurred, and your task is to explain it to the user in simple, non-technical Persian.\n\n"
+            f"**Technical Error:**\n- **Type:** `{error_type}`\n- **Details:** `{error_details}`\n\n"
+            "**Your Task:**\n"
+            "1.  Read the technical error type and details.\n"
+            "2.  Write a very short, simple, one-sentence explanation in Persian for a non-technical user.\n"
+            "3.  If possible, suggest a simple action, like 'لطفاً دوباره تلاش کنید' (please try again).\n\n"
+            "**Example:**\n- If the error is `ConnectionError`, you could say: 'مشکلی در اتصال به سرورهای تلگرام پیش آمده است. لطفاً لحظاتی دیگر دوباره تلاش کنید.'\n"
+            "- If the error is `UserRestrictedError`, you could say: 'این حساب توسط تلگرام محدود شده و قادر به انجام این کار نیست.'\n\n"
+            "**Do not include technical terms like 'Error', 'Exception', 'Traceback', etc. in your final response.** Just provide the simple, helpful sentence."
         )
 
     async def _call_gemini_with_fallback(self, prompt: str, models: List[str]) -> (Optional[str], Optional[str]):

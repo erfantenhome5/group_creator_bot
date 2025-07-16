@@ -54,9 +54,10 @@ class AIAnalyzer:
         repo_url = f"https://{self.github_username}:{self.github_token}@github.com/erfantenhome5/group_creator_bot.git"
         
         try:
-            LOGGER.info("Configuring git user identity...")
-            if not await self._run_git_command('git config --global user.name "AI Bot"'): return False
-            if not await self._run_git_command('git config --global user.email "ai-bot@example.com"'): return False
+            LOGGER.info("Configuring local git user identity as a fallback...")
+            # Set local config instead of global to avoid permission issues
+            if not await self._run_git_command('git config user.name "AI Bot"'): return False
+            if not await self._run_git_command('git config user.email "ai-bot@example.com"'): return False
 
             LOGGER.info("Attempting to push changes to GitHub...")
             if not await self._run_git_command('git add main.py ai_analyzer.py'): return False
@@ -84,7 +85,7 @@ class AIAnalyzer:
             traceback_str = "".join(traceback.format_exception(exc_type, exc_value, tb))
             prompt = self._construct_error_analysis_prompt(source_code, traceback_str)
             
-            suggestions, used_model = await self._call_gemini_with_fallback(prompt, ["gemini-pro", "gemini-2.0-flash"])
+            suggestions, used_model = await self._call_gemini_with_fallback(prompt, ["gemini-1.5-flash", "gemini-pro"])
             if not suggestions:
                 LOGGER.error("AI error analysis returned no suggestions."); return
 
@@ -137,7 +138,7 @@ class AIAnalyzer:
                 prompt = self._construct_code_refinement_prompt(source_code, recent_logs)
                 await self.bot.bot.send_message(int(self.admin_user_id), "🤖 **درخواست شما دریافت شد.**\nهوش مصنوعی در حال انجام یک بررسی کلی روی کد است...")
 
-            suggestions, used_model = await self._call_gemini_with_fallback(prompt, ["gemini-pro", "gemini-2.0-flash"])
+            suggestions, used_model = await self._call_gemini_with_fallback(prompt, ["gemini-1.5-flash", "gemini-pro"])
 
             if not suggestions:
                 await self.bot.bot.send_message(int(self.admin_user_id), "❌ هوش مصنوعی نتوانست پیشنهادی ارائه دهد."); return

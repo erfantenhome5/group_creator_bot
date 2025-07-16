@@ -28,7 +28,7 @@ class AIAnalyzer:
 
     async def analyze_and_apply_fix(self, exc_type, exc_value, tb):
         """
-        Analyzes an error, generates a patch, notifies the admin, and applies the fix.
+        Analyzes an error, generates a corrected function, and replaces the old function in the source code.
         """
         if not self.gemini_api_key or not self.admin_user_id:
             LOGGER.warning("Cannot run AI error analysis: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
@@ -52,7 +52,7 @@ class AIAnalyzer:
                 LOGGER.error("AI error analysis returned no suggestions after trying all fallback models.")
                 return
 
-            patch_content = self._extract_patch_from_response(suggestions)
+            corrected_function = self._extract_python_code_from_response(suggestions)
             
             response_message = (
                 f"🚨 **گزارش خودکار و اقدام اصلاحی از هوش مصنوعی ({used_model}):**\n\n"
@@ -63,48 +63,74 @@ class AIAnalyzer:
             for i in range(0, len(response_message), 4096):
                 await self.bot.bot.send_message(int(self.admin_user_id), response_message[i:i+4096])
 
-            if patch_content:
-                patch_file = Path("fix.patch")
-                patch_file.write_text(patch_content)
-                
-                apply_script_content = (
-                    "#!/bin/bash\n"
-                    "echo 'Applying patch...'\n"
-                    "patch -p1 main.py < fix.patch\n"
-                    "if [ $? -eq 0 ]; then\n"
-                    "    echo 'Patch applied successfully. Restarting bot service...'\n"
-                    "    sudo systemctl restart telegram_bot.service\n"
-                    "    echo 'Service restarted.'\n"
-                    "else\n"
-                    "    echo 'Error applying patch. Please check the patch file and apply it manually.'\n"
-                    "fi\n"
-                )
-                apply_script_file = Path("apply_and_restart.sh")
-                apply_script_file.write_text(apply_script_content)
-                os.chmod(apply_script_file, 0o755) # Make the script executable
-
-                # Execute the script to apply the patch and restart
-                LOGGER.info("Executing self-healing script: apply_and_restart.sh")
-                process = await asyncio.create_subprocess_shell(f'./{apply_script_file}')
-                await process.wait()
-                
-                patch_file.unlink()
-                apply_script_file.unlink()
+            if corrected_function:
+                if self._apply_code_fix(main_py_path, corrected_function):
+                    LOGGER.info("Code fix applied successfully. Restarting bot service...")
+                    await self.bot.bot.send_message(int(self.admin_user_id), "✅ **اصلاحیه با موفقیت اعمال شد. ربات در حال راه‌اندازی مجدد است...**")
+                    # Execute the restart command
+                    process = await asyncio.create_subprocess_shell('sudo systemctl restart telegram_bot.service')
+                    await process.wait()
+                else:
+                    LOGGER.error("Failed to apply the AI-generated code fix.")
+                    await self.bot.bot.send_message(int(self.admin_user_id), "❌ **خطا در اعمال خودکار اصلاحیه.** لطفاً کد پیشنهادی را به صورت دستی بررسی و اعمال کنید.")
             else:
-                LOGGER.warning("AI analysis was generated, but no patch was found to apply.")
+                LOGGER.warning("AI analysis was generated, but no code block was found to apply.")
 
         except Exception as e:
             LOGGER.error(f"The AI self-healing process itself failed: {e}", exc_info=True)
 
-    def _extract_patch_from_response(self, response: str) -> Optional[str]:
-        """Extracts a diff/patch block from the AI's markdown response."""
+    def _extract_python_code_from_response(self, response: str) -> Optional[str]:
+        """Extracts a Python code block from the AI's markdown response."""
         try:
-            match = re.search(r"```diff\n(.*?)```", response, re.DOTALL)
+            match = re.search(r"```python\n(.*?)```", response, re.DOTALL)
             if match:
                 return match.group(1).strip()
             return None
         except Exception:
             return None
+
+    def _apply_code_fix(self, file_path: Path, new_function_code: str) -> bool:
+        """
+        Replaces an entire function in a file with new code.
+        """
+        try:
+            # Extract the function name from the new code (e.g., "def my_function(...")
+            match = re.search(r"def\s+(\w+)\s*\(", new_function_code)
+            if not match:
+                LOGGER.error("AI fix did not contain a valid function definition.")
+                return False
+            
+            func_name = match.group(1)
+            
+            original_code = file_path.read_text()
+            
+            # Create a robust regex to find the whole function block, accounting for decorators
+            # This looks for 'async def' or 'def' and captures until the next function definition or end of class.
+            pattern = re.compile(
+                rf"(?:@\w+\n)*\s*async\s+def\s+{func_name}\s*\([^)]*\):\s*.*?(?=\n\s*(?:@\w+\n)*\s*(?:async\s+)?def|\n\s*class|\Z)", 
+                re.DOTALL
+            )
+            
+            if not pattern.search(original_code):
+                 pattern = re.compile(
+                    rf"(?:@\w+\n)*\s*def\s+{func_name}\s*\([^)]*\):\s*.*?(?=\n\s*(?:@\w+\n)*\s*(?:async\s+)?def|\n\s*class|\Z)", 
+                    re.DOTALL
+                )
+
+            if not pattern.search(original_code):
+                LOGGER.error(f"Could not find the original function '{func_name}' in the source code to replace it.")
+                return False
+
+            # Replace the old function with the new one
+            modified_code = pattern.sub(new_function_code, original_code, count=1)
+            
+            # Write the modified code back to the file
+            file_path.write_text(modified_code)
+            return True
+
+        except Exception as e:
+            LOGGER.error(f"Failed to apply code fix to file {file_path}: {e}", exc_info=True)
+            return False
 
     async def refine_code(self, event):
         """
@@ -145,15 +171,15 @@ class AIAnalyzer:
             await event.reply(f"❌ خطایی در هنگام ارتباط با سرویس Gemini رخ داد: `{type(e).__name__}`")
 
     def _construct_error_analysis_prompt(self, source_code: str, traceback_str: str) -> str:
-        """Constructs a sophisticated prompt for analyzing a specific error and generating a patch."""
+        """Constructs a sophisticated prompt for analyzing a specific error and generating a fix."""
         return (
             "You are an expert Python developer and a specialist in debugging asynchronous applications, "
             "particularly Telegram bots built with the Telethon library. Your task is to perform a root cause analysis of an error that was just captured and generate a fix.\n\n"
             "**Context:** The user is running a multi-account Telegram bot that creates groups. The bot uses proxies and runs multiple operations concurrently.\n\n"
             "**Your Task:**\n"
             "1.  **Analyze the Traceback and Source Code:** Carefully examine the provided traceback and the full source code to identify the exact root cause of the error.\n"
-            "2.  **Generate a Patch:** Create a code patch in the `diff` format that fixes the bug. The patch should be clean, targeted, and follow best practices. Enclose the patch in a markdown block like this: ```diff ... ```.\n"
-            "3.  **Explain the Fix:** In a separate section, explain the root cause of the error and how your patch resolves it.\n\n"
+            "2.  **Generate the Corrected Function:** Rewrite the *entire Python function* where the error occurred, with the fix applied. The function should be complete and syntactically correct.\n"
+            "3.  **Explain the Fix:** In a separate section, explain the root cause of the error and how your corrected function resolves it.\n\n"
             "---"
             "### Traceback:\n"
             "```\n"
@@ -164,7 +190,7 @@ class AIAnalyzer:
             f"{source_code}\n"
             "```\n\n"
             "---"
-            "**Output Format:** Provide your analysis in Persian. First, provide the explanation under a 'تحلیل و راه حل' heading. Then, provide the patch inside a `diff` markdown block."
+            "**Output Format:** Provide your analysis in Persian. First, provide the explanation under a 'تحلیل و راه حل' heading. Then, provide the complete, corrected Python function inside a `python` markdown block."
         )
 
     def _construct_code_refinement_prompt(self, source_code: str, recent_logs: str) -> str:

@@ -101,6 +101,7 @@ class Config:
     # --- Messages ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
     MSG_ACCOUNT_MENU_HEADER = "👤 **مدیریت حساب‌ها**\n\nاز این منو می‌توانید حساب‌های خود را مدیریت کرده و عملیات ساخت گروه را برای هرکدام آغاز یا متوقف کنید."
+    # MODIFIED: Removed special commands from the public help message
     MSG_HELP_TEXT = (
         "**راهنمای جامع ربات**\n\n"
         "این ربات به شما اجازه می‌دهد تا با چندین حساب تلگرام به صورت همزمان گروه‌های جدید بسازید.\n\n"
@@ -112,9 +113,7 @@ class Config:
         f"  - `{BTN_STOP_PREFIX} [نام حساب]`: عملیات در حال اجرا برای یک حساب را متوقف می‌کند.\n"
         f"  - `{BTN_DELETE_PREFIX} [نام حساب]`: یک حساب و تمام اطلاعات آن را برای همیشه حذف می‌کند.\n\n"
         f"**{BTN_SERVER_STATUS}**\n"
-        "این گزینه اطلاعات لحظه‌ای درباره وضعیت ربات را نمایش می‌دهد.\n\n"
-        "**دستورات ویژه:**\n"
-        "  - `/refine_code`: از هوش مصنوعی برای تحلیل و پیشنهاد بهبود برای کد ربات استفاده کنید."
+        "این گزینه اطلاعات لحظه‌ای درباره وضعیت ربات را نمایش می‌دهد."
     )
     MSG_PROMPT_MASTER_PASSWORD = "🔑 لطفا برای دسترسی به ربات، رمز عبور اصلی را وارد کنید:"
     MSG_INCORRECT_MASTER_PASSWORD = "❌ رمز عبور اشتباه است. لطفا دوباره تلاش کنید."
@@ -257,7 +256,8 @@ class GroupCreatorBot:
             proxy_url = f"http://{proxy['addr']}:{proxy['port']}"
 
         try:
-            async with httpx.AsyncClient(proxies=proxy_url) as client:
+            # FIXED: Corrected parameter name from 'proxies' to 'proxy'
+            async with httpx.AsyncClient(proxy=proxy_url) as client:
                 response = await client.post(api_url, json=payload, headers=headers, timeout=120)
                 response.raise_for_status()
             
@@ -648,8 +648,10 @@ class GroupCreatorBot:
         raise events.StopPropagation
 
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
-        """Runs a silent proxy test, logging results to debug."""
-        LOGGER.info(f"User {event.sender_id} initiated a silent proxy test.")
+        if str(event.sender_id) != ADMIN_USER_ID:
+            await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
+        LOGGER.info(f"Admin {event.sender_id} initiated a silent proxy test.")
         
         if not self.proxies:
             LOGGER.debug("Proxy test: No proxies found in the file.")
@@ -697,9 +699,11 @@ class GroupCreatorBot:
         raise events.StopPropagation
 
     async def _clean_sessions_handler(self, event: events.NewMessage.Event) -> None:
-        """Stops all workers and cleans up all user session files and folders."""
+        if str(event.sender_id) != ADMIN_USER_ID:
+            await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
         user_id = event.sender_id
-        LOGGER.info(f"User {user_id} initiated session cleaning.")
+        LOGGER.info(f"Admin {user_id} initiated session cleaning.")
 
         try:
             async with self.bot.conversation(user_id, timeout=30) as conv:
@@ -763,7 +767,10 @@ class GroupCreatorBot:
         raise events.StopPropagation
 
     async def _test_sentry_handler(self, event: events.NewMessage.Event) -> None:
-        LOGGER.info(f"User {event.sender_id} initiated a Sentry test.")
+        if str(event.sender_id) != ADMIN_USER_ID:
+            await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
+        LOGGER.info(f"Admin {event.sender_id} initiated a Sentry test.")
         await event.reply("🧪 Sending a test error to Sentry. Please check your Sentry dashboard.")
         try:
             division_by_zero = 1 / 0
@@ -772,7 +779,9 @@ class GroupCreatorBot:
             await event.reply("✅ Test error sent! The AI is now analyzing it...")
 
     async def _refine_code_handler(self, event: events.NewMessage.Event) -> None:
-        """Uses Gemini to analyze the bot's code and recent logs to suggest improvements."""
+        if str(event.sender_id) != ADMIN_USER_ID:
+            await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
         user_id = event.sender_id
         if not GEMINI_API_KEY:
             await event.reply("❌ قابلیت تحلیل کد با هوش مصنوعی غیرفعال است. لطفاً `GEMINI_API_KEY` را در فایل `.env` تنظیم کنید.")

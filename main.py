@@ -768,11 +768,6 @@ async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
             await event.reply('❌ شماره تلفن نمی‌تواند خالی باشد. لطفا دوباره تلاش کنید.')
             return
 
-        # Validating phone number format (add more robust validation if needed)
-        if not re.match(r'^\+\d{1,3}\d{6,14}$', phone): #Basic validation
-            await event.reply('❌ فرمت شماره تلفن نامعتبر است. لطفا از فرمت بین المللی مانند +989123456789 استفاده کنید.')
-            return
-
         self.user_sessions[user_id]['phone'] = phone
         selected_proxy = self._get_available_proxy()
         self.user_sessions[user_id]['login_proxy'] = selected_proxy
@@ -786,73 +781,15 @@ async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
             self.user_sessions[user_id]['state'] = 'awaiting_code'
             await event.reply('💬 کد ورود ارسال شد. لطفا آن را اینجا ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
         except errors.PhoneNumberInvalidError:
-            LOGGER.warning(f"Invalid phone number provided by user {user_id}: {phone}")
+            LOGGER.error(f"Invalid phone number provided by user {user_id}: {phone}")
             await event.reply('❌ شماره تلفن نامعتبر است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
-            if user_client.is_connected(): await user_client.disconnect()
         except Exception as e:
-            LOGGER.error(f"Phone input error for {user_id}", exc_info=True)
+            LOGGER.error(f"Phone input error for {user_id}: {e}", exc_info=True)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
-            await event.reply('❌ **خطا:** در ارسال درخواست کد ورود، خطایی رخ داد. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
-            if user_client.is_connected(): await user_client.disconnect()
-    async def _handle_code_input(self, event: events.NewMessage.Event) -> None:
-        user_id = event.sender_id
-        user_client = self.user_sessions[user_id]['client']
-        try:
-            await user_client.sign_in(self.user_sessions[user_id]['phone'], code=event.text.strip(), phone_code_hash=self.user_sessions[user_id].get('phone_code_hash'))
-            self.user_sessions[user_id]['state'] = 'awaiting_account_name'
-            await event.reply('✅ ورود موفق! لطفاً یک نام مستعار برای این حساب وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
-        except errors.SessionPasswordNeededError:
-            self.user_sessions[user_id]['state'] = 'awaiting_password'
-            await event.reply('🔑 این حساب تایید دو مرحله‌ای دارد. لطفا رمز عبور را ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
-        except Exception as e:
-            LOGGER.error(f"Code input error for {user_id}", exc_info=True)
-            self.user_sessions[user_id]['state'] = 'awaiting_phone'
-            await event.reply('❌ **خطا:** کد وارد شده نامعتبر است. لطفا شماره تلفن را مجددا وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
-
-    async def _handle_password_input(self, event: events.NewMessage.Event) -> None:
-        user_id = event.sender_id
-        try:
-            await self.user_sessions[user_id]['client'].sign_in(password=event.text.strip())
-            self.user_sessions[user_id]['state'] = 'awaiting_account_name'
-            await event.reply('✅ ورود موفق! لطفاً یک نام مستعار برای این حساب وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
-        except Exception as e:
-            LOGGER.error(f"Password input error for {user_id}", exc_info=True)
-            self.user_sessions[user_id]['state'] = 'awaiting_password'
-            await event.reply('❌ **خطا:** رمز عبور اشتباه است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
-
-    async def _handle_account_name_input(self, event: events.NewMessage.Event) -> None:
-        user_id = event.sender_id
-        account_name = event.text.strip()
-        if not account_name or account_name in self._get_user_accounts(user_id):
-            await event.reply("❌ نام مستعار نامعتبر یا تکراری است.", buttons=[[Button.text(Config.BTN_BACK)]])
-            return
-        self.user_sessions[user_id]['account_name'] = account_name
-        await self.on_login_success(event, self.user_sessions[user_id]['client'])
-
-    # --- Main Run Method ---
-    def register_handlers(self) -> None:
-        self.bot.add_event_handler(self._start_handler, events.NewMessage(pattern='/start'))
-        self.bot.add_event_handler(self._message_router, events.NewMessage)
-
-    async def run(self) -> None:
-        self.register_handlers()
-        LOGGER.info("Starting bot...")
-        try:
-            await self.bot.start(bot_token=BOT_TOKEN)
-            LOGGER.info("Bot service has started successfully.")
-            
-            await self._load_and_resume_workers()
-
-            await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
-            
-            await self.bot.run_until_disconnected()
+            await event.reply('❌ **خطا:** خطایی در ارسال درخواست کد رخ داد. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
         finally:
-            LOGGER.info("Bot service is shutting down.")
-            self._save_worker_state()
-            if self.bot.is_connected():
-                await self.bot.disconnect()
-            LOGGER.info("Shutdown complete.")
-
+            if user_client and user_client.is_connected():
+                await user_client.disconnect()
 if __name__ == "__main__":
     bot_instance = GroupCreatorBot()
     asyncio.run(bot_instance.run())

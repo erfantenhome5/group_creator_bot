@@ -21,7 +21,6 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest
 from telethon.tl.types import Message
 
-# ADDED: Import the new AI Analyzer class
 from ai_analyzer import AIAnalyzer
 
 # --- Basic Logging Setup ---
@@ -152,6 +151,8 @@ class GroupCreatorBot:
 
         def before_send_hook(event: Event, hint: Hint) -> Optional[Event]:
             """Sentry hook to filter logs and trigger AI analysis on exceptions."""
+            is_test_error = event.get('tags', {}).get('test_error') == 'true'
+
             if 'log_record' in hint:
                 log_record = hint['log_record']
                 if log_record.levelno == logging.DEBUG and log_record.name.startswith('telethon'):
@@ -166,7 +167,7 @@ class GroupCreatorBot:
                         if pattern in message:
                             return None
             
-            if 'exc_info' in hint:
+            if 'exc_info' in hint and not is_test_error:
                 exc_type, exc_value, tb = hint['exc_info']
                 asyncio.create_task(self.ai_analyzer.analyze_and_apply_fix(exc_type, exc_value, tb))
 
@@ -496,8 +497,8 @@ class GroupCreatorBot:
                     except Exception as e:
                         LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
                         sentry_sdk.capture_exception(e)
-                        error_type = type(e).__name__
-                        await self.bot.send_message(user_id, f"❌ **خطای غیرمنتظره در ساخت گروه برای `{account_name}`:**\n`{error_type}`")
+                        user_error_message = await self.ai_analyzer.explain_error_for_user(e)
+                        await self.bot.send_message(user_id, user_error_message)
                         break
         except asyncio.CancelledError:
             LOGGER.info(f"Task for {worker_key} was cancelled by user.")
@@ -705,14 +706,35 @@ class GroupCreatorBot:
         LOGGER.info(f"Admin {event.sender_id} initiated a Sentry test.")
         await event.reply("🧪 Sending a test error to Sentry. Please check your Sentry dashboard.")
         try:
-            division_by_zero = 1 / 0
+            with sentry_sdk.configure_scope() as scope:
+                scope.set_tag("test_error", "true")
+                division_by_zero = 1 / 0
         except Exception as e:
             sentry_sdk.capture_exception(e)
-            await event.reply("✅ Test error sent! The AI is now analyzing it...")
+            await event.reply("✅ Test error sent! It has been tagged to be ignored by the AI analyzer.")
 
     async def _refine_code_handler(self, event: events.NewMessage.Event) -> None:
         await self.ai_analyzer.refine_code(event)
         raise events.StopPropagation
+        
+    # ADDED: New handler to test the self-healing function
+    async def _test_self_heal_handler(self, event: events.NewMessage.Event) -> None:
+        """Intentionally triggers a fixable error to test the self-healing pipeline."""
+        LOGGER.info(f"Admin {event.sender_id} initiated a self-healing test.")
+        await event.reply("🧪 Triggering a test error to check the AI self-healing function...")
+        try:
+            # This function is designed to have a bug that the AI can fix.
+            await self._intentionally_broken_function()
+        except Exception as e:
+            # The error will be caught and sent to Sentry by the global handler,
+            # which then triggers the AI analysis.
+            LOGGER.info("Test error was triggered successfully. The AI is now analyzing it.")
+    
+    async def _intentionally_broken_function(self):
+        """This is a placeholder function with a deliberate bug for testing the AI."""
+        # This will raise a NameError because 'undefined_variable' does not exist.
+        # The AI should be able to identify this and suggest a fix.
+        print(undefined_variable)
 
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
         self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
@@ -761,6 +783,7 @@ class GroupCreatorBot:
             "/clean_sessions": self._clean_sessions_handler,
             "/test_sentry": self._test_sentry_handler,
             "/refine_code": self._refine_code_handler,
+            "/test_self_heal": self._test_self_heal_handler,
         }
 
         if text in admin_routes:

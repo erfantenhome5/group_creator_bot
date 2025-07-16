@@ -21,6 +21,9 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest
 from telethon.tl.types import Message
 
+# ADDED: Import the new AI Analyzer class
+from ai_analyzer import AIAnalyzer
+
 # --- Basic Logging Setup ---
 logging.basicConfig(
     level=logging.DEBUG,
@@ -101,7 +104,6 @@ class Config:
     # --- Messages ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
     MSG_ACCOUNT_MENU_HEADER = "👤 **مدیریت حساب‌ها**\n\nاز این منو می‌توانید حساب‌های خود را مدیریت کرده و عملیات ساخت گروه را برای هرکدام آغاز یا متوقف کنید."
-    # MODIFIED: Removed special commands from the public help message
     MSG_HELP_TEXT = (
         "**راهنمای جامع ربات**\n\n"
         "این ربات به شما اجازه می‌دهد تا با چندین حساب تلگرام به صورت همزمان گروه‌های جدید بسازید.\n\n"
@@ -139,6 +141,7 @@ class GroupCreatorBot:
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
         
+        self.ai_analyzer = AIAnalyzer(self)
         self._initialize_sentry()
 
     # --- Sentry and AI Methods ---
@@ -165,7 +168,7 @@ class GroupCreatorBot:
             
             if 'exc_info' in hint:
                 exc_type, exc_value, tb = hint['exc_info']
-                asyncio.create_task(self._analyze_error_with_ai(exc_type, exc_value, tb))
+                asyncio.create_task(self.ai_analyzer.analyze_and_apply_fix(exc_type, exc_value, tb))
 
             return event
 
@@ -197,75 +200,6 @@ class GroupCreatorBot:
 
         sentry_sdk.init(**sentry_options)
         LOGGER.info("Sentry initialized with proactive AI error analysis.")
-
-    async def _analyze_error_with_ai(self, exc_type, exc_value, tb):
-        """Analyzes an error with Gemini and sends a report to the admin."""
-        if not GEMINI_API_KEY or not ADMIN_USER_ID:
-            LOGGER.warning("Cannot run AI analysis: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
-            return
-
-        try:
-            LOGGER.info(f"AI is analyzing an error: {exc_type.__name__}")
-            
-            source_code = Path(__file__).read_text()
-            traceback_str = "".join(traceback.format_exception(exc_type, exc_value, tb))
-
-            prompt = (
-                "You are an expert Python code reviewer specializing in robust, asynchronous Telegram bots using the Telethon library. "
-                "An error was just captured by Sentry. Analyze the traceback and the full source code to identify the root cause. "
-                "Provide a concise, bulleted list of actionable suggestions to fix the error and improve the code's robustness.\n\n"
-                "### Traceback:\n"
-                "```\n"
-                f"{traceback_str}\n"
-                "```\n\n"
-                "### Full Source Code:\n"
-                "```python\n"
-                f"{source_code}\n"
-                "```"
-            )
-            
-            suggestions = await self._call_gemini_api(prompt)
-            
-            if suggestions:
-                response_message = (
-                    f"🚨 **گزارش خودکار از هوش مصنوعی (Gemini):**\n\n"
-                    f"یک خطا از نوع `{exc_type.__name__}` شناسایی شد. در اینجا یک تحلیل و پیشنهاد برای رفع آن ارائه می‌شود:\n\n"
-                    f"{suggestions}"
-                )
-                
-                for i in range(0, len(response_message), 4096):
-                    await self.bot.send_message(int(ADMIN_USER_ID), response_message[i:i+4096])
-            else:
-                LOGGER.error("AI analysis returned no suggestions.")
-
-        except Exception as e:
-            LOGGER.error(f"The AI analysis process itself failed: {e}", exc_info=True)
-            
-    async def _call_gemini_api(self, prompt: str) -> Optional[str]:
-        """Generic function to call the Gemini API."""
-        if not GEMINI_API_KEY:
-            return None
-            
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        headers = {'Content-Type': 'application/json'}
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
-        proxy_url = None
-        if self.proxies:
-            proxy = random.choice(self.proxies)
-            proxy_url = f"http://{proxy['addr']}:{proxy['port']}"
-
-        try:
-            # FIXED: Corrected parameter name from 'proxies' to 'proxy'
-            async with httpx.AsyncClient(proxy=proxy_url) as client:
-                response = await client.post(api_url, json=payload, headers=headers, timeout=120)
-                response.raise_for_status()
-            
-            result = response.json()
-            return result['candidates'][0]['content']['parts'][0]['text']
-        except Exception as e:
-            LOGGER.error(f"Failed to call Gemini API: {e}")
-            return None
 
     # --- Proxy Helpers ---
     def _load_account_proxies(self) -> Dict[str, Dict]:
@@ -647,10 +581,14 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
-    async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
+    async def _admin_command_handler(self, event: events.NewMessage.Event, handler: callable):
+        """Wrapper to check for admin privileges before running a command."""
         if str(event.sender_id) != ADMIN_USER_ID:
             await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
             return
+        await handler(event)
+
+    async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
         LOGGER.info(f"Admin {event.sender_id} initiated a silent proxy test.")
         
         if not self.proxies:
@@ -699,9 +637,6 @@ class GroupCreatorBot:
         raise events.StopPropagation
 
     async def _clean_sessions_handler(self, event: events.NewMessage.Event) -> None:
-        if str(event.sender_id) != ADMIN_USER_ID:
-            await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
-            return
         user_id = event.sender_id
         LOGGER.info(f"Admin {user_id} initiated session cleaning.")
 
@@ -767,9 +702,6 @@ class GroupCreatorBot:
         raise events.StopPropagation
 
     async def _test_sentry_handler(self, event: events.NewMessage.Event) -> None:
-        if str(event.sender_id) != ADMIN_USER_ID:
-            await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
-            return
         LOGGER.info(f"Admin {event.sender_id} initiated a Sentry test.")
         await event.reply("🧪 Sending a test error to Sentry. Please check your Sentry dashboard.")
         try:
@@ -779,58 +711,7 @@ class GroupCreatorBot:
             await event.reply("✅ Test error sent! The AI is now analyzing it...")
 
     async def _refine_code_handler(self, event: events.NewMessage.Event) -> None:
-        if str(event.sender_id) != ADMIN_USER_ID:
-            await event.reply("❌ شما مجاز به استفاده از این دستور نیستید.")
-            return
-        user_id = event.sender_id
-        if not GEMINI_API_KEY:
-            await event.reply("❌ قابلیت تحلیل کد با هوش مصنوعی غیرفعال است. لطفاً `GEMINI_API_KEY` را در فایل `.env` تنظیم کنید.")
-            return
-
-        await event.reply("🤖 در حال ارسال کد و لاگ‌ها برای تحلیل توسط هوش مصنوعی Gemini... این کار ممکن است کمی طول بکشد.")
-        
-        try:
-            source_code = Path(__file__).read_text()
-            
-            try:
-                with open("bot_activity.log", "r") as f:
-                    log_lines = f.readlines()
-                    recent_logs = "".join(log_lines[-50:])
-            except FileNotFoundError:
-                recent_logs = "Log file not found."
-
-            prompt = (
-                "You are an expert Python code reviewer specializing in robust, asynchronous Telegram bots using the Telethon library. "
-                "Analyze the following Python code and the recent log entries. Provide a concise, bulleted list of actionable suggestions "
-                "to improve the code's robustness, error handling, efficiency, or clarity. "
-                "Base your suggestions on both the code structure and any errors or patterns visible in the logs. "
-                "Do not rewrite the entire code. Focus on specific, impactful recommendations.\n\n"
-                "### Source Code:\n"
-                "```python\n"
-                f"{source_code}\n"
-                "```\n\n"
-                "### Recent Log Entries:\n"
-                "```log\n"
-                f"{recent_logs}\n"
-                "```"
-            )
-            
-            suggestions = await self._call_gemini_api(prompt)
-
-            if suggestions:
-                response_message = f"**💡 پیشنهادات Gemini برای بهبود کد (بر اساس کد و لاگ‌ها):**\n\n{suggestions}"
-                for i in range(0, len(response_message), 4096):
-                    await event.reply(response_message[i:i+4096])
-            else:
-                await event.reply("❌ هوش مصنوعی نتوانست پیشنهادی ارائه دهد. لطفاً دوباره تلاش کنید.")
-
-        except FileNotFoundError:
-            await event.reply("❌ خطا: فایل کد منبع ربات یافت نشد.")
-        except Exception as e:
-            LOGGER.error(f"AI code refinement failed: {e}", exc_info=True)
-            sentry_sdk.capture_exception(e)
-            await event.reply(f"❌ خطایی در هنگام ارتباط با سرویس Gemini رخ داد: `{type(e).__name__}`")
-        
+        await self.ai_analyzer.refine_code(event)
         raise events.StopPropagation
 
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
@@ -875,6 +756,17 @@ class GroupCreatorBot:
             await self._start_handler(event)
             return
 
+        admin_routes = {
+            "/debug_proxies": self._debug_test_proxies_handler,
+            "/clean_sessions": self._clean_sessions_handler,
+            "/test_sentry": self._test_sentry_handler,
+            "/refine_code": self._refine_code_handler,
+        }
+
+        if text in admin_routes:
+            await self._admin_command_handler(event, admin_routes[text])
+            return
+
         route_map = {
             Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
             Config.BTN_HELP: self._help_handler,
@@ -882,10 +774,6 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
-            "/debug_proxies": self._debug_test_proxies_handler,
-            "/clean_sessions": self._clean_sessions_handler,
-            "/test_sentry": self._test_sentry_handler,
-            "/refine_code": self._refine_code_handler,
         }
         
         handler = route_map.get(text)
@@ -1042,6 +930,18 @@ class GroupCreatorBot:
         except errors.SessionPasswordNeededError:
             self.user_sessions[user_id]['state'] = 'awaiting_password'
             await event.reply('🔑 این حساب تایید دو مرحله‌ای دارد. لطفا رمز عبور را ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+        except errors.PhoneCodeExpiredError:
+            try:
+                LOGGER.warning(f"Phone code expired for {user_id}. Requesting a new one.")
+                sent_code = await user_client.send_code_request(self.user_sessions[user_id]['phone'])
+                self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
+                self.user_sessions[user_id]['state'] = 'awaiting_code'
+                await event.reply('⚠️ کد منقضی شد (احتمالا به دلیل جابجایی سرور). کد جدیدی برای شما ارسال شد. لطفا کد جدید را وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            except Exception as e:
+                LOGGER.error(f"Failed to resend code for {user_id} after expiry: {e}", exc_info=True)
+                sentry_sdk.capture_exception(e)
+                self.user_sessions[user_id]['state'] = 'awaiting_phone'
+                await event.reply('❌ **خطا:** کد قبلی منقضی شد و تلاش برای ارسال کد جدید نیز ناموفق بود. لطفا شماره تلفن را مجددا وارد کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
             LOGGER.error(f"Code input error for {user_id}", exc_info=True)
             sentry_sdk.capture_exception(e)

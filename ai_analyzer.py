@@ -28,7 +28,7 @@ class AIAnalyzer:
 
     async def analyze_and_apply_fix(self, exc_type, exc_value, tb):
         """
-        Analyzes an error, generates a corrected function, and replaces the old function in the source code.
+        Analyzes an error, generates a corrected function, and applies the fix.
         """
         if not self.gemini_api_key or not self.admin_user_id:
             LOGGER.warning("Cannot run AI error analysis: GEMINI_API_KEY or ADMIN_USER_ID is not set.")
@@ -67,7 +67,6 @@ class AIAnalyzer:
                 if self._apply_code_fix(main_py_path, corrected_function):
                     LOGGER.info("Code fix applied successfully. Restarting bot service...")
                     await self.bot.bot.send_message(int(self.admin_user_id), "✅ **اصلاحیه با موفقیت اعمال شد. ربات در حال راه‌اندازی مجدد است...**")
-                    # Execute the restart command
                     process = await asyncio.create_subprocess_shell('sudo systemctl restart telegram_bot.service')
                     await process.wait()
                 else:
@@ -109,9 +108,10 @@ class AIAnalyzer:
         except Exception:
             return None
 
+    # MODIFIED: Replaced the brittle regex with a more robust line-based replacement logic.
     def _apply_code_fix(self, file_path: Path, new_function_code: str) -> bool:
         """
-        Replaces an entire function in a file with new code. This is more robust than patching.
+        Replaces an entire function in a file with new code by identifying its start and end lines.
         """
         try:
             match = re.search(r"def\s+(\w+)\s*\(", new_function_code)
@@ -121,31 +121,61 @@ class AIAnalyzer:
             
             func_name = match.group(1)
             
-            original_code = file_path.read_text()
+            lines = file_path.read_text().splitlines()
             
-            # This regex finds the function definition, including decorators, and replaces it.
-            # It looks for the start of a function definition and continues until the next function
-            # or the end of the class, which is determined by indentation.
-            pattern = re.compile(
-                rf"(^(\s*@\w+\s*\n)*\s*async\s+def\s+{func_name}\s*\([^)]*\):\s*\n(?:(?!\n^\s*def|\n^\s*class).*\n?)*)",
-                re.MULTILINE
-            )
+            start_line_idx = -1
+            func_indentation = -1
 
-            if not pattern.search(original_code):
-                 pattern = re.compile(
-                    rf"(?:@\w+\n)*\s*def\s+{func_name}\s*\([^)]*\):\s*.*?(?=\n\s*(?:@\w+\n)*\s*(?:async\s+)?def|\n\s*class|\Z)", 
-                    re.DOTALL
-                )
-
-            if not pattern.search(original_code):
-                LOGGER.error(f"Could not find the original function '{func_name}' in the source code to replace it.")
+            # Find the start of the function, accounting for decorators
+            for i, line in enumerate(lines):
+                if re.search(rf"^\s*def\s+{func_name}\s*\(", line) or re.search(rf"^\s*async\s+def\s+{func_name}\s*\(", line):
+                    # Walk backwards to find the start of decorators if they exist
+                    start_of_func_block = i
+                    for j in range(i - 1, -1, -1):
+                        if lines[j].strip().startswith('@'):
+                            start_of_func_block = j
+                        elif lines[j].strip() == "":
+                            continue
+                        else:
+                            break
+                    start_line_idx = start_of_func_block
+                    func_indentation = len(lines[i]) - len(lines[i].lstrip(' '))
+                    break
+            
+            if start_line_idx == -1:
+                LOGGER.error(f"Could not find the start of function '{func_name}' in the source code.")
                 return False
 
-            # Replace the old function with the new one
-            modified_code = pattern.sub(new_function_code, original_code, count=1)
+            # Find the end of the function
+            end_line_idx = -1
+            for i in range(start_line_idx + 1, len(lines)):
+                line = lines[i]
+                if not line.strip():
+                    continue
+                
+                line_indentation = len(line) - len(line.lstrip(' '))
+                
+                if line_indentation <= func_indentation:
+                    end_line_idx = i
+                    break
             
-            # Write the modified code back to the file
+            if end_line_idx == -1:
+                end_line_idx = len(lines)
+
+            # Reconstruct the code
+            pre_func_lines = lines[:start_line_idx]
+            post_func_lines = lines[end_line_idx:]
+            
+            new_function_lines = new_function_code.splitlines()
+            
+            # Add the original indentation to the new function code
+            indented_new_function_lines = [f"{' ' * func_indentation}{line}" for line in new_function_lines]
+
+            modified_lines = pre_func_lines + indented_new_function_lines + post_func_lines
+            modified_code = "\n".join(modified_lines)
+            
             file_path.write_text(modified_code)
+            LOGGER.info(f"Successfully applied fix for function '{func_name}'.")
             return True
 
         except Exception as e:

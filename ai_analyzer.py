@@ -108,10 +108,10 @@ class AIAnalyzer:
         except Exception:
             return None
 
-    # MODIFIED: Replaced the brittle regex with a more robust line-based replacement logic.
     def _apply_code_fix(self, file_path: Path, new_function_code: str) -> bool:
         """
         Replaces an entire function in a file with new code by identifying its start and end lines.
+        This method is more robust than simple regex replacement.
         """
         try:
             match = re.search(r"def\s+(\w+)\s*\(", new_function_code)
@@ -129,7 +129,6 @@ class AIAnalyzer:
             # Find the start of the function, accounting for decorators
             for i, line in enumerate(lines):
                 if re.search(rf"^\s*def\s+{func_name}\s*\(", line) or re.search(rf"^\s*async\s+def\s+{func_name}\s*\(", line):
-                    # Walk backwards to find the start of decorators if they exist
                     start_of_func_block = i
                     for j in range(i - 1, -1, -1):
                         if lines[j].strip().startswith('@'):
@@ -146,7 +145,7 @@ class AIAnalyzer:
                 LOGGER.error(f"Could not find the start of function '{func_name}' in the source code.")
                 return False
 
-            # Find the end of the function
+            # Find the end of the function by looking for a line with less or equal indentation
             end_line_idx = -1
             for i in range(start_line_idx + 1, len(lines)):
                 line = lines[i]
@@ -162,13 +161,11 @@ class AIAnalyzer:
             if end_line_idx == -1:
                 end_line_idx = len(lines)
 
-            # Reconstruct the code
             pre_func_lines = lines[:start_line_idx]
             post_func_lines = lines[end_line_idx:]
             
             new_function_lines = new_function_code.splitlines()
             
-            # Add the original indentation to the new function code
             indented_new_function_lines = [f"{' ' * func_indentation}{line}" for line in new_function_lines]
 
             modified_lines = pre_func_lines + indented_new_function_lines + post_func_lines

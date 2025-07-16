@@ -138,7 +138,6 @@ class GroupCreatorBot:
         self.account_proxies = self._load_account_proxies()
         self.known_users_file = SESSIONS_DIR / "known_users.json"
         self.known_users = self._load_known_users()
-        # ADDED: State for active workers persistence
         self.active_workers_file = SESSIONS_DIR / "active_workers.json"
         self.active_workers_state = self._load_active_workers_state()
         try:
@@ -974,7 +973,7 @@ class GroupCreatorBot:
     # --- Login Flow Handlers ---
     async def _handle_master_password(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        if event.text.strip() == Config.MASTER_PASSWORD:
+        if event.message.text.strip() == Config.MASTER_PASSWORD:
             self.user_sessions[user_id] = {'state': 'authenticated'}
             await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
         else:
@@ -983,7 +982,17 @@ class GroupCreatorBot:
 
     async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        self.user_sessions[user_id]['phone'] = event.text.strip()
+        phone_number = event.message.text.strip()
+
+        if not re.match(r'^\+\d{10,}$', phone_number):
+            await event.reply(
+                '❌ **فرمت شماره تلفن نامعتبر است.**\n'
+                'لطفا شماره را در فرمت بین‌المللی کامل وارد کنید (مثال: `+989123456789`).',
+                buttons=[[Button.text(Config.BTN_BACK)]]
+            )
+            return
+
+        self.user_sessions[user_id]['phone'] = phone_number
         
         selected_proxy = self._get_available_proxy()
         self.user_sessions[user_id]['login_proxy'] = selected_proxy
@@ -1018,7 +1027,7 @@ class GroupCreatorBot:
         user_id = event.sender_id
         user_client = self.user_sessions[user_id]['client']
         try:
-            await user_client.sign_in(self.user_sessions[user_id]['phone'], code=event.text.strip(), phone_code_hash=self.user_sessions[user_id].get('phone_code_hash'))
+            await user_client.sign_in(self.user_sessions[user_id]['phone'], code=event.message.text.strip(), phone_code_hash=self.user_sessions[user_id].get('phone_code_hash'))
             self.user_sessions[user_id]['state'] = 'awaiting_account_name'
             await event.reply('✅ ورود موفق! لطفاً یک نام مستعار برای این حساب وارد کنید (مثلا: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
         except errors.SessionPasswordNeededError:
@@ -1045,7 +1054,7 @@ class GroupCreatorBot:
     async def _handle_password_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         try:
-            await self.user_sessions[user_id]['client'].sign_in(password=event.text.strip())
+            await self.user_sessions[user_id]['client'].sign_in(password=event.message.text.strip())
             self.user_sessions[user_id]['state'] = 'awaiting_account_name'
             await event.reply('✅ ورود موفق! لطفاً یک نام مستعار برای این حساب وارد کنید (مثلا: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
@@ -1056,7 +1065,7 @@ class GroupCreatorBot:
 
     async def _handle_account_name_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        account_name = event.text.strip()
+        account_name = event.message.text.strip()
         if not account_name:
             await event.reply("❌ نام مستعار نمی‌تواند خالی باشد. لطفا یک نام وارد کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
             return
@@ -1069,10 +1078,9 @@ class GroupCreatorBot:
         user_client = self.user_sessions[user_id]['client']
         await self.on_login_success(event, user_client)
 
-    # ADDED: Handler for multi-message refine prompt
     async def _handle_refine_prompt(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        text = event.text
+        text = event.message.text
 
         if text == '/end_prompt':
             prompt = self.user_sessions[user_id].get('refine_prompt', '')
@@ -1081,12 +1089,10 @@ class GroupCreatorBot:
             else:
                 await self.ai_analyzer.refine_code(event, prompt)
             
-            # Clean up session state
             if 'refine_prompt' in self.user_sessions[user_id]:
                 del self.user_sessions[user_id]['refine_prompt']
             self.user_sessions[user_id]['state'] = 'authenticated'
         else:
-            # Append the message to the prompt
             current_prompt = self.user_sessions[user_id].get('refine_prompt', '')
             self.user_sessions[user_id]['refine_prompt'] = current_prompt + text + "\n"
             await event.reply("✅ پیام شما دریافت شد. برای اتمام، دستور `/end_prompt` را ارسال کنید یا پیام بعدی را بفرستید.")

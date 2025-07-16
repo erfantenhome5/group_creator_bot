@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +24,8 @@ from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRe
 from telethon.tl.types import Message
 
 from ai_analyzer import AIAnalyzer
+# ADDED: Import the new SessionManager class
+from session_manager import SessionManager
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
@@ -44,6 +47,8 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+# ADDED: Support for hashed master password
+MASTER_PASSWORD_HASH = os.getenv("MASTER_PASSWORD_HASH")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
     raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, and ENCRYPTION_KEY are set.")
@@ -81,7 +86,6 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
 class Config:
     """Holds all configurable values and UI strings for the bot."""
     # Bot Settings
-    MASTER_PASSWORD = "3935Eerfan@123"
     MAX_CONCURRENT_WORKERS = 5
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 60
@@ -141,7 +145,9 @@ class GroupCreatorBot:
         self.active_workers_file = SESSIONS_DIR / "active_workers.json"
         self.active_workers_state = self._load_active_workers_state()
         try:
-            self.fernet = Fernet(ENCRYPTION_KEY.encode())
+            fernet = Fernet(ENCRYPTION_KEY.encode())
+            # MODIFIED: Initialize SessionManager
+            self.session_manager = SessionManager(fernet, SESSIONS_DIR)
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
         
@@ -331,51 +337,6 @@ class GroupCreatorBot:
             except Exception as e:
                 LOGGER.error(f"Failed to send broadcast to {user_id}: {e}")
 
-    # --- Encryption & Session Helpers ---
-    def _encrypt_data(self, data: str) -> bytes:
-        return self.fernet.encrypt(data.encode())
-
-    def _decrypt_data(self, encrypted_data: bytes) -> Optional[str]:
-        try:
-            return self.fernet.decrypt(encrypted_data).decode()
-        except InvalidToken:
-            LOGGER.error("Failed to decrypt session data. Key may have changed or data is corrupt.")
-            return None
-
-    def _get_session_path(self, user_id: int, account_name: str) -> Path:
-        safe_account_name = re.sub(r'[^a-zA-Z0-9_-]', '', account_name)
-        return SESSIONS_DIR / f"user_{user_id}__{safe_account_name}.session"
-
-    def _get_user_accounts(self, user_id: int) -> List[str]:
-        accounts = []
-        for f in SESSIONS_DIR.glob(f"user_{user_id}__*.session"):
-            match = re.search(f"user_{user_id}__(.*)\\.session", f.name)
-            if match:
-                accounts.append(match.group(1))
-        return sorted(accounts)
-
-    def _save_session_string(self, user_id: int, account_name: str, session_string: str) -> None:
-        encrypted_session = self._encrypt_data(session_string)
-        session_file = self._get_session_path(user_id, account_name)
-        session_file.write_bytes(encrypted_session)
-        LOGGER.info(f"Encrypted session saved for user {user_id} as account '{account_name}'.")
-
-    def _load_session_string(self, user_id: int, account_name: str) -> Optional[str]:
-        session_file = self._get_session_path(user_id, account_name)
-        if not session_file.exists(): return None
-        return self._decrypt_data(session_file.read_bytes())
-
-    def _delete_session_file(self, user_id: int, account_name: str) -> bool:
-        session_path = self._get_session_path(user_id, account_name)
-        if session_path.exists():
-            try:
-                session_path.unlink()
-                LOGGER.info(f"Deleted session file for user {user_id}, account '{account_name}'.")
-                return True
-            except OSError as e:
-                LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
-        return False
-
     async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         """Creates a temporary client for the login flow, using the specified proxy."""
         session = StringSession()
@@ -452,7 +413,7 @@ class GroupCreatorBot:
         ]
 
     def _build_accounts_menu(self, user_id: int) -> List[List[Button]]:
-        accounts = self._get_user_accounts(user_id)
+        accounts = self.session_manager.get_user_accounts(user_id)
         keyboard = []
         if not accounts:
             keyboard.append([Button.text("هنوز هیچ حسابی اضافه نشده است.")])
@@ -534,7 +495,7 @@ class GroupCreatorBot:
                     except errors.AuthKeyUnregisteredError as e:
                         LOGGER.error(f"Authentication key for account '{account_name}' is unregistered. Deleting session.")
                         sentry_sdk.capture_exception(e)
-                        self._delete_session_file(user_id, account_name)
+                        self.session_manager.delete_session_file(user_id, account_name)
                         self._remove_group_count(worker_key)
                         await self.bot.send_message(user_id, f"🚨 **خطای امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند نقطه، توسط تلگرام باطل شد. عملیات متوقف و حساب حذف گردید. لطفاً آن را دوباره اضافه کنید.")
                         break 
@@ -562,6 +523,8 @@ class GroupCreatorBot:
             LOGGER.info(f"Worker finished for {worker_key}.")
             if worker_key in self.active_workers:
                 del self.active_workers[worker_key]
+                self.active_workers_state.pop(worker_key, None)
+                self._save_active_workers_state()
             if user_client and user_client.is_connected():
                 await user_client.disconnect()
 
@@ -571,7 +534,7 @@ class GroupCreatorBot:
         account_name = self.user_sessions[user_id]['account_name']
         worker_key = f"{user_id}:{account_name}"
         
-        self._save_session_string(user_id, account_name, user_client.session.save())
+        self.session_manager.save_session_string(user_id, account_name, user_client.session.save())
 
         assigned_proxy = self.user_sessions[user_id].get('login_proxy')
         self.account_proxies[worker_key] = assigned_proxy
@@ -894,7 +857,7 @@ class GroupCreatorBot:
             await event.reply('⏳ عملیات برای این حساب در حال اجراست.')
             return
 
-        session_str = self._load_session_string(user_id, account_name)
+        session_str = self.session_manager.load_session_string(user_id, account_name)
         if not session_str:
             await event.reply('❌ نشست برای این حساب یافت نشد. لطفا آن را حذف و دوباره اضافه کنید.')
             return
@@ -913,15 +876,17 @@ class GroupCreatorBot:
             if await user_client.is_user_authorized():
                 task = asyncio.create_task(self.run_group_creation_worker(user_id, account_name, user_client))
                 self.active_workers[worker_key] = task
+                self.active_workers_state[worker_key] = {"user_id": user_id, "account_name": account_name}
+                self._save_active_workers_state()
                 await self._send_accounts_menu(event)
             else:
-                self._delete_session_file(user_id, account_name)
+                self.session_manager.delete_session_file(user_id, account_name)
                 self._remove_group_count(worker_key)
                 await event.reply(f'⚠️ نشست برای حساب `{account_name}` منقضی شده و حذف شد. لطفا دوباره آن را اضافه کنید.')
         except errors.AuthKeyUnregisteredError as e:
             LOGGER.error(f"Authentication key for account '{account_name}' is unregistered. Deleting session.")
             sentry_sdk.capture_exception(e)
-            self._delete_session_file(user_id, account_name)
+            self.session_manager.delete_session_file(user_id, account_name)
             self._remove_group_count(worker_key)
             await event.reply(f"🚨 **خطای امنیتی:** نشست برای حساب `{account_name}` به دلیل استفاده همزمان از چند نقطه، توسط تلگرام باطل شد. این حساب حذف گردید. لطفاً آن را دوباره اضافه کنید.")
             await self._send_accounts_menu(event)
@@ -959,7 +924,7 @@ class GroupCreatorBot:
             self.active_workers[worker_key].cancel()
             LOGGER.info(f"Worker cancelled for {worker_key} due to account deletion.")
 
-        if self._delete_session_file(user_id, account_name):
+        if self.session_manager.delete_session_file(user_id, account_name):
             self._remove_group_count(worker_key)
             if worker_key in self.account_proxies:
                 del self.account_proxies[worker_key]
@@ -973,11 +938,19 @@ class GroupCreatorBot:
     # --- Login Flow Handlers ---
     async def _handle_master_password(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        if event.message.text.strip() == Config.MASTER_PASSWORD:
-            self.user_sessions[user_id] = {'state': 'authenticated'}
-            await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
-        else:
-            await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
+        if MASTER_PASSWORD_HASH:
+            hashed_input = hashlib.sha256(event.message.text.strip().encode()).hexdigest()
+            if hashed_input == MASTER_PASSWORD_HASH:
+                self.user_sessions[user_id] = {'state': 'authenticated'}
+                await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
+            else:
+                await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
+        else: # Fallback to plain text if hash is not set
+            if event.message.text.strip() == "3935Eerfan@123":
+                self.user_sessions[user_id] = {'state': 'authenticated'}
+                await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
+            else:
+                await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
         raise events.StopPropagation
 
     async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
@@ -1070,7 +1043,7 @@ class GroupCreatorBot:
             await event.reply("❌ نام مستعار نمی‌تواند خالی باشد. لطفا یک نام وارد کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
             return
 
-        if account_name in self._get_user_accounts(user_id):
+        if account_name in self.session_manager.get_user_accounts(user_id):
             await event.reply(f"❌ شما قبلا حسابی با نام `{account_name}` اضافه کرده‌اید. لطفا یک نام دیگر انتخاب کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
             return
 
@@ -1108,6 +1081,15 @@ class GroupCreatorBot:
         try:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service has started successfully.")
+            # Resume any workers that were active before a restart
+            for worker_key, worker_data in self.active_workers_state.items():
+                user_id = worker_data["user_id"]
+                account_name = worker_data["account_name"]
+                LOGGER.info(f"Resuming worker for account '{account_name}' after restart.")
+                # We need a dummy event to start the process
+                dummy_event = events.NewMessage.Event(self.bot.build_in_message(user_id))
+                await self._start_process_handler(dummy_event, account_name)
+
             if self.known_users:
                 await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
             await self.bot.run_until_disconnected()

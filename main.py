@@ -761,11 +761,16 @@ class GroupCreatorBot:
         await asyncio.sleep(2)
         await self._initiate_login_flow(event)
 
-    async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
+async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         phone = event.text.strip()
         if not phone:
             await event.reply('❌ شماره تلفن نمی‌تواند خالی باشد. لطفا دوباره تلاش کنید.')
+            return
+
+        # Validating phone number format (add more robust validation if needed)
+        if not re.match(r'^\+\d{1,3}\d{6,14}$', phone): #Basic validation
+            await event.reply('❌ فرمت شماره تلفن نامعتبر است. لطفا از فرمت بین المللی مانند +989123456789 استفاده کنید.')
             return
 
         self.user_sessions[user_id]['phone'] = phone
@@ -780,12 +785,15 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
             self.user_sessions[user_id]['state'] = 'awaiting_code'
             await event.reply('💬 کد ورود ارسال شد. لطفا آن را اینجا ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+        except errors.PhoneNumberInvalidError:
+            LOGGER.warning(f"Invalid phone number provided by user {user_id}: {phone}")
+            await event.reply('❌ شماره تلفن نامعتبر است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            if user_client.is_connected(): await user_client.disconnect()
         except Exception as e:
             LOGGER.error(f"Phone input error for {user_id}", exc_info=True)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
-            await event.reply('❌ **خطا:** شماره تلفن نامعتبر است. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('❌ **خطا:** در ارسال درخواست کد ورود، خطایی رخ داد. لطفا دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
             if user_client.is_connected(): await user_client.disconnect()
-
     async def _handle_code_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         user_client = self.user_sessions[user_id]['client']

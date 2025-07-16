@@ -212,6 +212,8 @@ class GroupCreatorBot:
     # --- User Tracking and Broadcast ---
     async def _broadcast_message(self, message_text: str):
         """Sends a message to all known users."""
+        if not self.known_users:
+            return
         LOGGER.info(f"Broadcasting message to {len(self.known_users)} users.")
         for user_id in self.known_users:
             try:
@@ -279,32 +281,42 @@ class GroupCreatorBot:
         return None
 
     # --- Worker State Persistence ---
-    def _save_active_workers(self):
-        """Saves the list of active worker keys to a file."""
-        active_keys = list(self.active_workers.keys())
-        self._save_json_file(active_keys, self.active_workers_file, "active workers state")
-        LOGGER.info(f"Saved state for {len(active_keys)} active workers.")
+    def _save_worker_state(self):
+        """Saves the keys of all active workers to a file."""
+        if self.active_workers:
+            active_keys = list(self.active_workers.keys())
+            self._save_json_file(active_keys, self.active_workers_file, "active workers state")
+            LOGGER.info(f"Saved state for {len(active_keys)} active workers.")
     
-    async def _resume_active_workers(self):
-        """Resumes workers that were active before a restart."""
+    async def _load_and_resume_workers(self):
+        """Loads worker state from a file and resumes their tasks."""
+        if not self.active_workers_file.exists():
+            LOGGER.info("No worker state file found, skipping resumption.")
+            return
+
         LOGGER.info("Attempting to resume active workers from previous session...")
-        active_keys = self._load_json_file(self.active_workers_file, "active workers state", is_list=True)
+        worker_keys_to_resume = self._load_json_file(self.active_workers_file, "active workers state", is_list=True)
         
-        if not active_keys:
+        if not worker_keys_to_resume:
             LOGGER.info("No previously active workers found to resume.")
             return
 
-        for worker_key in active_keys:
+        for worker_key in worker_keys_to_resume:
             try:
                 user_id_str, account_name = worker_key.split(":", 1)
                 user_id = int(user_id_str)
+                
+                # Create a dummy event to pass to the handler
+                dummy_event = events.NewMessage.Event(message=Message(id=0, peer_id=user_id, message=''), out=False)
+                dummy_event.sender_id = user_id
+                
                 LOGGER.info(f"Resuming worker for account '{account_name}' (User ID: {user_id}).")
-                await self._start_worker_logic(user_id, account_name, is_resume=True)
+                await self._start_process_handler(dummy_event, account_name, is_resume=True)
                 await asyncio.sleep(2) # Stagger resumption
             except Exception as e:
                 LOGGER.error(f"Failed to resume worker for key '{worker_key}': {e}")
         
-        # Clean the file after attempting resumption
+        # Clean up the state file after attempting resumption
         self.active_workers_file.unlink(missing_ok=True)
 
     # --- Encryption & Session Helpers ---
@@ -514,7 +526,7 @@ class GroupCreatorBot:
                  await self.bot.send_message(user_id, f"🏁 چرخه ساخت گروه برای حساب `{account_name}` به پایان رسید.")
             if worker_key in self.active_workers:
                 del self.active_workers[worker_key]
-                self._save_active_workers()
+                self._save_worker_state()
             if user_client and user_client.is_connected():
                 await user_client.disconnect()
 
@@ -649,7 +661,14 @@ class GroupCreatorBot:
         if text in admin_routes:
             await self._admin_command_handler(event, admin_routes[text]); return
 
-        route_map = {Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler, Config.BTN_HELP: self._help_handler, Config.BTN_BACK: self._start_handler, Config.BTN_ADD_ACCOUNT: self._initiate_login_flow, Config.BTN_SERVER_STATUS: self._server_status_handler}
+        route_map = {
+            Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler, 
+            Config.BTN_HELP: self._help_handler, 
+            Config.BTN_BACK: self._start_handler, 
+            Config.BTN_ADD_ACCOUNT: self._initiate_login_flow, 
+            Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
+            Config.BTN_SERVER_STATUS: self._server_status_handler
+        }
         if text in route_map:
             await route_map[text](event); return
 
@@ -660,50 +679,57 @@ class GroupCreatorBot:
         if (match := re.match(rf"{re.escape(Config.BTN_DELETE_PREFIX)} (.*)", text)):
             await self._delete_account_handler(event, match.group(1)); return
 
-    async def _start_worker_logic(self, user_id: int, account_name: str, is_resume: bool = False) -> bool:
-        """Core logic to start a worker, separated for reuse."""
+    async def _start_process_handler(self, event: events.NewMessage.Event, account_name: str, is_resume: bool = False) -> None:
+        user_id = event.sender_id
         worker_key = f"{user_id}:{account_name}"
+
         if worker_key in self.active_workers:
-            LOGGER.warning(f"Worker for {worker_key} is already active.")
-            return False
+            if not is_resume:
+                await event.reply('⏳ عملیات برای این حساب در حال اجراست.')
+            else:
+                LOGGER.info(f"Worker {worker_key} is already active, skipping resume.")
+            return
 
         session_str = self._load_session_string(user_id, account_name)
         if not session_str:
-            LOGGER.error(f"Session not found for {worker_key}. Cannot start worker.")
             if not is_resume:
-                await self.bot.send_message(user_id, f'❌ نشست برای حساب `{account_name}` یافت نشد.')
-            return False
+                await event.reply('❌ نشست برای این حساب یافت نشد.')
+            else:
+                LOGGER.error(f"Cannot resume worker {worker_key}, session file not found.")
+            return
+        
+        if not is_resume:
+            await event.reply(f'🚀 در حال آماده‌سازی برای شروع عملیات حساب `{account_name}`...')
+        else:
+            LOGGER.info(f"Resuming worker for account `{account_name}`.")
 
         user_client = None
         try:
             assigned_proxy = self.account_proxies.get(worker_key)
             user_client = await self._create_worker_client(session_str, assigned_proxy)
             if not user_client:
+                message = f'❌ اتصال به تلگرام برای `{account_name}` با شکست مواجه شد.'
                 if not is_resume:
-                    await self.bot.send_message(user_id, f'❌ اتصال به تلگرام برای `{account_name}` با شکست مواجه شد.')
-                return False
+                    await event.reply(message)
+                else:
+                    await self.bot.send_message(user_id, f"⚠️ از سرگیری عملیات ناموفق بود. {message}")
+                return
             
             if await user_client.is_user_authorized():
                 task = asyncio.create_task(self.run_group_creation_worker(user_id, account_name, user_client, session_str))
                 self.active_workers[worker_key] = task
-                self._save_active_workers()
-                return True
+                self._save_worker_state()
+                if not is_resume:
+                    await self._send_accounts_menu(event)
             else:
                 self._delete_session_file(user_id, account_name)
                 if not is_resume:
-                    await self.bot.send_message(user_id, f'⚠️ نشست برای `{account_name}` منقضی شده و حذف شد.')
-                return False
+                    await event.reply(f'⚠️ نشست برای `{account_name}` منقضی شده و حذف شد.')
         except Exception as e:
             LOGGER.error(f"Failed to start process for {worker_key}", exc_info=True)
             sentry_sdk.capture_exception(e)
             if not is_resume:
-                await self.bot.send_message(user_id, f'❌ خطایی در اتصال به `{account_name}` رخ داد.')
-            return False
-
-    async def _start_process_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
-        await event.reply(f'🚀 در حال آماده‌سازی برای شروع عملیات حساب `{account_name}`...')
-        if await self._start_worker_logic(event.sender_id, account_name):
-            await self._send_accounts_menu(event)
+                await event.reply(f'❌ خطایی در اتصال به `{account_name}` رخ داد.')
 
     async def _cancel_worker_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
         user_id = event.sender_id
@@ -737,8 +763,13 @@ class GroupCreatorBot:
         raise events.StopPropagation
     
     async def _initiate_login_flow(self, event: events.NewMessage.Event) -> None:
-        self.user_sessions[event.sender_id] = {'state': 'awaiting_phone'}
+        self.user_sessions[event.sender_id]['state'] = 'awaiting_phone'
         await event.reply('📞 لطفا شماره تلفن حساب جدید را با فرمت بین‌المللی ارسال کنید.', buttons=Button.clear())
+
+    async def _initiate_selenium_login_flow(self, event: events.NewMessage.Event) -> None:
+        await event.reply(Config.MSG_BROWSER_RUNNING)
+        await asyncio.sleep(2)
+        await self._initiate_login_flow(event)
 
     async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
@@ -806,15 +837,18 @@ class GroupCreatorBot:
         try:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service has started successfully.")
-            await self._resume_active_workers()
-            if self.known_users:
-                await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
+            
+            await self._load_and_resume_workers()
+
+            await self._broadcast_message("✅ ربات با موفقیت راه‌اندازی شد و اکنون در دسترس است.")
+            
             await self.bot.run_until_disconnected()
         finally:
-            LOGGER.info("Bot service is shutting down. Saving worker state...")
-            self._save_active_workers()
+            LOGGER.info("Bot service is shutting down.")
+            self._save_worker_state()
             if self.bot.is_connected():
                 await self.bot.disconnect()
+            LOGGER.info("Shutdown complete.")
 
 if __name__ == "__main__":
     bot_instance = GroupCreatorBot()

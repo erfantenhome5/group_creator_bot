@@ -46,6 +46,7 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 MASTER_PASSWORD_HASH = os.getenv("MASTER_PASSWORD_HASH")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY]):
     raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, and ENCRYPTION_KEY are set.")
@@ -414,6 +415,61 @@ class GroupCreatorBot:
         ])
         keyboard.append([Button.text(Config.BTN_BACK)])
         return keyboard
+        
+    async def _generate_unique_username(self) -> str:
+        """Generates a unique username using the Gemini API or falls back to a random one."""
+        if not GEMINI_API_KEY:
+            LOGGER.warning("GEMINI_API_KEY not set. Falling back to random UUID for username.")
+            return 'a' + uuid.uuid4().hex[:15]
+
+        # Keywords provided by the user
+        keywords = ["erfan", "king", "tenhome", "god", "1234567890", "Oldchannelsbuy", "mmd", "mohammad", "2000", "apr", "afkari"]
+        
+        prompt = (
+            "Create a unique, available, and creative public Telegram channel username. "
+            "The username must start with a letter and can only contain letters, numbers, and underscores. "
+            "It must be between 5 and 32 characters long. "
+            f"Use a creative combination of the following keywords: {', '.join(keywords)}. "
+            "Do not just join them. Be creative. "
+            "Only return the username itself, with no extra text, symbols, or explanations."
+        )
+
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}]
+        }
+        headers = {'Content-Type': 'application/json'}
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(api_url, json=payload, headers=headers, timeout=20.0)
+                response.raise_for_status() # Raise an exception for bad status codes
+                
+                data = response.json()
+                
+                if data.get("candidates") and data["candidates"][0].get("content", {}).get("parts"):
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    # Clean the response: remove quotes, newlines, and other unwanted characters
+                    username = re.sub(r'[^a-zA-Z0-9_]', '', text).strip()
+                    # Ensure it starts with a letter
+                    if username and not username[0].isalpha():
+                        username = 'a' + username
+                    
+                    if 5 <= len(username) <= 32:
+                        LOGGER.info(f"Generated username with Gemini: {username}")
+                        return username
+                    else:
+                        LOGGER.warning(f"Gemini generated an invalid username '{username}'. Falling back to random.")
+                else:
+                    LOGGER.warning(f"Unexpected Gemini API response format: {data}. Falling back to random.")
+        
+        except httpx.RequestError as e:
+            LOGGER.error(f"Error calling Gemini API: {e}. Falling back to random username.")
+        except Exception as e:
+            LOGGER.error(f"An unexpected error occurred during username generation: {e}. Falling back to random.")
+
+        # Fallback in case of any error
+        return 'a' + uuid.uuid4().hex[:15]
 
     # --- Main Worker Task ---
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
@@ -452,19 +508,29 @@ class GroupCreatorBot:
                         
                         # --- Upgrade to Supergroup and set History Visibility ---
                         try:
-                            # CRITICAL FIX: Use the negative chat ID to get the correct entity.
-                            # This tells Telethon it's a chat/channel, not a user.
                             input_channel = await user_client.get_input_entity(-chat.id)
 
-                            # 1. Upgrade to a supergroup by making it public with a random username.
-                            random_username = 'a' + uuid.uuid4().hex 
-                            LOGGER.info(f"Attempting to upgrade group {chat.id} to a supergroup by setting username: {random_username}")
+                            # 1. Upgrade to a supergroup by making it public with a generated username.
+                            username_set = False
+                            for attempt in range(5): # Try up to 5 times to find an available username
+                                generated_username = await self._generate_unique_username()
+                                LOGGER.info(f"Attempting to upgrade group {chat.id} with username: {generated_username} (Attempt {attempt + 1}/5)")
+                                
+                                try:
+                                    await user_client(functions.channels.UpdateUsernameRequest(
+                                        channel=input_channel,
+                                        username=generated_username
+                                    ))
+                                    LOGGER.info(f"Group {chat.id} successfully upgraded to a supergroup with username @{generated_username}.")
+                                    username_set = True
+                                    break # Exit loop on success
+                                except errors.UsernameOccupiedError:
+                                    LOGGER.warning(f"Username '{generated_username}' is occupied. Retrying with a new one.")
+                                    await asyncio.sleep(1) # Small delay before retrying
                             
-                            await user_client(functions.channels.UpdateUsernameRequest(
-                                channel=input_channel,
-                                username=random_username
-                            ))
-                            LOGGER.info(f"Group {chat.id} successfully upgraded to a supergroup.")
+                            if not username_set:
+                                LOGGER.error(f"Failed to set a public username for group {chat.id} after multiple attempts. Skipping history toggle.")
+                                raise Exception("Could not set public username.")
 
                             # 2. Now that it's a supergroup, make chat history visible to new members.
                             await user_client(functions.channels.TogglePreHistoryHiddenRequest(
@@ -473,17 +539,10 @@ class GroupCreatorBot:
                             ))
                             LOGGER.info(f"Chat history for new members in group {chat.id} is now visible.")
                             
-                            # 3. (Optional but good practice) Make the group private again.
-                            await user_client(functions.channels.UpdateUsernameRequest(
-                                channel=input_channel,
-                                username=""  # Setting username to empty string makes it private
-                            ))
-                            LOGGER.info(f"Group {chat.id} has been made private again.")
+                            # 3. As requested, DO NOT make the group private again. It will remain public.
 
-                        except errors.UsernameOccupiedError as e:
-                            LOGGER.error(f"Could not upgrade group {chat.id} because the random username was occupied. Skipping history toggle. Error: {e}")
                         except Exception as e:
-                            LOGGER.warning(f"Could not make chat history visible for group {chat.id}. Error: {e}\n{traceback.format_exc()}")
+                            LOGGER.warning(f"Could not complete supergroup upgrade/history toggle for group {chat.id}. Error: {e}\n{traceback.format_exc()}")
 
 
                         self._set_group_count(worker_key, current_semester)

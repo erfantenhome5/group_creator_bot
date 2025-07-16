@@ -18,7 +18,6 @@ from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events
 from telethon.sessions import StringSession
-# MODIFIED: Added 'functions' to the import
 from telethon.tl import functions
 from telethon.tl.functions.messages import CreateChatRequest, ExportChatInviteRequest
 from telethon.tl.types import Message
@@ -139,6 +138,9 @@ class GroupCreatorBot:
         self.account_proxies = self._load_account_proxies()
         self.known_users_file = SESSIONS_DIR / "known_users.json"
         self.known_users = self._load_known_users()
+        # ADDED: State for active workers persistence
+        self.active_workers_file = SESSIONS_DIR / "active_workers.json"
+        self.active_workers_state = self._load_active_workers_state()
         try:
             self.fernet = Fernet(ENCRYPTION_KEY.encode())
         except (ValueError, TypeError):
@@ -279,7 +281,7 @@ class GroupCreatorBot:
             del self.group_counts[worker_key]
             self._save_group_counts()
 
-    # --- User Tracking for Broadcasts ---
+    # --- User and Worker State Management ---
     def _load_known_users(self) -> List[int]:
         """Loads the list of known user IDs from a file."""
         if not self.known_users_file.exists():
@@ -299,13 +301,32 @@ class GroupCreatorBot:
         except IOError:
             LOGGER.error("Could not save known_users.json.")
 
+    def _load_active_workers_state(self) -> Dict[str, Dict]:
+        """Loads the state of active workers from a file."""
+        if not self.active_workers_file.exists():
+            return {}
+        try:
+            with self.active_workers_file.open("r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            LOGGER.error("Could not read active_workers.json.")
+            return {}
+
+    def _save_active_workers_state(self) -> None:
+        """Saves the current state of active workers to a file."""
+        try:
+            with self.active_workers_file.open("w") as f:
+                json.dump(self.active_workers_state, f, indent=4)
+        except IOError:
+            LOGGER.error("Could not save active_workers.json.")
+
     async def _broadcast_message(self, message_text: str):
         """Sends a message to all known users."""
         LOGGER.info(f"Broadcasting message to {len(self.known_users)} users.")
         for user_id in self.known_users:
             try:
                 await self.bot.send_message(user_id, message_text)
-                await asyncio.sleep(0.1) # Avoid hitting rate limits
+                await asyncio.sleep(0.1) 
             except (errors.UserIsBlockedError, errors.InputUserDeactivatedError):
                 LOGGER.warning(f"User {user_id} has blocked the bot or is deactivated. Cannot send broadcast.")
             except Exception as e:
@@ -356,29 +377,19 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error deleting session file for user {user_id}, account '{account_name}': {e}")
         return False
 
-    async def _create_login_client(self) -> Optional[TelegramClient]:
-        """Creates a temporary client for the login flow, trying a random proxy."""
+    async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
+        """Creates a temporary client for the login flow, using the specified proxy."""
         session = StringSession()
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
 
-        if self.proxies:
-            proxy = random.choice(self.proxies)
-            proxy_addr = f"{proxy['addr']}:{proxy['port']}"
-            try:
-                LOGGER.debug(f"Attempting login connection with random proxy: {proxy_addr}")
-                client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
-                await client.connect()
-                return client
-            except Exception as e:
-                LOGGER.warning(f"Random proxy {proxy_addr} failed for login: {e}")
-        
-        LOGGER.warning("Login connection falling back to no proxy.")
         try:
-            client = TelegramClient(session, API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
+            proxy_info = f"proxy {proxy['addr']}:{proxy['port']}" if proxy else "no proxy"
+            LOGGER.debug(f"Attempting login connection with {proxy_info}")
+            client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
             await client.connect()
             return client
         except Exception as e:
-            LOGGER.error(f"Failed to connect without proxy for login: {e}")
+            LOGGER.error(f"Login connection failed with {proxy_info}: {e}")
             return None
 
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
@@ -497,7 +508,6 @@ class GroupCreatorBot:
                             current_semester -= 1 
                             continue
                         
-                        # ADDED: Make history visible for new members
                         try:
                             await user_client(functions.channels.TogglePreHistoryHiddenRequest(
                                 channel=chat.id,
@@ -551,9 +561,6 @@ class GroupCreatorBot:
             await self.bot.send_message(user_id, f"⏹️ عملیات برای حساب `{account_name}` توسط شما متوقف شد.")
         finally:
             LOGGER.info(f"Worker finished for {worker_key}.")
-            if worker_key in self.active_workers and not self.active_workers[worker_key].cancelled():
-                 await self.bot.send_message(user_id, f"🏁 چرخه ساخت گروه برای حساب `{account_name}` به پایان رسید.")
-
             if worker_key in self.active_workers:
                 del self.active_workers[worker_key]
             if user_client and user_client.is_connected():
@@ -567,19 +574,24 @@ class GroupCreatorBot:
         
         self._save_session_string(user_id, account_name, user_client.session.save())
 
-        assigned_proxy = self._get_available_proxy()
+        assigned_proxy = self.user_sessions[user_id].get('login_proxy')
         self.account_proxies[worker_key] = assigned_proxy
         self._save_account_proxies()
         
         if assigned_proxy:
             proxy_addr = f"{assigned_proxy['addr']}:{assigned_proxy['port']}"
-            LOGGER.info(f"Assigned available proxy {proxy_addr} to account '{account_name}'.")
+            LOGGER.info(f"Assigned login proxy {proxy_addr} to account '{account_name}'.")
         else:
-            LOGGER.warning(f"No available proxies. Account '{account_name}' will run without a proxy.")
-            await self.bot.send_message(user_id, f"⚠️ **هشدار:** تمام پراکسی‌ها در حال استفاده هستند. حساب `{account_name}` بدون پراکسی اضافه شد.")
+            LOGGER.info(f"Account '{account_name}' was logged in directly and will run without a proxy.")
+
+        if user_client and user_client.is_connected():
+            await user_client.disconnect()
+            LOGGER.info(f"Login client for user {user_id} ('{account_name}') disconnected successfully.")
 
         if 'client' in self.user_sessions[user_id]:
             del self.user_sessions[user_id]['client']
+        if 'login_proxy' in self.user_sessions[user_id]:
+            del self.user_sessions[user_id]['login_proxy']
         self.user_sessions[user_id]['state'] = 'authenticated' 
 
         await self.bot.send_message(user_id, f"✅ حساب `{account_name}` با موفقیت اضافه شد!")
@@ -766,7 +778,9 @@ class GroupCreatorBot:
             await event.reply("✅ Test error sent! It has been tagged to be ignored by the AI analyzer.")
 
     async def _refine_code_handler(self, event: events.NewMessage.Event) -> None:
-        await self.ai_analyzer.refine_code(event)
+        user_id = event.sender_id
+        self.user_sessions[user_id]['state'] = 'awaiting_refine_prompt'
+        await event.reply("💬 لطفاً دستورالعمل‌های خود را برای بهبود کد ارسال کنید. می‌توانید چندین پیام ارسال کنید. پس از اتمام، دستور `/end_prompt` را ارسال کنید.")
         raise events.StopPropagation
         
     async def _test_self_heal_handler(self, event: events.NewMessage.Event) -> None:
@@ -796,8 +810,19 @@ class GroupCreatorBot:
         session = self.user_sessions.get(user_id, {})
         state = session.get('state')
 
+        # Global cancel command
+        if text == '/cancel':
+            if 'state' in self.user_sessions.get(user_id, {}):
+                del self.user_sessions[user_id]['state']
+            await event.reply("✅ عملیات فعلی لغو شد.", buttons=self._build_main_menu())
+            return
+
         if state == 'awaiting_master_password':
             await self._handle_master_password(event)
+            return
+            
+        if state == 'awaiting_refine_prompt':
+            await self._handle_refine_prompt(event)
             return
 
         login_flow_states = ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']
@@ -960,11 +985,15 @@ class GroupCreatorBot:
         user_id = event.sender_id
         self.user_sessions[user_id]['phone'] = event.text.strip()
         
+        selected_proxy = self._get_available_proxy()
+        self.user_sessions[user_id]['login_proxy'] = selected_proxy
+
         user_client = None
         try:
-            user_client = await self._create_login_client()
+            user_client = await self._create_login_client(selected_proxy)
             if not user_client:
-                await event.reply('❌ اتصال به تلگرام با استفاده از پراکسی و بدون پراکسی با شکست مواجه شد. لطفا بعدا تلاش کنید.')
+                proxy_msg = f" with proxy {selected_proxy['addr']}:{selected_proxy['port']}" if selected_proxy else " directly"
+                await event.reply(f'❌ اتصال به تلگرام{proxy_msg} با شکست مواجه شد. لطفا بعدا تلاش کنید.')
                 return
                 
             self.user_sessions[user_id]['client'] = user_client
@@ -1039,6 +1068,28 @@ class GroupCreatorBot:
         self.user_sessions[user_id]['account_name'] = account_name
         user_client = self.user_sessions[user_id]['client']
         await self.on_login_success(event, user_client)
+
+    # ADDED: Handler for multi-message refine prompt
+    async def _handle_refine_prompt(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        text = event.text
+
+        if text == '/end_prompt':
+            prompt = self.user_sessions[user_id].get('refine_prompt', '')
+            if not prompt:
+                await event.reply("❌ شما هیچ دستوری وارد نکرده‌اید. عملیات لغو شد.")
+            else:
+                await self.ai_analyzer.refine_code(event, prompt)
+            
+            # Clean up session state
+            if 'refine_prompt' in self.user_sessions[user_id]:
+                del self.user_sessions[user_id]['refine_prompt']
+            self.user_sessions[user_id]['state'] = 'authenticated'
+        else:
+            # Append the message to the prompt
+            current_prompt = self.user_sessions[user_id].get('refine_prompt', '')
+            self.user_sessions[user_id]['refine_prompt'] = current_prompt + text + "\n"
+            await event.reply("✅ پیام شما دریافت شد. برای اتمام، دستور `/end_prompt` را ارسال کنید یا پیام بعدی را بفرستید.")
 
     # --- Main Run Method ---
     def register_handlers(self) -> None:

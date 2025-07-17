@@ -718,7 +718,7 @@ class GroupCreatorBot:
 
         async def make_gemini_request(timeout: int = 40):
             if not self.gemini_api_key: return None
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-2.0:generateContent?key={self.gemini_api_key}"
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={self.gemini_api_key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
             headers = {'Content-Type': 'application/json'}
             proxy_url = None
@@ -2327,7 +2327,7 @@ class GroupCreatorBot:
                 LOGGER.info("[Scheduler] No groups need reviving at this time.")
                 continue
 
-            LOGGER.info(f"[Scheduler] Found {len(groups_to_revive)} groups to revive.")
+            LOGGER.info(f"[Scheduler] Found {len(groups_to_revive)} groups to revive. Processing sequentially to avoid rate limits.")
             
             # [FIX] Process groups one by one with a delay to avoid connection flooding.
             for group_id, data in groups_to_revive:
@@ -2349,14 +2349,17 @@ class GroupCreatorBot:
                         
                     LOGGER.info(f"[Scheduler] Starting scheduled conversation task for group {group_id} (owner: {owner_key}).")
                     
-                    # Create the task for this single group
-                    asyncio.create_task(self._run_conversation_task(user_id, group_id, num_messages=random.randint(5, 15)))
+                    # Run the task for this single group and wait for it to complete
+                    # This is simpler and more robust than creating background tasks in a loop
+                    await self._run_conversation_task(user_id, group_id, num_messages=random.randint(5, 15))
                     
                     # Wait for a random interval before starting the next one
-                    await asyncio.sleep(random.uniform(60, 120))
+                    delay = random.uniform(60, 180) # 1-3 minutes
+                    LOGGER.info(f"[Scheduler] Waiting for {delay:.2f} seconds before next group.")
+                    await asyncio.sleep(delay)
 
                 except Exception as e:
-                    LOGGER.error(f"[Scheduler] Failed to start conversation task for group {group_id}: {e}", exc_info=True)
+                    LOGGER.error(f"[Scheduler] Failed to process group {group_id}: {e}", exc_info=True)
 
     async def _get_ai_error_explanation(self, traceback_str: str) -> Optional[str]:
         """Asks the AI to explain a Python traceback to the user."""

@@ -8,10 +8,12 @@ import re
 import shutil
 import traceback
 import uuid
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import sys
+import time
 
 import httpx
 import sentry_sdk
@@ -109,6 +111,44 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
     except FileNotFoundError:
         LOGGER.warning(f"Proxy file '{proxy_file_path}' not found.")
     return proxy_list
+
+# --- [NEW] Proxy Manager for Global Rate Limiting ---
+class ProxyManager:
+    """Manages proxy selection and enforces a global rate limit."""
+    RATE_LIMIT = 500  # requests
+    TIME_WINDOW = 60  # seconds
+
+    def __init__(self, proxies: List[Dict]):
+        self._proxies = proxies
+        self._request_timestamps = deque()
+        self._lock = asyncio.Lock()
+
+    async def get_proxy(self) -> Optional[Dict]:
+        """
+        Returns a proxy while respecting the global rate limit.
+        Waits if the rate limit has been exceeded.
+        """
+        if not self._proxies:
+            return None
+
+        async with self._lock:
+            now = time.monotonic()
+            
+            # Remove timestamps older than the time window
+            while self._request_timestamps and self._request_timestamps[0] <= now - self.TIME_WINDOW:
+                self._request_timestamps.popleft()
+
+            # If we've hit the rate limit, wait for the oldest request to expire
+            if len(self._request_timestamps) >= self.RATE_LIMIT:
+                oldest_request_time = self._request_timestamps[0]
+                wait_time = oldest_request_time - (now - self.TIME_WINDOW)
+                if wait_time > 0:
+                    LOGGER.warning(f"Global proxy rate limit hit. Waiting for {wait_time:.2f} seconds.")
+                    await asyncio.sleep(wait_time)
+            
+            # Add new timestamp and return a random proxy
+            self._request_timestamps.append(time.monotonic())
+            return random.choice(self._proxies)
 
 # --- Centralized Configuration ---
 class Config:
@@ -295,6 +335,7 @@ class GroupCreatorBot:
         self.daily_counts_file = SESSIONS_DIR / "daily_counts.json"
         self.daily_counts = self._load_daily_counts()
         self.proxies = load_proxies_from_file(self.config.get("PROXY_FILE", "proxy.txt"))
+        self.proxy_manager = ProxyManager(self.proxies) # [NEW] Initialize proxy manager
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
         self.known_users_file = SESSIONS_DIR / "known_users.json"
@@ -336,7 +377,7 @@ class GroupCreatorBot:
         self.ai_model = self.config.get("AI_MODEL", "moonshotai/kimi-k2:free")
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
-    def _initialize_sentry(self):
+    async def _initialize_sentry(self):
         sentry_dsn = self.config.get("SENTRY_DSN", SENTRY_DSN)
         if not sentry_dsn:
             return
@@ -368,9 +409,9 @@ class GroupCreatorBot:
             "traces_sample_rate": 1.0,
             "before_send": before_send_hook,
         }
-
-        if self.proxies:
-            sentry_proxy = random.choice(self.proxies)
+        
+        sentry_proxy = await self.proxy_manager.get_proxy()
+        if sentry_proxy:
             proxy_url = f"http://{sentry_proxy['addr']}:{sentry_proxy['port']}"
             sentry_options["http_proxy"] = proxy_url
             sentry_options["https_proxy"] = proxy_url
@@ -707,12 +748,14 @@ class GroupCreatorBot:
             delay = initial_delay
             for attempt in range(max_retries):
                 try:
-                    result = await request_func(model_name)
+                    # [MODIFIED] Get a new proxy on each attempt
+                    proxy_info = await self.proxy_manager.get_proxy()
+                    result = await request_func(model_name, proxy_info)
                     if result:
                         return result
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 429:
-                        LOGGER.warning(f"Rate limit hit for {model_name} on attempt {attempt + 1}. Retrying in {delay} seconds.")
+                        LOGGER.warning(f"Rate limit hit for {model_name} on attempt {attempt + 1}. Retrying in {delay} seconds with a new proxy.")
                         await asyncio.sleep(delay)
                         delay *= 2  # Exponential backoff
                     else:
@@ -724,15 +767,12 @@ class GroupCreatorBot:
             LOGGER.error(f"AI request for {model_name} failed after {max_retries} retries.")
             return None
 
-        async def make_openrouter_request(model_name: str, timeout: int = 25):
+        async def make_openrouter_request(model_name: str, proxy_info: Optional[Dict], timeout: int = 25):
             if not self.openrouter_api_key: return None
             headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
             data = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
             api_url = "https://openrouter.ai/api/v1/chat/completions"
-            proxy_url = None
-            if self.proxies:
-                proxy_info = random.choice(self.proxies)
-                proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
+            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
             
             async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
                 response = await client.post(api_url, json=data, headers=headers)
@@ -744,15 +784,12 @@ class GroupCreatorBot:
                     return [message.strip()]
             return None
 
-        async def make_gemini_request(model_name: str, timeout: int = 40): # model_name is unused but keeps signature consistent
+        async def make_gemini_request(model_name: str, proxy_info: Optional[Dict], timeout: int = 40):
             if not self.gemini_api_key: return None
             api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={self.gemini_api_key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
             headers = {'Content-Type': 'application/json'}
-            proxy_url = None
-            if self.proxies:
-                proxy_info = random.choice(self.proxies)
-                proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
+            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
 
             async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
                 response = await client.post(api_url, json=payload, headers=headers)
@@ -779,15 +816,19 @@ class GroupCreatorBot:
         return []
 
     async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 7, delay: int = 3) -> bool:
-        """Ensures the client has cached the group entity and is a participant."""
+        """[FIXED] Ensures the client has cached the group entity and is a participant."""
         for attempt in range(retries):
             try:
-                # Step 1: Resolve the entity. This also helps in caching.
-                group_entity = await self._send_request_with_reconnect(client, client.get_entity(PeerChannel(group_id)), account_name)
+                # Check connection before making calls
+                if not client.is_connected():
+                    await client.connect()
+
+                # Step 1: Resolve the entity. This is a high-level call.
+                group_entity = await client.get_entity(PeerChannel(group_id))
                 
                 # Step 2: Verify participation.
-                me = await self._send_request_with_reconnect(client, client.get_me(), account_name)
-                await self._send_request_with_reconnect(client, GetParticipantRequest(channel=group_entity, participant=me), account_name)
+                me = await client.get_me()
+                await client(GetParticipantRequest(channel=group_entity, participant=me))
                 
                 LOGGER.info(f"Account '{account_name}' successfully verified as participant in group {group_id}.")
                 return True
@@ -802,7 +843,7 @@ class GroupCreatorBot:
                 # This can happen if the entity isn't in the dialogs list yet.
                 LOGGER.warning(f"Attempt {attempt + 1}/{retries}: Account '{account_name}' could not find entity for group {group_id}. Retrying in {delay}s. Error: {e}")
                 if attempt < retries - 1:
-                    await self._send_request_with_reconnect(client, client.get_dialogs(limit=1), account_name) # Force update dialogs
+                    await client.get_dialogs(limit=1) # Force update dialogs
                     await asyncio.sleep(delay)
                 else:
                      LOGGER.error(f"Account '{account_name}' failed to cache entity for group {group_id} after {retries} retries.")
@@ -2526,7 +2567,9 @@ class GroupCreatorBot:
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
         try:
-            async with httpx.AsyncClient(timeout=40.0) as client:
+            proxy_info = await self.proxy_manager.get_proxy()
+            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=40.0) as client:
                 response = await client.post(api_url, json=data, headers=headers)
                 response.raise_for_status()
                 res_json = response.json()
@@ -2575,7 +2618,9 @@ class GroupCreatorBot:
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            proxy_info = await self.proxy_manager.get_proxy()
+            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=120.0) as client:
                 response = await client.post(api_url, json=data, headers=headers)
                 response.raise_for_status()
                 res_json = response.json()

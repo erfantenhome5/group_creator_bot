@@ -34,7 +34,7 @@ from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Mess
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO, # Changed to INFO for production
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("bot_activity.log"),
@@ -90,7 +90,7 @@ class CustomMarkdown:
 def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
     proxy_list = []
     try:
-        with open(proxy_file_path, 'r') as f:
+        with open(proxy_file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
@@ -252,6 +252,7 @@ class GroupCreatorBot:
         self.user_sessions: Dict[int, Dict[str, Any]] = {}
         self.active_workers: Dict[str, asyncio.Task] = {}
         self.active_conversations: Dict[str, asyncio.Task] = {}
+        self.suggested_code: Optional[str] = None
         
         self.config_file = SESSIONS_DIR / "config.json"
         self.config = self._load_json_file(self.config_file, {})
@@ -354,7 +355,7 @@ class GroupCreatorBot:
         if not self.account_proxy_file.exists():
             return {}
         try:
-            with self.account_proxy_file.open("r") as f:
+            with self.account_proxy_file.open("r", encoding='utf-8') as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             LOGGER.error("Could not read or parse account_proxies.json. Starting with empty assignments.")
@@ -362,7 +363,7 @@ class GroupCreatorBot:
 
     def _save_account_proxies(self) -> None:
         try:
-            with self.account_proxy_file.open("w") as f:
+            with self.account_proxy_file.open("w", encoding='utf-8') as f:
                 json.dump(self.account_proxies, f, indent=4)
         except IOError:
             LOGGER.error("Could not save account_proxies.json.")
@@ -387,7 +388,7 @@ class GroupCreatorBot:
         if not file_path.exists():
             return default_type
         try:
-            with file_path.open("r") as f:
+            with file_path.open("r", encoding='utf-8') as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             LOGGER.error(f"Could not read or parse {file_path.name}. Starting with empty data.")
@@ -395,7 +396,7 @@ class GroupCreatorBot:
 
     def _save_json_file(self, data: Any, file_path: Path) -> None:
         try:
-            with file_path.open("w") as f:
+            with file_path.open("w", encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
         except IOError:
             LOGGER.error(f"Could not save {file_path.name}.")
@@ -755,7 +756,7 @@ class GroupCreatorBot:
 
         # Make a mutable copy of the list to allow removing problematic clients
         active_clients_meta = list(clients_with_meta)
-        emojis = ["😊", "�", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
+        emojis = ["😊", "👍", "🤔", "🎉", "💡", "�", "🔥", "💯", "✅"]
 
         try:
             # 1. Kick-off message
@@ -1240,6 +1241,8 @@ class GroupCreatorBot:
             await self._clean_sessions_handler(event)
         elif text == "/test_sentry":
             await self._test_sentry_handler(event)
+        elif text == "/force_refine":
+            await self._force_refine_handler(event)
         else:
             await event.reply("Unknown admin command.")
 
@@ -2131,55 +2134,72 @@ class GroupCreatorBot:
         user_id = event.sender_id
         data = event.data.decode('utf-8')
 
-        if data.startswith("patch_"):
-            if user_id != ADMIN_USER_ID:
-                await event.answer("You are not authorized to do this.")
-                return
-            
-            # This is a simplified patching mechanism. In a real-world scenario,
-            # this would need to be much more robust.
-            try:
-                with open("main.py", "w") as f:
-                    f.write(self.suggested_code)
-                await event.edit("✅ Code patched. Restarting bot...")
-                await self.bot.disconnect()
-                os.execv(sys.executable, ['python'] + sys.argv)
-            except Exception as e:
-                await event.edit(f"❌ Failed to patch the code: {e}")
-            return
-
         if user_id != ADMIN_USER_ID:
             await event.answer("You are not authorized to perform this action.")
             return
 
-        action, user_id_str = data.split('_')
-        user_id_to_act_on = int(user_id_str)
-        if action == "approve":
-            if user_id_to_act_on in self.pending_users:
-                self.pending_users.remove(user_id_to_act_on)
-                self.known_users.append(user_id_to_act_on)
-                self._save_pending_users()
-                self._save_known_users()
-                await event.edit(f"✅ User `{user_id_to_act_on}` has been approved.")
-                await self.bot.send_message(user_id_to_act_on, Config.MSG_USER_APPROVED)
-                LOGGER.info(f"Admin approved user {user_id_to_act_on}.")
+        # --- AI Patching Logic ---
+        if data == "patch_feature":
+            if hasattr(self, 'suggested_code') and self.suggested_code:
+                try:
+                    # Backup the current script before patching, with a timestamp
+                    backup_path = f"{__file__}.{datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
+                    shutil.copyfile(__file__, backup_path)
+                    LOGGER.info(f"Created backup of the script at {backup_path}")
+                    
+                    with open(__file__, "w", encoding='utf-8') as f:
+                        f.write(self.suggested_code)
+                    
+                    await event.edit("✅ Code patched successfully. Restarting bot...")
+                    self.suggested_code = None # Clear after use
+                    await self.bot.disconnect()
+                    os.execv(sys.executable, ['python'] + sys.argv)
+                except Exception as e:
+                    LOGGER.error(f"Failed to patch the code: {e}", exc_info=True)
+                    await event.edit(f"❌ Failed to patch the code: {e}")
             else:
-                await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
-        elif action == "deny":
-            if user_id_to_act_on in self.pending_users:
-                self.pending_users.remove(user_id_to_act_on)
-                self._save_pending_users()
-                await event.edit(f"❌ User `{user_id_to_act_on}` has been denied.")
-                await self.bot.send_message(user_id_to_act_on, Config.MSG_USER_DENIED)
-                LOGGER.info(f"Admin denied user {user_id_to_act_on}.")
-            else:
-                await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
+                await event.edit("❌ No suggested code found to apply.")
+            return
+        
+        if data == "ignore_feature":
+            self.suggested_code = None # Clear the suggestion
+            await event.edit("👍 Suggestion ignored.")
+            return
+
+        # --- User Approval Logic ---
+        if data.startswith("approve_") or data.startswith("deny_"):
+            try:
+                action, user_id_str = data.split('_', 1)
+                user_id_to_act_on = int(user_id_str)
+            except ValueError:
+                await event.edit("⚠️ Invalid callback data.")
+                return
+
+            if action == "approve":
+                if user_id_to_act_on in self.pending_users:
+                    self.pending_users.remove(user_id_to_act_on)
+                    self.known_users.append(user_id_to_act_on)
+                    self._save_pending_users()
+                    self._save_known_users()
+                    await event.edit(f"✅ User `{user_id_to_act_on}` has been approved.")
+                    await self.bot.send_message(user_id_to_act_on, Config.MSG_USER_APPROVED)
+                    LOGGER.info(f"Admin approved user {user_id_to_act_on}.")
+                else:
+                    await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
+            elif action == "deny":
+                if user_id_to_act_on in self.pending_users:
+                    self.pending_users.remove(user_id_to_act_on)
+                    self._save_pending_users()
+                    await event.edit(f"❌ User `{user_id_to_act_on}` has been denied.")
+                    await self.bot.send_message(user_id_to_act_on, Config.MSG_USER_DENIED)
+                    LOGGER.info(f"Admin denied user {user_id_to_act_on}.")
+                else:
+                    await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
 
     async def _daily_conversation_scheduler(self):
         """
-        [NEW] This background task periodically checks created groups and starts 
-        conversations in them to maintain activity. This fixes a bug where this
-        function was called but not defined.
+        This background task periodically checks created groups and starts 
+        conversations in them to maintain activity.
         """
         while True:
             # Check for groups to revive once per hour
@@ -2234,42 +2254,64 @@ class GroupCreatorBot:
                 except Exception as e:
                     LOGGER.error(f"[Scheduler] Failed to start conversation task for owner {owner_key}: {e}", exc_info=True)
 
-    async def _daily_feature_suggestion(self):
-        """[DISABLED] This experimental feature is disabled by default due to its potential risks."""
-        while True:
-            await asyncio.sleep(86400) # Run once a day
-            try:
-                with open(__file__, 'r') as f:
-                    current_code = f.read()
-                
-                prompt = (
-                    "Analyze the following Python code for a Telegram bot. "
-                    "Suggest one new feature or a refinement to an existing one. "
-                    "Provide a brief explanation and the code for the new feature. "
-                    "Format the response as a JSON object with 'suggestion' and 'code' keys."
-                )
-                
-                # This would be a call to your AI model
-                # For this example, we'll just simulate a response
-                simulated_response = {
-                    "suggestion": "Add a new admin command `/stats` to show detailed statistics about bot usage.",
-                    "code": "async def _stats_handler(self, event): ... "
-                }
-                
-                suggestion = simulated_response['suggestion']
-                code_suggestion = simulated_response['code']
-                
-                message = f"**💡 AI Feature Suggestion**\n\n{suggestion}\n\n" \
-                          f"Would you like to apply this change?\n\n" \
-                          f"```python\n{code_suggestion}\n```"
+    async def _trigger_ai_suggestion(self):
+        """Contains the core logic for generating and proposing an AI code suggestion."""
+        try:
+            with open(__file__, 'r', encoding='utf-8') as f:
+                current_code = f.read()
+            
+            # In a real implementation, you would call your AI model here.
+            # This is a simulated response for demonstration.
+            prompt = (
+                "Analyze the following Python code for a Telegram bot. "
+                "Suggest one new feature or a refinement to an existing one. "
+                "Provide a brief explanation and the full, updated Python code for the new feature. "
+                "The response must be a JSON object with two keys: 'suggestion' (a string explaining the change) "
+                "and 'code' (a string containing the complete, modified source code)."
+            )
+            simulated_response = {
+                "suggestion": "This is a test suggestion to confirm the self-patching mechanism works. No actual code change is proposed in this test.",
+                "code": current_code 
+            }
+            
+            suggestion = simulated_response['suggestion']
+            code_suggestion = simulated_response['code']
+            
+            self.suggested_code = code_suggestion
+            
+            message = (
+                f"**💡 AI Feature Suggestion**\n\n"
+                f"{suggestion}\n\n"
+                f"Do you want to apply this change? The bot will restart if you approve."
+            )
 
-                await self.bot.send_message(ADMIN_USER_ID, message, buttons=[
+            await self.bot.send_message(
+                ADMIN_USER_ID, 
+                message, 
+                buttons=[
                     [Button.inline("✅ Apply & Restart", data="patch_feature")],
                     [Button.inline("❌ Ignore", data="ignore_feature")]
-                ])
-                self.suggested_code = current_code # Store the code to be patched
-            except Exception as e:
-                LOGGER.error(f"Failed to get daily feature suggestion: {e}")
+                ]
+            )
+            LOGGER.info("Sent AI feature suggestion to admin for approval.")
+        except Exception as e:
+            LOGGER.error(f"Failed to get AI feature suggestion: {e}", exc_info=True)
+            await self.bot.send_message(ADMIN_USER_ID, f"❌ An error occurred during AI analysis: {e}")
+
+    async def _force_refine_handler(self, event: events.NewMessage.Event):
+        """Manually triggers the AI feature suggestion process."""
+        if event.sender_id != ADMIN_USER_ID:
+            return
+        await event.reply("🤖 Triggering AI code analysis... This may take a moment.")
+        LOGGER.info(f"Admin {event.sender_id} manually triggered the AI feature suggestion.")
+        await self._trigger_ai_suggestion()
+
+    async def _daily_feature_suggestion(self):
+        """[ENABLED] This background task runs daily to suggest AI-powered code refinements."""
+        while True:
+            await asyncio.sleep(86400) # Run once a day
+            LOGGER.info("[Scheduler] Running daily AI feature suggestion task...")
+            await self._trigger_ai_suggestion()
 
     def register_handlers(self) -> None:
         self.bot.add_event_handler(self._start_handler, events.NewMessage(pattern='/start'))
@@ -2284,23 +2326,19 @@ class GroupCreatorBot:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service started successfully.")
 
-            # [FIX] Start the background scheduler for automatic conversations.
+            # Start the background scheduler for automatic conversations.
             self.bot.loop.create_task(self._daily_conversation_scheduler())
             
-            # [IMPROVEMENT] The AI-powered self-patching feature is experimental and potentially
-            # risky as it modifies its own code. It is disabled by default.
-            # To enable, uncomment the line below.
-            # self.bot.loop.create_task(self._daily_feature_suggestion())
+            # Start the background scheduler for AI feature suggestions.
+            self.bot.loop.create_task(self._daily_feature_suggestion())
             
-            # [IMPROVEMENT] Automatically resume workers that were active before a restart,
-            # instead of requiring the user to restart them manually.
+            # Automatically resume workers that were active before a restart.
             if self.active_workers_state:
                 LOGGER.info(f"Found {len(self.active_workers_state)} workers to resume from previous session.")
                 for worker_key, worker_data in list(self.active_workers_state.items()):
                     user_id = worker_data["user_id"]
                     account_name = worker_data["account_name"]
                     LOGGER.info(f"Attempting to resume worker for account '{account_name}' ({worker_key}).")
-                    # Use the refactored worker start logic to resume the task
                     await self._start_worker_task(user_id, account_name)
 
             if self.known_users:
@@ -2311,7 +2349,7 @@ class GroupCreatorBot:
         except Exception as e:
             LOGGER.critical(f"A critical error occurred in the main run loop: {e}", exc_info=True)
             # AI-powered error analysis
-            with open(__file__, 'r') as f:
+            with open(__file__, 'r', encoding='utf-8') as f:
                 current_code = f.read()
             error_traceback = traceback.format_exc()
             
@@ -2338,4 +2376,4 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
-
+�

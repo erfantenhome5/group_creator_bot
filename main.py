@@ -1634,6 +1634,9 @@ class GroupCreatorBot:
                 await self._delete_account_handler(event, delete_match.group(1))
                 return
         
+        except events.StopPropagation:
+            # [FIX] This is not a real error. Re-raise it so Telethon can handle it.
+            raise
         except Exception as e:
             # Global error handler for the message router
             await self._send_error_explanation(user_id, e)
@@ -2324,9 +2327,11 @@ class GroupCreatorBot:
             return None
 
         prompt = (
-            "You are a Python expert debugging a Telegram bot. The following error occurred. "
-            "Analyze the traceback and explain the likely cause in simple, user-friendly terms. "
-            "Keep the explanation concise (2-3 sentences) and write it in Persian.\n\n"
+            "An error occurred in a Telegram bot. Analyze the following Python traceback. "
+            "Explain the most likely cause to a non-technical user in 2-3 simple sentences. "
+            "Write the explanation in clear, everyday Persian. Do not use technical jargon. "
+            "For example, instead of 'RPC error', say 'a communication problem with Telegram'. "
+            "Instead of 'index out of bounds', say 'the bot tried to find an item that does not exist'.\n\n"
             f"**Traceback:**\n```\n{traceback_str}\n```"
         )
 
@@ -2362,7 +2367,8 @@ class GroupCreatorBot:
         
         user_message = "❌ یک خطای پیش‌بینی نشده رخ داد. لطفاً دوباره تلاش کنید."
         if ai_explanation:
-            user_message += f"\n\n**تحلیل هوش مصنوعی:**\n{ai_explanation}"
+            # [FIX] Don't say "AI Analysis", just give the explanation.
+            user_message += f"\n\n{ai_explanation}"
         
         try:
             await self.bot.send_message(user_id, user_message)

@@ -175,7 +175,7 @@ class Config:
         "چه خبر؟",
         "کسی اینجا هست؟",
         "🤔",
-        "�",
+        "👍",
         "عالیه!",
         "موافقم.",
         "جالبه.",
@@ -750,49 +750,40 @@ class GroupCreatorBot:
         return random.choice(documents) if documents else None
 
     async def _execute_ai_request(self, model_name: str, prompt: str, proxy_info: Optional[Dict]) -> Optional[List[str]]:
-        """A unified function to execute an AI request against either Gemini or OpenRouter."""
+        """A unified function to execute an AI request against the Gemini API."""
         proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
         
-        # --- Gemini Logic ---
-        if model_name.startswith("google/") or model_name.startswith("gemini-"):
-            if not self.gemini_api_key: return None
-            # Normalize model name for the API endpoint
-            clean_model_name = model_name.split('/')[-1]
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model_name}:generateContent?key={self.gemini_api_key}"
-            payload = {"contents": [{"parts": [{"text": prompt}]}]}
-            headers = {'Content-Type': 'application/json'}
-            
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=40) as client:
-                response = await client.post(api_url, json=payload, headers=headers)
-                response.raise_for_status()
-                res_json = response.json()
-                if res_json.get("candidates") and res_json["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text"):
-                    message = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                    LOGGER.info(f"Successfully generated message from Gemini model: {model_name}.")
-                    return [message.strip()]
+        if not self.gemini_api_key: return None
         
-        # --- OpenRouter Logic ---
-        else:
-            if not self.openrouter_api_key: return None
-            headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-            data = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
-            api_url = "https://openrouter.ai/api/v1/chat/completions"
-            
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=25) as client:
-                response = await client.post(api_url, json=data, headers=headers)
-                response.raise_for_status()
-                res_json = response.json()
-                if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
-                    message = res_json["choices"][0]["message"]["content"]
-                    LOGGER.info(f"Successfully generated message from OpenRouter model: {model_name}.")
-                    return [message.strip()]
+        # Correctly format the model name for the API URL
+        api_model_name = model_name.replace("google/", "") # Remove prefix if present
+        
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model_name}:generateContent?key={self.gemini_api_key}"
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        headers = {'Content-Type': 'application/json'}
+        
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=40) as client:
+            response = await client.post(api_url, json=payload, headers=headers)
+            response.raise_for_status()
+            res_json = response.json()
+            if res_json.get("candidates") and res_json["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text"):
+                message = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                LOGGER.info(f"Successfully generated message from Gemini model: {model_name}.")
+                return [message.strip()]
         
         return None
 
-    async def _generate_persian_messages(self, user_id: int, persona: str, previous_message: Optional[str] = None) -> List[str]:
-        """Generates a message using a specific persona, optionally replying to a previous message."""
-        if not self.openrouter_api_key and not self.gemini_api_key:
-            LOGGER.warning("No AI API keys are set. Skipping message generation.")
+    async def _generate_persian_messages(self, user_id: int, persona: str, previous_message: Optional[str] = None, ai_is_down: bool = False) -> List[str]:
+        """
+        Generates a message using a specific persona, optionally replying to a previous message.
+        If ai_is_down is True, it will immediately return a predefined message.
+        """
+        if ai_is_down:
+            LOGGER.info("AI is marked as down for this session, using predefined fallback.")
+            return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
+
+        if not self.gemini_api_key:
+            LOGGER.warning("No Gemini API key is set. Using predefined fallback.")
             return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
 
         keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
@@ -834,7 +825,7 @@ class GroupCreatorBot:
             LOGGER.error(f"AI request for {model_name} failed after {max_retries} retries.")
             return None
 
-        # [MODIFIED] Iterate through the model hierarchy
+        # Iterate through the model hierarchy
         for model in self.ai_model_hierarchy:
             LOGGER.info(f"Attempting AI generation with model: {model}")
             result = await make_request_with_backoff(self._execute_ai_request, model, prompt)
@@ -893,6 +884,7 @@ class GroupCreatorBot:
             return
 
         active_clients_meta = list(clients_with_meta)
+        ai_failed_for_this_group = False # [NEW] Flag to track AI failure per group
         
         # Assign a random persona to each participant for this conversation session
         personas = random.sample(Config.PERSONAS, k=len(active_clients_meta))
@@ -912,9 +904,11 @@ class GroupCreatorBot:
             starter_persona = starter_info['persona']
 
             initial_messages = await self._generate_persian_messages(user_id, persona=starter_persona)
-            if not initial_messages:
-                LOGGER.warning("Could not generate initial message for conversation.")
-                return
+            if not initial_messages or initial_messages[0] in Config.PREDEFINED_FALLBACK_MESSAGES:
+                ai_failed_for_this_group = True
+                LOGGER.warning(f"Initial AI generation failed for group {group_id}. Switching to predefined messages.")
+                if not initial_messages: # Ensure we have a message if AI returned empty
+                    initial_messages = [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
 
             initial_message_text = self._prepare_spoiler_text(initial_messages[0])
             
@@ -952,11 +946,17 @@ class GroupCreatorBot:
                         continue
                 
                 prompt_text = last_message.raw_text or "یک پاسخ جالب بده"
-                reply_messages = await self._generate_persian_messages(user_id, persona=replier_persona, previous_message=prompt_text)
+                reply_messages = await self._generate_persian_messages(user_id, persona=replier_persona, previous_message=prompt_text, ai_is_down=ai_failed_for_this_group)
                 
                 if not reply_messages:
-                    LOGGER.warning(f"Could not generate reply for '{replier_name}'.")
+                    LOGGER.warning(f"Could not generate any reply for '{replier_name}'.")
                     continue
+                
+                # If AI failed this time, set the flag for future messages in this group
+                if reply_messages[0] in Config.PREDEFINED_FALLBACK_MESSAGES:
+                    if not ai_failed_for_this_group:
+                        LOGGER.warning(f"AI generation failed mid-conversation for group {group_id}. Switching to predefined messages for the rest of this session.")
+                        ai_failed_for_this_group = True
 
                 reply_text = self._prepare_spoiler_text(reply_messages[0])
                 
@@ -1325,11 +1325,8 @@ class GroupCreatorBot:
         if event.sender_id != ADMIN_USER_ID:
             return
         
-        fallback_status = "Enabled" if self.use_fallback_model else "Disabled"
-        
         buttons = [
-            [Button.text("Set AI Model"), Button.text("Set Fallback AI Model")],
-            [Button.text(f"Toggle Fallback AI ({fallback_status})")],
+            [Button.text("Set AI Model Hierarchy")],
             [Button.text("Set Worker Limit"), Button.text("Set Group Count")],
             [Button.text("Set Sleep Times"), Button.text("Set Daily Msg Limit")],
             [Button.text("Set Proxy Timeout"), Button.text("Set Master Password")],
@@ -1437,14 +1434,19 @@ class GroupCreatorBot:
 
     async def _set_config_handler(self, event: events.NewMessage.Event, key: str, value: str):
         key = key.upper()
-        # Try to convert to number if possible
-        try:
-            if '.' in value:
-                value = float(value)
-            else:
-                value = int(value)
-        except ValueError:
-            pass # Keep as string
+        
+        # Handle list input for AI_MODEL_HIERARCHY
+        if key == "AI_MODEL_HIERARCHY":
+            value = [model.strip() for model in value.split(',')]
+        else:
+            # Try to convert to number if possible for other keys
+            try:
+                if '.' in value:
+                    value = float(value)
+                else:
+                    value = int(value)
+            except ValueError:
+                pass # Keep as string
         
         self.config[key] = value
         self._save_json_file(self.config, self.config_file)
@@ -1752,8 +1754,7 @@ class GroupCreatorBot:
             # Admin settings buttons
             if user_id == ADMIN_USER_ID:
                 admin_settings_map = {
-                    "Set AI Model": "AI_MODEL", 
-                    "Set Fallback AI Model": "FALLBACK_AI_MODEL",
+                    "Set AI Model Hierarchy": "AI_MODEL_HIERARCHY",
                     "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
                     "Set Group Count": "GROUPS_TO_CREATE", 
                     "Set Sleep Times": "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS",
@@ -1764,9 +1765,6 @@ class GroupCreatorBot:
                 }
                 if text in admin_settings_map:
                     await self._handle_admin_setting_button(event, admin_settings_map[text])
-                    return
-                if text.startswith("Toggle Fallback AI"):
-                    await self._toggle_fallback_handler(event)
                     return
 
             handler = button_handlers.get(text)
@@ -2298,7 +2296,10 @@ class GroupCreatorBot:
             await self._view_config_handler(event)
             return
         
-        if config_key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
+        if config_key == "AI_MODEL_HIERARCHY":
+            current_hierarchy = ", ".join(self.ai_model_hierarchy)
+            prompt_message = f"Please enter the new AI model hierarchy, separated by commas.\n**Current:**\n`{current_hierarchy}`"
+        elif config_key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
              prompt_message = f"Please enter the new min and max sleep times, separated by a comma (e.g., `300,900`).\nCurrent: `{self.min_sleep_seconds},{self.max_sleep_seconds}`"
         elif config_key == "MASTER_PASSWORD_HASH":
              prompt_message = f"Please enter the new **plain text** master password. It will be hashed automatically before saving."
@@ -2322,7 +2323,11 @@ class GroupCreatorBot:
             session['state'] = 'authenticated'
             return
 
-        if key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
+        if key == "AI_MODEL_HIERARCHY":
+            value = [model.strip() for model in value_str.split(',')]
+            self.config[key] = value
+            await event.reply(f"✅ AI Model Hierarchy has been updated.")
+        elif key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
             try:
                 min_val, max_val = map(int, value_str.split(','))
                 self.config["MIN_SLEEP_SECONDS"] = min_val
@@ -2356,18 +2361,6 @@ class GroupCreatorBot:
         session['state'] = 'authenticated'
         session.pop('config_key_to_set', None)
         await self._settings_handler(event)
-        
-    async def _toggle_fallback_handler(self, event: events.NewMessage.Event):
-        """Toggles the USE_FALLBACK_MODEL setting."""
-        current_status = self.config.get("USE_FALLBACK_MODEL", False)
-        new_status = not current_status
-        self.config["USE_FALLBACK_MODEL"] = new_status
-        self._save_json_file(self.config, self.config_file)
-        self.update_config_from_file() # Reload config
-        
-        await event.reply(f"✅ Fallback AI model has been **{'Enabled' if new_status else 'Disabled'}**.")
-        await self._settings_handler(event)
-
 
     # --- [FIXED] DM Chat Handlers ---
     async def _start_dm_chat_handler(self, event: events.NewMessage.Event):

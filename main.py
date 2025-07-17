@@ -121,6 +121,9 @@ class Config:
     PROXY_FILE = "proxy.txt"
     PROXY_TIMEOUT = 15
     DAILY_MESSAGE_LIMIT_PER_GROUP = 20
+    MESSAGE_SEND_DELAY_MIN = 1
+    MESSAGE_SEND_DELAY_MAX = 5
+
 
     # [NEW] Personas for more human-like conversations
     PERSONAS = [
@@ -572,12 +575,16 @@ class GroupCreatorBot:
         try:
             if not client.is_connected():
                 LOGGER.warning(f"Client for '{account_name}' is disconnected. Reconnecting...")
-                await client.connect()
-                if client.is_connected():
-                    LOGGER.info(f"Client for '{account_name}' reconnected successfully.")
-                else:
-                    LOGGER.error(f"Failed to reconnect client for '{account_name}'.")
-                    raise ConnectionError("Client reconnection failed.")
+                try:
+                    await client.connect()
+                    if client.is_connected():
+                        LOGGER.info(f"Client for '{account_name}' reconnected successfully.")
+                    else:
+                        LOGGER.error(f"Failed to reconnect client for '{account_name}'.")
+                        raise ConnectionError("Client reconnection failed.")
+                except Exception as conn_e:
+                    LOGGER.error(f"Reconnection attempt for '{account_name}' failed: {conn_e}")
+                    raise ConnectionError(f"Client reconnection failed: {conn_e}") from conn_e
             return await client(request)
         except ConnectionError as e:
             LOGGER.error(f"Connection error for '{account_name}' even after check: {e}")
@@ -696,6 +703,27 @@ class GroupCreatorBot:
                 f"Use slang and emojis if it fits your personality."
             )
         
+        async def make_request_with_backoff(request_func, model_name, max_retries=4, initial_delay=2):
+            delay = initial_delay
+            for attempt in range(max_retries):
+                try:
+                    result = await request_func(model_name)
+                    if result:
+                        return result
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        LOGGER.warning(f"Rate limit hit for {model_name} on attempt {attempt + 1}. Retrying in {delay} seconds.")
+                        await asyncio.sleep(delay)
+                        delay *= 2  # Exponential backoff
+                    else:
+                        LOGGER.error(f"HTTP error for {model_name}: {e}", exc_info=True)
+                        return None # Don't retry on other HTTP errors
+                except Exception as e:
+                    LOGGER.error(f"Request failed for {model_name}: {e}", exc_info=True)
+                    return None
+            LOGGER.error(f"AI request for {model_name} failed after {max_retries} retries.")
+            return None
+
         async def make_openrouter_request(model_name: str, timeout: int = 25):
             if not self.openrouter_api_key: return None
             headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
@@ -716,7 +744,7 @@ class GroupCreatorBot:
                     return [message.strip()]
             return None
 
-        async def make_gemini_request(timeout: int = 40):
+        async def make_gemini_request(model_name: str, timeout: int = 40): # model_name is unused but keeps signature consistent
             if not self.gemini_api_key: return None
             api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={self.gemini_api_key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -736,33 +764,30 @@ class GroupCreatorBot:
                     return [message.strip()]
             return None
 
-        try:
-            # Try primary model first
-            result = await make_openrouter_request(self.ai_model)
-            if result: return result
-        except Exception as e:
-            LOGGER.warning(f"Primary AI model '{self.ai_model}' failed: {e}. Trying fallback model.")
+        # Try primary model with backoff
+        result = await make_request_with_backoff(make_openrouter_request, self.ai_model)
+        if result:
+            return result
         
-        # If primary fails or returns nothing, try Gemini
-        try:
-            result = await make_gemini_request()
-            if result: return result
-        except Exception as fallback_e:
-            LOGGER.error(f"Fallback AI model also failed: {fallback_e}", exc_info=True)
-            sentry_sdk.capture_exception(fallback_e)
+        # If primary fails, try Gemini fallback with backoff
+        LOGGER.warning(f"Primary AI model '{self.ai_model}' failed. Trying fallback Gemini model.")
+        result = await make_request_with_backoff(make_gemini_request, "gemini-1.5-flash")
+        if result:
+            return result
 
+        LOGGER.error("All AI models failed to generate a response.")
         return []
 
-    async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 1) -> bool:
+    async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 7, delay: int = 3) -> bool:
         """Ensures the client has cached the group entity and is a participant."""
         for attempt in range(retries):
             try:
                 # Step 1: Resolve the entity. This also helps in caching.
-                group_entity = await client.get_entity(PeerChannel(group_id))
+                group_entity = await self._send_request_with_reconnect(client, client.get_entity(PeerChannel(group_id)), account_name)
                 
                 # Step 2: Verify participation.
-                me = await client.get_me()
-                await client(GetParticipantRequest(channel=group_entity, participant=me))
+                me = await self._send_request_with_reconnect(client, client.get_me(), account_name)
+                await self._send_request_with_reconnect(client, GetParticipantRequest(channel=group_entity, participant=me), account_name)
                 
                 LOGGER.info(f"Account '{account_name}' successfully verified as participant in group {group_id}.")
                 return True
@@ -777,11 +802,14 @@ class GroupCreatorBot:
                 # This can happen if the entity isn't in the dialogs list yet.
                 LOGGER.warning(f"Attempt {attempt + 1}/{retries}: Account '{account_name}' could not find entity for group {group_id}. Retrying in {delay}s. Error: {e}")
                 if attempt < retries - 1:
-                    await client.get_dialogs(limit=1) # Force update dialogs
+                    await self._send_request_with_reconnect(client, client.get_dialogs(limit=1), account_name) # Force update dialogs
                     await asyncio.sleep(delay)
                 else:
                      LOGGER.error(f"Account '{account_name}' failed to cache entity for group {group_id} after {retries} retries.")
                      return False
+            except ConnectionError as e:
+                LOGGER.error(f"ConnectionError during entity caching for '{account_name}' in group {group_id}: {e}. Aborting for this account.")
+                return False
             except Exception as e:
                 LOGGER.error(f"Unexpected error while ensuring entity cached for '{account_name}' in group {group_id}: {e}", exc_info=True)
                 sentry_sdk.capture_exception(e)
@@ -824,11 +852,10 @@ class GroupCreatorBot:
             LOGGER.info(f"Account '{starter_name}' (Persona: {starter_persona}) started conversation in group {group_id}.")
             
             messages_sent_this_session = 1
+            await asyncio.sleep(random.uniform(Config.MESSAGE_SEND_DELAY_MIN, Config.MESSAGE_SEND_DELAY_MAX))
 
             # 2. Main reply loop
             while self._get_daily_count_for_group(group_id) < self.daily_message_limit and messages_sent_this_session < num_messages:
-                await asyncio.sleep(random.uniform(5, 12)) # Slightly longer, more human delay
-
                 last_sender_id = last_message.sender_id
 
                 possible_repliers = [m for m in active_clients_meta if m.get('account_id') != last_sender_id]
@@ -850,6 +877,7 @@ class GroupCreatorBot:
                         self._increment_daily_count_for_group(group_id)
                         messages_sent_this_session += 1
                         LOGGER.info(f"Account '{replier_name}' sent a sticker in group {group_id}.")
+                        await asyncio.sleep(random.uniform(Config.MESSAGE_SEND_DELAY_MIN, Config.MESSAGE_SEND_DELAY_MAX))
                         continue
                 
                 prompt_text = last_message.raw_text or "یک پاسخ جالب بده"
@@ -865,6 +893,7 @@ class GroupCreatorBot:
                 self._increment_daily_count_for_group(group_id)
                 messages_sent_this_session += 1
                 LOGGER.info(f"Account '{replier_name}' (Persona: {replier_persona}) replied in group {group_id}.")
+                await asyncio.sleep(random.uniform(Config.MESSAGE_SEND_DELAY_MIN, Config.MESSAGE_SEND_DELAY_MAX))
 
             self.created_groups[str(group_id)]["last_simulated"] = datetime.utcnow().timestamp()
             self._save_created_groups()
@@ -941,6 +970,9 @@ class GroupCreatorBot:
                                         await p_client(ImportChatInviteRequest(invite_hash))
                                         LOGGER.info(f"Account '{p_name}' successfully joined group {new_supergroup.id} via link.")
                                         await asyncio.sleep(random.uniform(5, 10)) # Delay to allow server processing
+                                    except errors.FloodWaitError as e:
+                                        LOGGER.warning(f"Flood wait error for '{p_name}' when joining group. Waiting for {e.seconds} seconds.")
+                                        await asyncio.sleep(e.seconds + 5)
                                     except Exception as e:
                                         LOGGER.warning(f"Account '{p_name}' failed to join group {new_supergroup.id} via link: {e}")
                             else:
@@ -1568,6 +1600,9 @@ class GroupCreatorBot:
             if text.startswith('/'):
                 if user_id == ADMIN_USER_ID:
                     await self._admin_command_handler(event)
+                # Allow non-admins to use /start
+                elif text == '/start':
+                    await self._start_handler(event)
                 else:
                     await event.reply("❌ You are not authorized to use commands.")
                 return
@@ -1676,10 +1711,11 @@ class GroupCreatorBot:
                 return
         
         except events.StopPropagation:
-            # [FIX] This is not a real error. Re-raise it so Telethon can handle it.
+            # This is not a real error. Re-raise it so Telethon can handle it.
             raise
         except Exception as e:
             # Global error handler for the message router
+            LOGGER.error(f"An error occurred for user {user_id}", exc_info=True)
             await self._send_error_explanation(user_id, e)
 
     async def _start_worker_task(self, user_id: int, account_name: str) -> Optional[TelegramClient]:
@@ -1917,6 +1953,11 @@ class GroupCreatorBot:
                     await client(ImportChatInviteRequest(invite_hash))
                     success_count += 1
                     LOGGER.info(f"Account '{account_name}' successfully joined chat with link {link}.")
+                except errors.FloodWaitError as e:
+                    fail_count += 1
+                    fail_details_list.append(f"- `{link}` (Rate Limited: wait {e.seconds}s)")
+                    LOGGER.warning(f"Flood wait on joining link {link}. Waiting {e.seconds} seconds.")
+                    await asyncio.sleep(e.seconds + 5) # Wait and add a buffer
                 except Exception as e:
                     fail_count += 1
                     fail_details_list.append(f"- `{link}` ({e.__class__.__name__})")
@@ -2236,6 +2277,104 @@ class GroupCreatorBot:
         session['state'] = 'authenticated'
         session.pop('config_key_to_set', None)
         await self._settings_handler(event)
+
+    # --- [FIXED] DM Chat Handlers ---
+    async def _start_dm_chat_handler(self, event: events.NewMessage.Event):
+        """Starts the process of setting up a DM chat simulation."""
+        user_id = event.sender_id
+        if user_id != ADMIN_USER_ID:
+            return
+        self.user_sessions[user_id]['state'] = 'awaiting_dm_target_id'
+        await event.reply("👤 Please enter the **User ID** or **username** of the target you want to start a DM chat with.", buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _handle_dm_target_id(self, event: events.NewMessage.Event):
+        """Handles receiving the target user ID for the DM chat."""
+        user_id = event.sender_id
+        target_id = event.text.strip()
+        
+        # Simple validation: if it's a number, it's a user ID. Otherwise, it's a username.
+        try:
+            target_entity = int(target_id)
+        except ValueError:
+            target_entity = target_id.lstrip('@') # Allow with or without @
+
+        self.user_sessions[user_id]['dm_target'] = target_entity
+        self.user_sessions[user_id]['state'] = 'awaiting_dm_account_selection'
+        
+        accounts = self.session_manager.get_user_accounts(user_id)
+        if not accounts:
+            await event.reply("❌ You have no accounts to use for the DM. Please add an account first.")
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        buttons = [[Button.text(acc)] for acc in accounts]
+        buttons.append([Button.text(Config.BTN_BACK)])
+        await event.reply("🤖 Please select the account that will initiate the DM chat.", buttons=buttons)
+
+    async def _handle_dm_account_selection(self, event: events.NewMessage.Event):
+        """Handles selecting the account to use for the DM."""
+        user_id = event.sender_id
+        account_name = event.text.strip()
+        if account_name not in self.session_manager.get_user_accounts(user_id):
+            await event.reply("❌ Invalid account selected. Please use the buttons.")
+            return
+
+        self.user_sessions[user_id]['dm_account_name'] = account_name
+        self.user_sessions[user_id]['state'] = 'awaiting_dm_initial_prompt'
+        await event.reply("✍️ Please provide the initial message to send to the target user.", buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _handle_dm_initial_prompt(self, event: events.NewMessage.Event):
+        """Handles the initial message and starts the DM task."""
+        user_id = event.sender_id
+        initial_message = event.text.strip()
+        session_data = self.user_sessions.get(user_id, {})
+        account_name = session_data.get('dm_account_name')
+        target_entity = session_data.get('dm_target')
+
+        if not all([account_name, target_entity, initial_message]):
+            await event.reply("❌ An internal error occurred (missing DM data). Please start over.")
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        await event.reply(f"🚀 Starting DM chat from `{account_name}` to `{target_entity}`...")
+        
+        # This part can be expanded into a full background task like the conversation worker
+        # For now, it will just send one message.
+        client = None
+        try:
+            session_str = self.session_manager.load_session_string(user_id, account_name)
+            proxy = self.account_proxies.get(f"{user_id}:{account_name}")
+            client = await self._create_worker_client(session_str, proxy)
+            if not client:
+                await event.reply("❌ Failed to connect with the selected account.")
+                return
+
+            await client.send_message(target_entity, initial_message)
+            await event.reply("✅ Initial DM sent successfully!")
+            LOGGER.info(f"DM sent from '{account_name}' to '{target_entity}'.")
+
+        except Exception as e:
+            await self._send_error_explanation(user_id, e)
+        finally:
+            if client and client.is_connected():
+                await client.disconnect()
+            
+            # Clean up DM state
+            session_data.pop('dm_target', None)
+            session_data.pop('dm_account_name', None)
+            session_data['state'] = 'authenticated'
+
+    # These are placeholders for the other DM states that were in the original router but not implemented
+    async def _handle_dm_persona(self, event: events.NewMessage.Event):
+        await event.reply("This part of the DM feature is not yet implemented.")
+        self.user_sessions[event.sender_id]['state'] = 'authenticated'
+
+    async def _handle_dm_sticker_packs(self, event: events.NewMessage.Event):
+        await event.reply("This part of the DM feature is not yet implemented.")
+        self.user_sessions[event.sender_id]['state'] = 'authenticated'
+
+    async def _stop_dm_chat_handler(self, event: events.NewMessage.Event):
+        await event.reply("DM chat stopping functionality is not yet implemented.")
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id

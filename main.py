@@ -52,6 +52,7 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", OPENROUTER_API_KEY) # Use OpenRouter key as fallback for Gemini
 
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY, ADMIN_USER_ID]):
@@ -115,9 +116,6 @@ class Config:
     # Bot Settings
     MAX_CONCURRENT_WORKERS = 5
     GROUPS_TO_CREATE = 50
-    # [MODIFIED] Adjusted sleep times for 50 groups to be created in 2-4 hours.
-    # 7200 seconds (2 hours) / 50 groups = 144s/group
-    # 14400 seconds (4 hours) / 50 groups = 288s/group
     MIN_SLEEP_SECONDS = 144
     MAX_SLEEP_SECONDS = 288
     PROXY_FILE = "proxy.txt"
@@ -316,6 +314,7 @@ class GroupCreatorBot:
         self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
+        self.gemini_api_key = self.config.get("GEMINI_API_KEY", GEMINI_API_KEY)
         self.ai_model = self.config.get("AI_MODEL", "moonshotai/kimi-k2:free")
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
@@ -661,8 +660,8 @@ class GroupCreatorBot:
 
     async def _generate_persian_messages(self, user_id: int, persona: str, previous_message: Optional[str] = None) -> List[str]:
         """Generates a message using a specific persona, optionally replying to a previous message."""
-        if not self.openrouter_api_key:
-            LOGGER.warning("OPENROUTER_API_KEY not set. Skipping message generation.")
+        if not self.openrouter_api_key and not self.gemini_api_key:
+            LOGGER.warning("No AI API keys are set. Skipping message generation.")
             return []
 
         keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
@@ -682,7 +681,8 @@ class GroupCreatorBot:
                 f"Use slang and emojis if it fits your personality."
             )
         
-        async def make_request(model_name: str, timeout: int = 20):
+        async def make_openrouter_request(model_name: str, timeout: int = 25):
+            if not self.openrouter_api_key: return None
             headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
             data = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
             api_url = "https://openrouter.ai/api/v1/chat/completions"
@@ -695,25 +695,48 @@ class GroupCreatorBot:
                 response = await client.post(api_url, json=data, headers=headers)
                 response.raise_for_status()
                 res_json = response.json()
-
                 if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
                     message = res_json["choices"][0]["message"]["content"]
                     LOGGER.info(f"Successfully generated message from OpenRouter using model: {model_name}.")
                     return [message.strip()]
-            return []
+            return None
+
+        async def make_gemini_request(timeout: int = 40):
+            if not self.gemini_api_key: return None
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            headers = {'Content-Type': 'application/json'}
+            proxy_url = None
+            if self.proxies:
+                proxy_info = random.choice(self.proxies)
+                proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
+
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
+                response = await client.post(api_url, json=payload, headers=headers)
+                response.raise_for_status()
+                res_json = response.json()
+                if res_json.get("candidates") and res_json["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text"):
+                    message = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                    LOGGER.info("Successfully generated message from Gemini fallback.")
+                    return [message.strip()]
+            return None
 
         try:
-            # Try primary model first with a shorter timeout
-            return await make_request(self.ai_model, timeout=25)
+            # Try primary model first
+            result = await make_openrouter_request(self.ai_model)
+            if result: return result
         except Exception as e:
-            LOGGER.warning(f"Primary AI model '{self.ai_model}' failed or timed out: {e}. Trying fallback model.")
-            try:
-                # If primary fails, try Gemini Flash with a longer timeout
-                return await make_request("google/gemini-flash-2.0:free", timeout=40)
-            except Exception as fallback_e:
-                LOGGER.error(f"Fallback AI model also failed: {fallback_e}", exc_info=True)
-                sentry_sdk.capture_exception(fallback_e)
-                return []
+            LOGGER.warning(f"Primary AI model '{self.ai_model}' failed: {e}. Trying fallback model.")
+        
+        # If primary fails or returns nothing, try Gemini
+        try:
+            result = await make_gemini_request()
+            if result: return result
+        except Exception as fallback_e:
+            LOGGER.error(f"Fallback AI model also failed: {fallback_e}", exc_info=True)
+            sentry_sdk.capture_exception(fallback_e)
+
+        return []
 
     async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 1) -> bool:
         """Ensures the client has cached the group entity and is a participant."""

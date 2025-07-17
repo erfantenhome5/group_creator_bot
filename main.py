@@ -115,11 +115,25 @@ class Config:
     # Bot Settings
     MAX_CONCURRENT_WORKERS = 5
     GROUPS_TO_CREATE = 50
-    MIN_SLEEP_SECONDS = 300
-    MAX_SLEEP_SECONDS = 900
+    # [MODIFIED] Adjusted sleep times for 50 groups to be created in 2-4 hours.
+    # 7200 seconds (2 hours) / 50 groups = 144s/group
+    # 14400 seconds (4 hours) / 50 groups = 288s/group
+    MIN_SLEEP_SECONDS = 144
+    MAX_SLEEP_SECONDS = 288
     PROXY_FILE = "proxy.txt"
     PROXY_TIMEOUT = 15
     DAILY_MESSAGE_LIMIT_PER_GROUP = 20
+
+    # [NEW] Personas for more human-like conversations
+    PERSONAS = [
+        "یک فرد بسیار مشتاق و با انگیزه که همیشه در مورد موفقیت و اهداف صحبت می کند.",
+        "یک فرد شوخ طبع و بامزه که سعی می کند با جوک و داستان های خنده دار دیگران را بخنداند.",
+        "یک فرد کنجکاو و اهل فن که به تکنولوژی و گجت های جدید علاقه دارد.",
+        "یک فرد آرام و متفکر که سوالات عمیق می پرسد و به دنبال معنای زندگی است.",
+        "یک فرد عملگرا و واقع بین که همیشه به دنبال راه حل های عملی برای مشکلات است.",
+        "یک هنرمند خلاق که در مورد هنر، موسیقی و زیبایی صحبت می کند.",
+        "یک ورزشکار پرانرژی که در مورد تناسب اندام و سبک زندگی سالم صحبت می کند."
+    ]
 
     # --- UI Text & Buttons (All in Persian) ---
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
@@ -645,74 +659,61 @@ class GroupCreatorBot:
         documents = self.sticker_sets.get(pack_name_to_use)
         return random.choice(documents) if documents else None
 
-    async def _generate_persian_messages(self, user_id: int, prompt_override: Optional[str] = None) -> List[str]:
+    async def _generate_persian_messages(self, user_id: int, persona: str, previous_message: Optional[str] = None) -> List[str]:
+        """Generates a message using a specific persona, optionally replying to a previous message."""
         if not self.openrouter_api_key:
             LOGGER.warning("OPENROUTER_API_KEY not set. Skipping message generation.")
             return []
 
-        if prompt_override:
-            prompt = prompt_override
-        else:
-            keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
-            base_prompt = self.custom_prompt or (
-                "یک عبارت کوتاه و جذاب برای شروع گفتگو به زبان فارسی ایجاد کن. "
-                "این عبارت باید درباره این موضوعات باشد: {keywords}. "
-                "مثال: 'موفقیت مثل یک سفر است، نه یک مقصد. اولین قدم شما چیست؟'"
+        keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
+        
+        if previous_message:
+            prompt = (
+                f"You are a person in a group chat. Your personality is: '{persona}'. "
+                f"Someone else just said: '{previous_message}'. "
+                f"Write a short, casual, and natural-sounding reply in Persian. "
+                f"Keep it to one or two sentences. Use slang and emojis if it fits your personality."
             )
-            prompt = base_prompt.format(keywords=', '.join(keywords))
-
-        headers = {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "model": self.ai_model,
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        api_url = "https://openrouter.ai/api/v1/chat/completions"
-
-        proxy_url = None
-        if self.proxies:
-            proxy_info = random.choice(self.proxies)
-            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
-            LOGGER.info(f"Using proxy {proxy_url} for OpenRouter API request.")
         else:
-            LOGGER.warning("No proxies configured. Making direct request to OpenRouter API.")
+            prompt = (
+                f"You are a person starting a conversation in a group chat. Your personality is: '{persona}'. "
+                f"Start a conversation about one of these topics: {', '.join(keywords)}. "
+                f"Write a short, casual, and engaging opening message in Persian (one or two sentences). "
+                f"Use slang and emojis if it fits your personality."
+            )
         
-        for attempt in range(3):
+        async def make_request(model_name: str, timeout: int = 20):
+            headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
+            data = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
+            api_url = "https://openrouter.ai/api/v1/chat/completions"
+            proxy_url = None
+            if self.proxies:
+                proxy_info = random.choice(self.proxies)
+                proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
+            
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
+                response = await client.post(api_url, json=data, headers=headers)
+                response.raise_for_status()
+                res_json = response.json()
+
+                if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
+                    message = res_json["choices"][0]["message"]["content"]
+                    LOGGER.info(f"Successfully generated message from OpenRouter using model: {model_name}.")
+                    return [message.strip()]
+            return []
+
+        try:
+            # Try primary model first with a shorter timeout
+            return await make_request(self.ai_model, timeout=25)
+        except Exception as e:
+            LOGGER.warning(f"Primary AI model '{self.ai_model}' failed or timed out: {e}. Trying fallback model.")
             try:
-                async with httpx.AsyncClient(proxy=proxy_url, timeout=40.0) as client:
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
-                    response = await client.post(api_url, json=data, headers=headers)
-                    response.raise_for_status()
-                    res_json = response.json()
-
-                    if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
-                        message = res_json["choices"][0]["message"]["content"]
-                        LOGGER.info(f"Successfully generated message from OpenRouter using {self.ai_model}.")
-                        return [message.strip()]
-                    else:
-                        LOGGER.warning(f"Unexpected OpenRouter API response structure: {res_json}")
-                        return []
-
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    LOGGER.warning(f"Rate limit hit with model {self.ai_model}. Attempt {attempt + 1}/3. Retrying after a delay...")
-                    if attempt < 2:
-                        await asyncio.sleep(random.uniform(2, 5))
-                    else:
-                        LOGGER.error(f"Failed to generate message after 3 attempts due to rate limiting.")
-                else:
-                    LOGGER.error(f"HTTP error with model {self.ai_model}: {e}", exc_info=True)
-                    sentry_sdk.capture_exception(e)
-                    break
-            except Exception as e:
-                LOGGER.error(f"An unexpected error occurred during message generation with {self.ai_model}: {e}", exc_info=True)
-                sentry_sdk.capture_exception(e)
-                break
-        
-        LOGGER.error("Failed to generate message from OpenRouter.")
-        return []
+                # If primary fails, try Gemini Flash with a longer timeout
+                return await make_request("google/gemini-flash-2.0:free", timeout=40)
+            except Exception as fallback_e:
+                LOGGER.error(f"Fallback AI model also failed: {fallback_e}", exc_info=True)
+                sentry_sdk.capture_exception(fallback_e)
+                return []
 
     async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 1) -> bool:
         """Ensures the client has cached the group entity and is a participant."""
@@ -754,9 +755,13 @@ class GroupCreatorBot:
             LOGGER.warning(f"Not enough clients to simulate interactive conversation in group {group_id}.")
             return
 
-        # Make a mutable copy of the list to allow removing problematic clients
         active_clients_meta = list(clients_with_meta)
-        emojis = ["😊", "👍", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
+        
+        # Assign a random persona to each participant for this conversation session
+        personas = random.sample(Config.PERSONAS, k=len(active_clients_meta))
+        for i, meta in enumerate(active_clients_meta):
+            meta['persona'] = personas[i]
+            LOGGER.info(f"Assigned persona '{personas[i]}' to account '{meta['account_name']}' for conversation in group {group_id}.")
 
         try:
             # 1. Kick-off message
@@ -767,32 +772,27 @@ class GroupCreatorBot:
             starter_info = random.choice(active_clients_meta)
             starter_client = starter_info['client']
             starter_name = starter_info['account_name']
+            starter_persona = starter_info['persona']
 
-            initial_messages = await self._generate_persian_messages(user_id)
+            initial_messages = await self._generate_persian_messages(user_id, persona=starter_persona)
             if not initial_messages:
                 LOGGER.warning("Could not generate initial message for conversation.")
                 return
 
             initial_message_text = self._prepare_spoiler_text(initial_messages[0])
             
-            try:
-                starter_group_entity = await starter_client.get_entity(PeerChannel(group_id))
-                last_message = await starter_client.send_message(starter_group_entity, initial_message_text)
-                self._increment_daily_count_for_group(group_id)
-                LOGGER.info(f"Account '{starter_name}' started conversation in group {group_id}.")
-            except errors.rpcerrorlist.ChannelInvalidError as e:
-                LOGGER.error(f"Starter account '{starter_name}' cannot send message to group {group_id}: {e}")
-                return # Can't start the conversation
-
+            last_message = await starter_client.send_message(PeerChannel(group_id), initial_message_text)
+            self._increment_daily_count_for_group(group_id)
+            LOGGER.info(f"Account '{starter_name}' (Persona: {starter_persona}) started conversation in group {group_id}.")
+            
             messages_sent_this_session = 1
 
             # 2. Main reply loop
             while self._get_daily_count_for_group(group_id) < self.daily_message_limit and messages_sent_this_session < num_messages:
-                await asyncio.sleep(random.uniform(3, 8))
+                await asyncio.sleep(random.uniform(5, 12)) # Slightly longer, more human delay
 
                 last_sender_id = last_message.sender_id
 
-                # Find a different bot to reply
                 possible_repliers = [m for m in active_clients_meta if m.get('account_id') != last_sender_id]
                 if not possible_repliers:
                     LOGGER.info("No other bot available to reply. Ending conversation.")
@@ -802,56 +802,38 @@ class GroupCreatorBot:
                 replier_client = replier_info['client']
                 replier_name = replier_info['account_name']
                 replier_user_id = replier_info['user_id']
+                replier_persona = replier_info['persona']
 
                 # Decide whether to send a sticker or text
-                if random.random() < 0.2: # 20% chance to send a sticker
+                if random.random() < 0.15: # 15% chance to send a sticker
                     sticker = await self._get_random_sticker(replier_client, replier_user_id)
                     if sticker:
-                        try:
-                            await asyncio.sleep(1) # Wait before responding
-                            replier_group_entity = await replier_client.get_entity(PeerChannel(group_id))
-                            last_message = await replier_client.send_file(replier_group_entity, sticker, reply_to=last_message.id)
-                            self._increment_daily_count_for_group(group_id)
-                            messages_sent_this_session += 1
-                            LOGGER.info(f"Account '{replier_name}' sent a sticker in group {group_id}.")
-                            continue
-                        except Exception as e:
-                            LOGGER.warning(f"Could not send sticker from '{replier_name}': {e}")
+                        last_message = await replier_client.send_file(PeerChannel(group_id), sticker, reply_to=last_message.id)
+                        self._increment_daily_count_for_group(group_id)
+                        messages_sent_this_session += 1
+                        LOGGER.info(f"Account '{replier_name}' sent a sticker in group {group_id}.")
+                        continue
                 
-                # Use last message as prompt for text reply
-                prompt = last_message.raw_text
-                if not prompt: # If last message was a sticker or media
-                    prompt = "یک پاسخ جالب بده"
-
-                reply_messages = await self._generate_persian_messages(user_id, prompt_override=prompt)
+                prompt_text = last_message.raw_text or "یک پاسخ جالب بده"
+                reply_messages = await self._generate_persian_messages(user_id, persona=replier_persona, previous_message=prompt_text)
+                
                 if not reply_messages:
                     LOGGER.warning(f"Could not generate reply for '{replier_name}'.")
                     continue
 
-                reply_text = self._prepare_spoiler_text(reply_messages[0]) + " " + random.choice(emojis)
+                reply_text = self._prepare_spoiler_text(reply_messages[0])
+                
+                last_message = await replier_client.send_message(PeerChannel(group_id), reply_text, reply_to=last_message.id)
+                self._increment_daily_count_for_group(group_id)
+                messages_sent_this_session += 1
+                LOGGER.info(f"Account '{replier_name}' (Persona: {replier_persona}) replied in group {group_id}.")
 
-                # Send the reply
-                try:
-                    await asyncio.sleep(1) # Wait before responding
-                    replier_group_entity = await replier_client.get_entity(PeerChannel(group_id))
-                    last_message = await replier_client.send_message(replier_group_entity, reply_text, reply_to=last_message.id)
-                    self._increment_daily_count_for_group(group_id)
-                    messages_sent_this_session += 1
-                    LOGGER.info(f"Account '{replier_name}' replied in group {group_id}. Daily count for group: {self._get_daily_count_for_group(group_id)}")
-                except errors.rpcerrorlist.ChannelInvalidError as e:
-                    LOGGER.error(f"Account '{replier_name}' cannot send message to group {group_id}: {e}")
-                    active_clients_meta.remove(replier_info) # Remove problematic client
-                    continue
-                except Exception as e:
-                    LOGGER.error(f"Unexpected error when '{replier_name}' tried sending a message in group {group_id}: {e}", exc_info=True)
-                    active_clients_meta.remove(replier_info) # Remove problematic client
-                    continue
-            
-            # After the conversation loop finishes, update the timestamp
             self.created_groups[str(group_id)]["last_simulated"] = datetime.utcnow().timestamp()
             self._save_created_groups()
             LOGGER.info(f"Updated 'last_simulated' timestamp for group {group_id}.")
 
+        except (ValueError, errors.rpcerrorlist.ChannelInvalidError) as e:
+            LOGGER.error(f"Conversation failed in group {group_id} due to an entity/channel error: {e}")
         except asyncio.CancelledError:
             LOGGER.info(f"Interactive conversation for group {group_id} was cancelled.")
             raise
@@ -1019,10 +1001,16 @@ class GroupCreatorBot:
                     p_account_name = me.first_name or me.username or f"ID:{me.id}"
                     clients_with_meta.append({'client': client, 'user_id': user_id, 'account_id': me.id, 'account_name': p_account_name})
 
-            if len(clients_with_meta) >= 2:
-                await self._run_interactive_conversation(user_id, group_id, clients_with_meta, num_messages=num_messages)
+            # [FIX] Ensure all clients know about the group before starting the conversation
+            ensure_tasks = [self._ensure_entity_cached(meta['client'], group_id, meta['account_name']) for meta in clients_with_meta]
+            results = await asyncio.gather(*ensure_tasks)
+            
+            successful_clients_meta = [meta for i, meta in enumerate(clients_with_meta) if results[i]]
+
+            if len(successful_clients_meta) >= 2:
+                await self._run_interactive_conversation(user_id, group_id, successful_clients_meta, num_messages=num_messages)
             else:
-                LOGGER.warning(f"[Conversation Task] Not enough clients could connect for user {user_id}.")
+                LOGGER.warning(f"[Conversation Task] Not enough clients could connect and cache the entity for group {group_id}.")
 
         except asyncio.CancelledError:
             LOGGER.info(f"[Conversation Task] for group {group_id} was cancelled.")
@@ -2312,10 +2300,13 @@ class GroupCreatorBot:
                         continue
                         
                     LOGGER.info(f"[Scheduler] Starting scheduled conversation task for owner {owner_key} in {len(group_ids)} groups.")
-                    # For scheduled tasks, send a smaller, random number of messages
-                    num_messages = random.randint(5, 15)
-                    tasks = [self._run_conversation_task(user_id, group_id, num_messages=num_messages) for group_id in group_ids]
-                    asyncio.create_task(asyncio.gather(*tasks))
+                    
+                    async def run_tasks():
+                        tasks = [self._run_conversation_task(user_id, group_id, num_messages=random.randint(5, 15)) for group_id in group_ids]
+                        await asyncio.gather(*tasks)
+
+                    # [FIX] Correctly create a task for the group of coroutines
+                    asyncio.create_task(run_tasks())
 
                 except Exception as e:
                     LOGGER.error(f"[Scheduler] Failed to start conversation task for owner {owner_key}: {e}", exc_info=True)
@@ -2503,7 +2494,7 @@ class GroupCreatorBot:
         """Allows the admin to test the AI message generation directly."""
         await event.reply("🧪 Testing AI message generation...")
         test_prompt = "Generate a short, friendly test message in English to confirm the AI is working."
-        messages = await self._generate_persian_messages(event.sender_id, prompt_override=test_prompt)
+        messages = await self._generate_persian_messages(event.sender_id, persona="a helpful assistant", previous_message=test_prompt)
         if messages:
             await event.reply(f"✅ **AI Response:**\n\n{messages[0]}")
         else:

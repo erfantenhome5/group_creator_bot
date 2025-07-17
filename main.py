@@ -223,6 +223,20 @@ class SessionManager:
         user_dir.mkdir(exist_ok=True)
         return user_dir
 
+    def get_all_accounts(self) -> Dict[str, int]:
+        """Returns a dictionary of all accounts across all users."""
+        all_accounts = {}
+        for user_dir in self._user_sessions_dir.iterdir():
+            if user_dir.is_dir():
+                try:
+                    user_id = int(user_dir.name)
+                    accounts = [f.stem for f in user_dir.glob("*.session")]
+                    for acc_name in accounts:
+                        all_accounts[f"{user_id}:{acc_name}"] = user_id
+                except ValueError:
+                    continue
+        return all_accounts
+
     def get_user_accounts(self, user_id: int) -> List[str]:
         user_dir = self._get_user_dir(user_id)
         return [f.stem for f in user_dir.glob("*.session")]
@@ -264,6 +278,7 @@ class GroupCreatorBot:
         self.user_sessions: Dict[int, Dict[str, Any]] = {}
         self.active_workers: Dict[str, asyncio.Task] = {}
         self.active_conversations: Dict[str, asyncio.Task] = {}
+        self.active_dm_chats: Dict[str, asyncio.Task] = {}
         self.suggested_code: Optional[str] = None
         
         self.config_file = SESSIONS_DIR / "config.json"
@@ -703,7 +718,7 @@ class GroupCreatorBot:
 
         async def make_gemini_request(timeout: int = 40):
             if not self.gemini_api_key: return None
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-2.0:generateContent?key={self.gemini_api_key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
             headers = {'Content-Type': 'application/json'}
             proxy_url = None
@@ -1098,26 +1113,32 @@ class GroupCreatorBot:
     async def _server_status_handler(self, event: events.NewMessage.Event) -> None:
         active_count = len(self.active_workers)
         active_conv_count = len(self.active_conversations)
+        active_dm_count = len(self.active_dm_chats)
         
         status_text = f"**📊 Server Status**\n\n"
         status_text += f"**Active Group Creators:** {active_count} / {self.max_workers}\n"
         status_text += f"**Active Manual Conversations:** {active_conv_count}\n"
+        
+        # [MODIFIED] Only show DM chat status to the admin
+        if event.sender_id == ADMIN_USER_ID:
+            status_text += f"**Active Private DM Chats:** {active_dm_count}\n"
 
-        if active_count > 0:
+        if self.active_workers:
             status_text += "\n**Accounts Creating Groups:**\n"
             for worker_key in self.active_workers.keys():
-                _, acc_name = worker_key.split(":", 1)
-                proxy_info = self.account_proxies.get(worker_key)
-                proxy_str = f" (Proxy: {proxy_info['addr']})" if proxy_info else ""
-                status_text += f"- `{worker_key}`{proxy_str}\n"
-
-        if active_conv_count > 0:
-            status_text += "\n**Accounts in Manual Conversation:**\n"
-            for worker_key in self.active_conversations.keys():
-                _, acc_name = worker_key.split(":", 1)
                 status_text += f"- `{worker_key}`\n"
 
-        if active_count == 0 and active_conv_count == 0:
+        if self.active_conversations:
+            status_text += "\n**Accounts in Manual Conversation:**\n"
+            for worker_key in self.active_conversations.keys():
+                status_text += f"- `{worker_key}`\n"
+        
+        if self.active_dm_chats and event.sender_id == ADMIN_USER_ID:
+            status_text += "\n**Accounts in Private DM Chat:**\n"
+            for chat_key in self.active_dm_chats.keys():
+                status_text += f"- `{chat_key}`\n"
+
+        if not any([self.active_workers, self.active_conversations, self.active_dm_chats]):
             status_text += "\nℹ️ No accounts are currently in operation."
 
         await event.reply(status_text, buttons=self._build_main_menu())
@@ -1261,6 +1282,10 @@ class GroupCreatorBot:
             await self._test_self_healing_handler(event)
         elif text == "/test_ai_generation":
             await self._test_ai_generation_handler(event)
+        elif text == "/start_dm_chat":
+            await self._start_dm_chat_handler(event)
+        elif text == "/stop_dm_chat":
+            await self._stop_dm_chat_handler(event)
         else:
             await event.reply("Unknown admin command.")
 
@@ -1573,6 +1598,11 @@ class GroupCreatorBot:
                 'awaiting_password': self._handle_password_input,
                 'awaiting_account_name': self._handle_account_name_input,
                 'awaiting_config_value': self._handle_config_value_input,
+                'awaiting_dm_target_id': self._handle_dm_target_id,
+                'awaiting_dm_account_selection': self._handle_dm_account_selection,
+                'awaiting_dm_persona': self._handle_dm_persona,
+                'awaiting_dm_sticker_packs': self._handle_dm_sticker_packs,
+                'awaiting_dm_initial_prompt': self._handle_dm_initial_prompt,
             }
 
             if text == Config.BTN_BACK:
@@ -2299,18 +2329,13 @@ class GroupCreatorBot:
 
             LOGGER.info(f"[Scheduler] Found {len(groups_to_revive)} groups to revive.")
             
-            # Group by owner to run conversations efficiently
-            groups_by_owner = {}
+            # [FIX] Process groups one by one with a delay to avoid connection flooding.
             for group_id, data in groups_to_revive:
-                owner_key = data.get("owner_worker_key")
-                if not owner_key:
-                    continue
-                if owner_key not in groups_by_owner:
-                    groups_by_owner[owner_key] = []
-                groups_by_owner[owner_key].append(group_id)
-
-            for owner_key, group_ids in groups_by_owner.items():
                 try:
+                    owner_key = data.get("owner_worker_key")
+                    if not owner_key:
+                        continue
+                    
                     user_id_str, account_name = owner_key.split(":", 1)
                     user_id = int(user_id_str)
                     
@@ -2322,17 +2347,16 @@ class GroupCreatorBot:
                         LOGGER.info(f"[Scheduler] Manual conversation already active for {owner_key}, skipping scheduled one.")
                         continue
                         
-                    LOGGER.info(f"[Scheduler] Starting scheduled conversation task for owner {owner_key} in {len(group_ids)} groups.")
+                    LOGGER.info(f"[Scheduler] Starting scheduled conversation task for group {group_id} (owner: {owner_key}).")
                     
-                    async def run_tasks():
-                        tasks = [self._run_conversation_task(user_id, group_id, num_messages=random.randint(5, 15)) for group_id in group_ids]
-                        await asyncio.gather(*tasks)
-
-                    # [FIX] Correctly create a task for the group of coroutines
-                    asyncio.create_task(run_tasks())
+                    # Create the task for this single group
+                    asyncio.create_task(self._run_conversation_task(user_id, group_id, num_messages=random.randint(5, 15)))
+                    
+                    # Wait for a random interval before starting the next one
+                    await asyncio.sleep(random.uniform(60, 120))
 
                 except Exception as e:
-                    LOGGER.error(f"[Scheduler] Failed to start conversation task for owner {owner_key}: {e}", exc_info=True)
+                    LOGGER.error(f"[Scheduler] Failed to start conversation task for group {group_id}: {e}", exc_info=True)
 
     async def _get_ai_error_explanation(self, traceback_str: str) -> Optional[str]:
         """Asks the AI to explain a Python traceback to the user."""

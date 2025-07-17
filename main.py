@@ -386,7 +386,7 @@ class GroupCreatorBot:
 
     def _save_group_counts(self) -> None:
         self._save_json_file(self.group_counts, self.counts_file)
-
+    
     def _load_banned_users(self) -> List[int]:
         return self._load_json_file(self.banned_users_file, [])
 
@@ -593,11 +593,12 @@ class GroupCreatorBot:
                 self.sticker_sets[pack_name_to_use] = sticker_set.documents
             except Exception as e:
                 LOGGER.error(f"Could not load sticker set '{pack_name_to_use}' for user {user_id}: {e}")
+                # Remove the invalid pack from the user's list to prevent future errors
                 if str(user_id) in self.user_sticker_packs and pack_name_to_use in self.user_sticker_packs[str(user_id)]:
                     self.user_sticker_packs[str(user_id)].remove(pack_name_to_use)
                     self._save_user_sticker_packs()
                 return None
-
+        
         documents = self.sticker_sets.get(pack_name_to_use)
         return random.choice(documents) if documents else None
 
@@ -623,13 +624,23 @@ class GroupCreatorBot:
         headers = {'Content-Type': 'application/json'}
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
+        # Prepare proxy for httpx if available
+        httpx_proxies = None
+        if self.proxies:
+            proxy_info = random.choice(self.proxies)
+            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
+            httpx_proxies = {"http://": proxy_url, "https://": proxy_url}
+            LOGGER.info(f"Using proxy {proxy_url} for Gemini API request.")
+        else:
+            LOGGER.warning("No proxies configured. Making direct request to Gemini API.")
+
         for model in models_to_try:
             api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
             LOGGER.info(f"Attempting to generate message from Gemini using model: {model}.")
-
+            
             for attempt in range(3): # Retry up to 3 times for rate limiting
                 try:
-                    async with httpx.AsyncClient(timeout=40.0) as client:
+                    async with httpx.AsyncClient(proxies=httpx_proxies, timeout=40.0) as client:
                         # Add a small random delay to avoid hitting rate limits too quickly
                         await asyncio.sleep(random.uniform(0.5, 1.5))
                         response = await client.post(api_url, json=payload, headers=headers)
@@ -670,11 +681,11 @@ class GroupCreatorBot:
             try:
                 # Step 1: Resolve the entity. This also helps in caching.
                 group_entity = await client.get_entity(PeerChannel(group_id))
-
+                
                 # Step 2: Verify participation.
                 me = await client.get_me()
                 await client(GetParticipantRequest(channel=group_entity, participant=me))
-
+                
                 LOGGER.info(f"Account '{account_name}' successfully verified as participant in group {group_id}.")
                 return True
             except errors.rpcerrorlist.UserNotParticipantError:
@@ -724,7 +735,7 @@ class GroupCreatorBot:
                 return
 
             initial_message_text = self._prepare_spoiler_text(initial_messages[0])
-
+            
             try:
                 starter_group_entity = await starter_client.get_entity(PeerChannel(group_id))
                 last_message = await starter_client.send_message(starter_group_entity, initial_message_text)
@@ -767,7 +778,7 @@ class GroupCreatorBot:
                             continue
                         except Exception as e:
                             LOGGER.warning(f"Could not send sticker from '{replier_name}': {e}")
-
+                
                 # Use last message as prompt for text reply
                 prompt = last_message.raw_text
                 if not prompt: # If last message was a sticker or media
@@ -1004,7 +1015,7 @@ class GroupCreatorBot:
     async def _server_status_handler(self, event: events.NewMessage.Event) -> None:
         active_count = len(self.active_workers)
         active_conv_count = len(self.active_conversations)
-
+        
         status_text = f"**📊 Server Status**\n\n"
         status_text += f"**Active Group Creators:** {active_count} / {self.max_workers}\n"
         status_text += f"**Active Manual Conversations:** {active_conv_count}\n"
@@ -1107,9 +1118,9 @@ class GroupCreatorBot:
         if event.sender_id != ADMIN_USER_ID:
             await event.reply("❌ You are not authorized to use this command.")
             return
-
+        
         text = event.message.text
-
+        
         # Commands with arguments
         pre_approve_match = re.match(r"/pre_approve (\d+)", text)
         ban_match = re.match(r"/ban (\d+)", text)
@@ -1177,11 +1188,11 @@ class GroupCreatorBot:
             await event.reply(f"✅ User `{user_id_to_unban}` has been unbanned.")
         else:
             await event.reply(f"ℹ️ User `{user_id_to_unban}` is not banned.")
-
+            
     async def _list_users_handler(self, event: events.NewMessage.Event):
         known_list = "\n".join(f"- `{uid}`" for uid in self.known_users) if self.known_users else "None"
         banned_list = "\n".join(f"- `{uid}`" for uid in self.banned_users) if self.banned_users else "None"
-
+        
         message = (
             f"**👥 User Lists**\n\n"
             f"**Approved Users:**\n{known_list}\n\n"
@@ -1215,7 +1226,7 @@ class GroupCreatorBot:
             await event.reply(f"🔄 Restarting worker `{worker_key}`...")
             await self._terminate_worker_handler(event, worker_key)
             await asyncio.sleep(2) # Give it a moment to fully stop
-
+            
             try:
                 user_id_str, account_name = worker_key.split(":", 1)
                 user_id = int(user_id_str)
@@ -1239,7 +1250,7 @@ class GroupCreatorBot:
             proxy_info = self.account_proxies.get(worker_key)
             proxy_str = f"Proxy: {proxy_info['addr']}:{proxy_info['port']}" if proxy_info else "Proxy: None"
             message += f"- **Key:** `{worker_key}`\n  - **Status:** {'Running' if not task.done() else 'Finished'}\n  - **{proxy_str}**\n\n"
-
+        
         await event.reply(message)
 
     async def _list_groups_handler(self, event: events.NewMessage.Event):
@@ -1251,7 +1262,7 @@ class GroupCreatorBot:
         for group_id, data in self.created_groups.items():
             owner_key = data.get("owner_worker_key", "Unknown")
             message += f"- **Group ID:** `{group_id}`\n  - **Owner Key:** `{owner_key}`\n\n"
-
+        
         if len(message) > 4096:
             try:
                 with open("created_groups.txt", "w", encoding="utf-8") as f:
@@ -1273,7 +1284,7 @@ class GroupCreatorBot:
         for user_id, accounts in self.conversation_accounts.items():
             accounts_str = ", ".join(f"`{acc}`" for acc in accounts) if accounts else "None"
             message += f"- **User ID:** `{user_id}`\n  - **Accounts:** {accounts_str}\n\n"
-
+        
         await event.reply(message)
 
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
@@ -1401,7 +1412,7 @@ class GroupCreatorBot:
     async def _message_router(self, event: events.NewMessage.Event) -> None:
         if not isinstance(getattr(event, 'message', None), Message) or not event.message.text:
             return
-
+        
         text = event.message.text
         user_id = event.sender_id
 
@@ -1524,10 +1535,10 @@ class GroupCreatorBot:
             if not from_admin:
                 await event.reply('❌ No session found for this account. Please delete and add it again.')
             return
-
+        
         if not from_admin:
             await event.reply(f'🚀 Preparing to start operation for account `{account_name}`...')
-
+        
         user_client = None
         try:
             assigned_proxy = self.account_proxies.get(worker_key)

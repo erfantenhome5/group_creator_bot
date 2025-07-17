@@ -756,7 +756,7 @@ class GroupCreatorBot:
 
         # Make a mutable copy of the list to allow removing problematic clients
         active_clients_meta = list(clients_with_meta)
-        emojis = ["😊", "👍", "🤔", "🎉", "💡", "�", "🔥", "💯", "✅"]
+        emojis = ["😊", "👍", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
 
         try:
             # 1. Kick-off message
@@ -1195,7 +1195,7 @@ class GroupCreatorBot:
             [Button.text("Set Proxy Timeout"), Button.text("Set Master Password")],
             [Button.text("View Config"), Button.text(Config.BTN_BACK)]
         ]
-        await event.reply("⚙️ **Admin Settings**\n\nUse `/set_config KEY value` to change a setting.", buttons=buttons)
+        await event.reply("⚙️ **Admin Settings**\n\nClick a button to change a setting, or use `/set_config KEY value`.", buttons=buttons)
 
     async def _admin_command_handler(self, event: events.NewMessage.Event) -> None:
         if event.sender_id != ADMIN_USER_ID:
@@ -1243,6 +1243,10 @@ class GroupCreatorBot:
             await self._test_sentry_handler(event)
         elif text == "/force_refine":
             await self._force_refine_handler(event)
+        elif text == "/test_self_healing":
+            await self._test_self_healing_handler(event)
+        elif text == "/test_ai_generation":
+            await self._test_ai_generation_handler(event)
         else:
             await event.reply("Unknown admin command.")
 
@@ -1534,62 +1538,48 @@ class GroupCreatorBot:
                 return
             await self._handle_master_password(event)
             return
+        
         session = self.user_sessions.get(user_id, {})
         state = session.get('state')
 
-        if text == Config.BTN_BACK and state in ['awaiting_keywords', 'awaiting_sticker_packs', 'awaiting_conv_accounts', 'awaiting_join_account_selection', 'awaiting_join_link', 'awaiting_export_account_selection', 'awaiting_force_conv_account_selection', 'awaiting_force_conv_num_messages', 'awaiting_stop_force_conv_selection']:
-            self.user_sessions[user_id]['state'] = 'authenticated'
-            await self._start_handler(event)
-            return
+        # --- State Handling ---
+        state_handlers = {
+            'awaiting_keywords': self._handle_keywords_input,
+            'awaiting_sticker_packs': self._handle_sticker_packs_input,
+            'awaiting_conv_accounts': self._handle_conv_accounts_input,
+            'awaiting_join_account_selection': self._handle_join_account_selection,
+            'awaiting_join_link': self._handle_join_link_input,
+            'awaiting_export_account_selection': self._process_export_link_request,
+            'awaiting_force_conv_account_selection': self._handle_force_conv_account_selection,
+            'awaiting_force_conv_num_messages': self._handle_force_conv_num_messages,
+            'awaiting_stop_force_conv_selection': self._handle_stop_force_conv_selection,
+            'awaiting_phone': self._handle_phone_input,
+            'awaiting_code': self._handle_code_input,
+            'awaiting_password': self._handle_password_input,
+            'awaiting_account_name': self._handle_account_name_input,
+            'awaiting_config_value': self._handle_config_value_input,
+        }
 
-        if state == 'awaiting_keywords':
-            await self._handle_keywords_input(event)
-            return
-        if state == 'awaiting_sticker_packs':
-            await self._handle_sticker_packs_input(event)
-            return
-        if state == 'awaiting_conv_accounts':
-            await self._handle_conv_accounts_input(event)
-            return
-        if state == 'awaiting_join_account_selection':
-            await self._handle_join_account_selection(event)
-            return
-        if state == 'awaiting_join_link':
-            await self._handle_join_link_input(event)
-            return
-        if state == 'awaiting_export_account_selection':
-            await self._process_export_link_request(event)
-            return
-        if state == 'awaiting_force_conv_account_selection':
-            await self._handle_force_conv_account_selection(event)
-            return
-        if state == 'awaiting_force_conv_num_messages':
-            await self._handle_force_conv_num_messages(event)
-            return
-        if state == 'awaiting_stop_force_conv_selection':
-            await self._handle_stop_force_conv_selection(event)
-            return
-
-        login_flow_states = ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']
-        if state in login_flow_states:
-            if text == Config.BTN_BACK:
+        if text == Config.BTN_BACK:
+            if state in ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']:
                 self.user_sessions[user_id]['state'] = 'authenticated'
                 await self._send_accounts_menu(event)
                 return
-            state_map = {
-                'awaiting_phone': self._handle_phone_input,
-                'awaiting_code': self._handle_code_input,
-                'awaiting_password': self._handle_password_input,
-                'awaiting_account_name': self._handle_account_name_input
-            }
-            await state_map[state](event)
+            elif state in state_handlers:
+                self.user_sessions[user_id]['state'] = 'authenticated'
+                await self._start_handler(event)
+                return
+
+        if state in state_handlers:
+            await state_handlers[state](event)
             return
 
         if state != 'authenticated':
             await self._start_handler(event)
             return
 
-        route_map = {
+        # --- Authenticated Text/Button Handling ---
+        button_handlers = {
             Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
             Config.BTN_HELP: self._help_handler,
             Config.BTN_BACK: self._start_handler,
@@ -1605,7 +1595,22 @@ class GroupCreatorBot:
             Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
             Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
         }
-        handler = route_map.get(text)
+        
+        # Admin settings buttons
+        if user_id == ADMIN_USER_ID:
+            admin_settings_map = {
+                "Set AI Model": "AI_MODEL", "Set API Key": "OPENROUTER_API_KEY",
+                "Set Custom Prompt": "CUSTOM_PROMPT", "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
+                "Set Group Count": "GROUPS_TO_CREATE", "Set Sleep Times": "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS",
+                "Set Daily Msg Limit": "DAILY_MESSAGE_LIMIT_PER_GROUP", "Set Proxy Timeout": "PROXY_TIMEOUT",
+                "Set Master Password": "MASTER_PASSWORD_HASH",
+                "View Config": "VIEW_CONFIG" # Special case
+            }
+            if text in admin_settings_map:
+                await self._handle_admin_setting_button(event, admin_settings_map[text])
+                return
+
+        handler = button_handlers.get(text)
         if handler:
             await handler(event)
             return
@@ -2130,6 +2135,73 @@ class GroupCreatorBot:
         user_client = self.user_sessions[user_id]['client']
         await self.on_login_success(event, user_client)
 
+    async def _handle_admin_setting_button(self, event: events.NewMessage.Event, config_key: str):
+        """Handles clicks on the admin settings buttons."""
+        user_id = event.sender_id
+
+        if config_key == "VIEW_CONFIG":
+            await self._view_config_handler(event)
+            return
+        
+        if config_key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
+             prompt_message = f"Please enter the new min and max sleep times, separated by a comma (e.g., `300,900`).\nCurrent: `{self.min_sleep_seconds},{self.max_sleep_seconds}`"
+        elif config_key == "MASTER_PASSWORD_HASH":
+             prompt_message = f"Please enter the new **plain text** master password. It will be hashed automatically before saving."
+        else:
+            current_value = self.config.get(config_key, "Not Set")
+            prompt_message = f"Please enter the new value for `{config_key}`.\nCurrent: `{current_value}`"
+
+        self.user_sessions[user_id]['state'] = 'awaiting_config_value'
+        self.user_sessions[user_id]['config_key_to_set'] = config_key
+        await event.reply(prompt_message, buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _handle_config_value_input(self, event: events.NewMessage.Event):
+        """Processes the value entered by the admin for a config setting."""
+        user_id = event.sender_id
+        session = self.user_sessions.get(user_id, {})
+        key = session.get('config_key_to_set')
+        value_str = event.message.text.strip()
+
+        if not key:
+            await event.reply("An internal error occurred. Please try again.", buttons=self._build_main_menu())
+            session['state'] = 'authenticated'
+            return
+
+        if key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
+            try:
+                min_val, max_val = map(int, value_str.split(','))
+                self.config["MIN_SLEEP_SECONDS"] = min_val
+                self.config["MAX_SLEEP_SECONDS"] = max_val
+                await event.reply(f"✅ Sleep times set to min `{min_val}` and max `{max_val}`.")
+            except (ValueError, TypeError):
+                await event.reply("❌ Invalid format. Please provide two numbers separated by a comma (e.g., `300,900`).")
+                return
+        elif key == "MASTER_PASSWORD_HASH":
+            hashed_value = hashlib.sha256(value_str.encode()).hexdigest()
+            self.config[key] = hashed_value
+            await event.reply(f"✅ `{key}` has been updated.")
+        else:
+            # Try to convert to number if possible
+            try:
+                if '.' in value_str:
+                    value = float(value_str)
+                else:
+                    value = int(value_str)
+            except ValueError:
+                value = value_str # Keep as string
+            
+            self.config[key] = value
+            await event.reply(f"✅ Config key `{key}` has been set to `{value}`.")
+
+        self._save_json_file(self.config, self.config_file)
+        self.update_config_from_file()
+        if key == "MAX_CONCURRENT_WORKERS":
+            self.worker_semaphore = asyncio.Semaphore(self.max_workers)
+
+        session['state'] = 'authenticated'
+        session.pop('config_key_to_set', None)
+        await self._settings_handler(event)
+
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id
         data = event.data.decode('utf-8')
@@ -2254,24 +2326,28 @@ class GroupCreatorBot:
                 except Exception as e:
                     LOGGER.error(f"[Scheduler] Failed to start conversation task for owner {owner_key}: {e}", exc_info=True)
 
-    async def _trigger_ai_suggestion(self):
+    async def _trigger_ai_suggestion(self, test_mode=False):
         """Contains the core logic for generating and proposing an AI code suggestion."""
         try:
             with open(__file__, 'r', encoding='utf-8') as f:
                 current_code = f.read()
             
+            if test_mode:
+                prompt = "This is a test. Please confirm you can read the code by suggesting a harmless change, like adding a comment. The full code must be returned."
+            else:
+                prompt = (
+                    "Analyze the following Python code for a Telegram bot. "
+                    "Suggest one new feature or a refinement to an existing one. "
+                    "Provide a brief explanation and the full, updated Python code for the new feature. "
+                    "The response must be a JSON object with two keys: 'suggestion' (a string explaining the change) "
+                    "and 'code' (a string containing the complete, modified source code)."
+                )
+
             # In a real implementation, you would call your AI model here.
             # This is a simulated response for demonstration.
-            prompt = (
-                "Analyze the following Python code for a Telegram bot. "
-                "Suggest one new feature or a refinement to an existing one. "
-                "Provide a brief explanation and the full, updated Python code for the new feature. "
-                "The response must be a JSON object with two keys: 'suggestion' (a string explaining the change) "
-                "and 'code' (a string containing the complete, modified source code)."
-            )
             simulated_response = {
-                "suggestion": "This is a test suggestion to confirm the self-patching mechanism works. No actual code change is proposed in this test.",
-                "code": current_code 
+                "suggestion": "This is a test suggestion to confirm the self-patching mechanism works. A comment has been added to the top of the file.",
+                "code": f"# AI Refinement Test: {datetime.now().isoformat()}\n{current_code}"
             }
             
             suggestion = simulated_response['suggestion']
@@ -2305,6 +2381,27 @@ class GroupCreatorBot:
         await event.reply("🤖 Triggering AI code analysis... This may take a moment.")
         LOGGER.info(f"Admin {event.sender_id} manually triggered the AI feature suggestion.")
         await self._trigger_ai_suggestion()
+
+    async def _test_self_healing_handler(self, event: events.NewMessage.Event):
+        """Simulates a critical error to test the self-healing (external restart) mechanism."""
+        await event.reply(
+            "💥 **Simulating critical failure!**\n\n"
+            "I will now raise an unhandled exception. If you are running this bot with a process manager "
+            "(like `systemd` or a Docker restart policy), it should restart automatically within a few moments. "
+            "The error will be reported to Sentry if configured."
+        )
+        await asyncio.sleep(2)
+        raise RuntimeError("Simulating a critical failure for self-healing test.")
+
+    async def _test_ai_generation_handler(self, event: events.NewMessage.Event):
+        """Allows the admin to test the AI message generation directly."""
+        await event.reply("🧪 Testing AI message generation...")
+        test_prompt = "Generate a short, friendly test message in English to confirm the AI is working."
+        messages = await self._generate_persian_messages(event.sender_id, prompt_override=test_prompt)
+        if messages:
+            await event.reply(f"✅ **AI Response:**\n\n{messages[0]}")
+        else:
+            await event.reply("❌ **Failed to generate AI message.**\n\nCheck the logs for errors. This could be due to an invalid API key, network issues, or a problem with the OpenRouter service.")
 
     async def _daily_feature_suggestion(self):
         """[ENABLED] This background task runs daily to suggest AI-powered code refinements."""
@@ -2348,21 +2445,7 @@ class GroupCreatorBot:
 
         except Exception as e:
             LOGGER.critical(f"A critical error occurred in the main run loop: {e}", exc_info=True)
-            # AI-powered error analysis
-            with open(__file__, 'r', encoding='utf-8') as f:
-                current_code = f.read()
-            error_traceback = traceback.format_exc()
-            
-            prompt = (
-                f"The following Python script for a Telegram bot crashed. "
-                f"Analyze the traceback and the source code to find the bug and suggest a fix.\n\n"
-                f"**Traceback:**\n{error_traceback}\n\n"
-                f"**Source Code:**\n```python\n{current_code}\n```\n\n"
-                f"Provide the fix as a complete, updated Python script inside a JSON object with a 'code' key."
-            )
-            # This would be a call to your AI model
-            # For this example, we'll just log it
-            LOGGER.info(f"AI analysis prompt for error:\n{prompt}")
+            sentry_sdk.capture_exception(e)
             
         finally:
             LOGGER.info("Bot service is shutting down. Disconnecting main bot client.")
@@ -2376,4 +2459,3 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
-�

@@ -646,11 +646,10 @@ class GroupCreatorBot:
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
         # Prepare proxy for httpx if available
-        httpx_proxies = None
+        proxy_url = None
         if self.proxies:
             proxy_info = random.choice(self.proxies)
             proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
-            httpx_proxies = {"http://": proxy_url, "https://": proxy_url}
             LOGGER.info(f"Using proxy {proxy_url} for Gemini API request.")
         else:
             LOGGER.warning("No proxies configured. Making direct request to Gemini API.")
@@ -661,7 +660,7 @@ class GroupCreatorBot:
             
             for attempt in range(3): # Retry up to 3 times for rate limiting
                 try:
-                    async with httpx.AsyncClient(proxies=httpx_proxies, timeout=40.0) as client:
+                    async with httpx.AsyncClient(proxy=proxy_url, timeout=40.0) as client:
                         # Add a small random delay to avoid hitting rate limits too quickly
                         await asyncio.sleep(random.uniform(0.5, 1.5))
                         response = await client.post(api_url, json=payload, headers=headers)
@@ -738,7 +737,7 @@ class GroupCreatorBot:
 
         # Make a mutable copy of the list to allow removing problematic clients
         active_clients_meta = list(clients_with_meta)
-        emojis = ["😊", "👍", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
+        emojis = ["😊", "👍", "�", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
 
         try:
             # 1. Kick-off message

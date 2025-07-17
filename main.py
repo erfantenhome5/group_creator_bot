@@ -52,6 +52,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY, ADMIN_USER_ID]):
@@ -300,7 +301,7 @@ class GroupCreatorBot:
         self.proxy_timeout = self.config.get("PROXY_TIMEOUT", Config.PROXY_TIMEOUT)
         self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
-        self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", "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")
+        self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
         self.ai_model = self.config.get("AI_MODEL", "moonshotai/kimi-k2:free")
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
@@ -1189,7 +1190,7 @@ class GroupCreatorBot:
             [Button.text("Set Proxy Timeout"), Button.text("Set Master Password")],
             [Button.text("View Config"), Button.text(Config.BTN_BACK)]
         ]
-        await event.reply("⚙️ **Admin Settings**", buttons=buttons)
+        await event.reply("⚙️ **Admin Settings**\n\nUse `/set_config KEY value` to change a setting.", buttons=buttons)
 
     async def _admin_command_handler(self, event: events.NewMessage.Event) -> None:
         if event.sender_id != ADMIN_USER_ID:

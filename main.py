@@ -574,6 +574,27 @@ class GroupCreatorBot:
     def _prepare_spoiler_text(self, text: str) -> str:
         """Converts ||spoiler|| syntax to [spoiler](spoiler) for custom markdown."""
         return re.sub(r'\|\|(.*?)\|\|', r'[\1](spoiler)', text)
+    
+    def _format_time_delta(self, seconds: float) -> str:
+        """Formats a duration in seconds into a human-readable string."""
+        if seconds < 0:
+            return "0s"
+        seconds = int(seconds)
+        days, remainder = divmod(seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if hours > 0:
+            parts.append(f"{hours}h")
+        if minutes > 0:
+            parts.append(f"{minutes}m")
+        if seconds > 0 or not parts:
+            parts.append(f"{seconds}s")
+            
+        return " ".join(parts)
 
     async def _get_random_sticker(self, client: TelegramClient, user_id: int) -> Optional[types.Document]:
         """Gets a random sticker from one of the user's configured sticker packs."""
@@ -819,9 +840,13 @@ class GroupCreatorBot:
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
         worker_key = f"{user_id}:{account_name}"
         temp_clients = []
+        progress_message = None
         try:
             async with self.worker_semaphore:
                 LOGGER.info(f"Worker for {worker_key} started.")
+                
+                start_time = datetime.now()
+                progress_message = await self.bot.send_message(user_id, f"🚀 Starting group creation for `{account_name}`...")
 
                 participant_clients_meta = []
                 participant_names = self.conversation_accounts.get(str(user_id), [])
@@ -898,23 +923,45 @@ class GroupCreatorBot:
                             await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
 
                         self._set_group_count(worker_key, current_semester)
-                        await self.bot.send_message(user_id, f"📊 [{account_name}] Group '{group_title}' created. ({i+1}/{Config.GROUPS_TO_CREATE})")
+                        
+                        # Calculate and update progress
+                        groups_done = i + 1
+                        elapsed_time = (datetime.now() - start_time).total_seconds()
+                        avg_time_per_group = elapsed_time / groups_done
+                        remaining_groups = Config.GROUPS_TO_CREATE - groups_done
+                        estimated_remaining_seconds = remaining_groups * avg_time_per_group
+                        eta_str = self._format_time_delta(estimated_remaining_seconds)
+                        
+                        try:
+                            await progress_message.edit(
+                                f"📊 [{account_name}] Group '{group_title}' created. "
+                                f"({groups_done}/{Config.GROUPS_TO_CREATE})\n\n"
+                                f"⏳ **Estimated time remaining:** {eta_str}"
+                            )
+                        except errors.MessageNotModifiedError:
+                            pass
+                        except Exception as e:
+                            LOGGER.warning(f"Could not edit progress message: {e}")
+
                         await asyncio.sleep(random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS))
 
                     except errors.AuthKeyUnregisteredError as e:
                         LOGGER.error(f"Auth key unregistered for '{account_name}'. Deleting session.")
                         sentry_sdk.capture_exception(e)
                         self.session_manager.delete_session_file(user_id, account_name)
-                        await self.bot.send_message(user_id, f"🚨 Session for `{account_name}` revoked. Account removed.")
+                        if progress_message: await progress_message.edit(f"🚨 Session for `{account_name}` revoked. Account removed.")
                         break
                     except Exception as e:
                         LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
                         sentry_sdk.capture_exception(e)
-                        await self.bot.send_message(user_id, "❌ Unexpected Error. Check logs.")
+                        if progress_message: await progress_message.edit("❌ Unexpected Error. Check logs.")
                         break
+                else: # This block runs if the for loop completes without a break
+                    if progress_message: await progress_message.edit(f"✅ [{account_name}] Finished creating {Config.GROUPS_TO_CREATE} groups.")
+
         except asyncio.CancelledError:
             LOGGER.info(f"Task for {worker_key} was cancelled.")
-            await self.bot.send_message(user_id, f"⏹️ Operation for `{account_name}` stopped.")
+            if progress_message: await progress_message.edit(f"⏹️ Operation for `{account_name}` stopped.")
         finally:
             LOGGER.info(f"Worker for {worker_key} finished. Disconnecting clients.")
             if worker_key in self.active_workers:

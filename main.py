@@ -6,12 +6,12 @@ import os
 import random
 import re
 import shutil
-import sys
 import traceback
 import uuid  # Added for generating random usernames
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import sys
 
 import httpx
 import sentry_sdk
@@ -35,7 +35,7 @@ from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Mess
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, # Changed to INFO for production
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("bot_activity.log"),
@@ -112,6 +112,15 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
 # --- Centralized Configuration ---
 class Config:
     """Holds all configurable values and UI strings for the bot."""
+    # Bot Settings
+    MAX_CONCURRENT_WORKERS = 5
+    GROUPS_TO_CREATE = 50
+    MIN_SLEEP_SECONDS = 300
+    MAX_SLEEP_SECONDS = 900
+    PROXY_FILE = "proxy.txt"
+    PROXY_TIMEOUT = 15
+    DAILY_MESSAGE_LIMIT_PER_GROUP = 20
+
     # --- UI Text & Buttons (All in Persian) ---
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
     BTN_SERVER_STATUS = "📊 وضعیت سرور"
@@ -274,8 +283,6 @@ class GroupCreatorBot:
         self.conversation_accounts_file = SESSIONS_DIR / "conversation_accounts.json"
         self.conversation_accounts = self._load_conversation_accounts()
         self.sticker_sets: Dict[str, Any] = {}
-        self.pending_code_change_file = SESSIONS_DIR / "pending_code_change.json"
-        self.pending_code_change = self._load_json_file(self.pending_code_change_file, None)
         try:
             fernet = Fernet(ENCRYPTION_KEY.encode())
             self.session_manager = session_manager(fernet, SESSIONS_DIR)
@@ -286,12 +293,12 @@ class GroupCreatorBot:
 
     def update_config_from_file(self):
         """Update runtime config attributes from the loaded JSON."""
-        self.max_workers = self.config.get("MAX_CONCURRENT_WORKERS", 5)
-        self.groups_to_create = self.config.get("GROUPS_TO_CREATE", 50)
-        self.min_sleep_seconds = self.config.get("MIN_SLEEP_SECONDS", 300)
-        self.max_sleep_seconds = self.config.get("MAX_SLEEP_SECONDS", 900)
-        self.proxy_timeout = self.config.get("PROXY_TIMEOUT", 15)
-        self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", 20)
+        self.max_workers = self.config.get("MAX_CONCURRENT_WORKERS", Config.MAX_CONCURRENT_WORKERS)
+        self.groups_to_create = self.config.get("GROUPS_TO_CREATE", Config.GROUPS_TO_CREATE)
+        self.min_sleep_seconds = self.config.get("MIN_SLEEP_SECONDS", Config.MIN_SLEEP_SECONDS)
+        self.max_sleep_seconds = self.config.get("MAX_SLEEP_SECONDS", Config.MAX_SLEEP_SECONDS)
+        self.proxy_timeout = self.config.get("PROXY_TIMEOUT", Config.PROXY_TIMEOUT)
+        self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", "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")
         self.ai_model = self.config.get("AI_MODEL", "moonshotai/kimi-k2:free")
@@ -482,22 +489,14 @@ class GroupCreatorBot:
     def _save_active_workers_state(self) -> None:
         self._save_json_file(self.active_workers_state, self.active_workers_file)
 
-    def _save_pending_change(self):
-        self._save_json_file({"code": self.pending_code_change}, self.pending_code_change_file)
-
-    def _clear_pending_change(self):
-        if self.pending_code_change_file.exists():
-            self.pending_code_change_file.unlink()
-        self.pending_code_change = None
-
     async def _broadcast_message(self, message_text: str):
         LOGGER.info(f"Broadcasting message to {len(self.known_users)} users.")
         for user_id in self.known_users:
             try:
                 await self.bot.send_message(user_id, message_text)
                 await asyncio.sleep(0.1)
-            except (errors.UserIsBlockedError, errors.InputUserDeactivatedError):
-                LOGGER.warning(f"User {user_id} has blocked the bot or is deactivated. Cannot send message.")
+            except (errors.UserIsBlockedError, errors.InputUserDeactivatedError, errors.rpcerrorlist.UserIsBotError):
+                LOGGER.warning(f"User {user_id} has blocked the bot, is deactivated, or is a bot. Cannot send message.")
             except Exception as e:
                 LOGGER.error(f"Error sending message to {user_id}: {e}")
 
@@ -1177,6 +1176,20 @@ class GroupCreatorBot:
         buttons = [[Button.text(key.split(":", 1)[1])] for key in active_conv_keys]
         buttons.append([Button.text(Config.BTN_BACK)])
         await event.reply(Config.MSG_PROMPT_STOP_FORCE_CONV, buttons=buttons)
+
+    async def _settings_handler(self, event: events.NewMessage.Event) -> None:
+        if event.sender_id != ADMIN_USER_ID:
+            return
+        
+        buttons = [
+            [Button.text("Set AI Model"), Button.text("Set API Key")],
+            [Button.text("Set Custom Prompt")],
+            [Button.text("Set Worker Limit"), Button.text("Set Group Count")],
+            [Button.text("Set Sleep Times"), Button.text("Set Daily Msg Limit")],
+            [Button.text("Set Proxy Timeout"), Button.text("Set Master Password")],
+            [Button.text("View Config"), Button.text(Config.BTN_BACK)]
+        ]
+        await event.reply("⚙️ **Admin Settings**", buttons=buttons)
 
     async def _admin_command_handler(self, event: events.NewMessage.Event) -> None:
         if event.sender_id != ADMIN_USER_ID:
@@ -2092,55 +2105,88 @@ class GroupCreatorBot:
         await self.on_login_success(event, user_client)
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
-        if event.sender_id != ADMIN_USER_ID:
+        user_id = event.sender_id
+        data = event.data.decode('utf-8')
+
+        if data.startswith("patch_"):
+            if user_id != ADMIN_USER_ID:
+                await event.answer("You are not authorized to do this.")
+                return
+            
+            # This is a simplified patching mechanism. In a real-world scenario,
+            # this would need to be much more robust.
+            try:
+                with open("main.py", "w") as f:
+                    f.write(self.suggested_code)
+                await event.edit("✅ Code patched. Restarting bot...")
+                await self.bot.disconnect()
+                os.execv(sys.executable, ['python'] + sys.argv)
+            except Exception as e:
+                await event.edit(f"❌ Failed to patch the code: {e}")
+            return
+
+        if user_id != ADMIN_USER_ID:
             await event.answer("You are not authorized to perform this action.")
             return
-        data = event.data.decode('utf-8')
+
         action, user_id_str = data.split('_')
-        user_id = int(user_id_str)
+        user_id_to_act_on = int(user_id_str)
         if action == "approve":
-            if user_id in self.pending_users:
-                self.pending_users.remove(user_id)
-                self.known_users.append(user_id)
+            if user_id_to_act_on in self.pending_users:
+                self.pending_users.remove(user_id_to_act_on)
+                self.known_users.append(user_id_to_act_on)
                 self._save_pending_users()
                 self._save_known_users()
-                await event.edit(f"✅ User `{user_id}` has been approved.")
-                await self.bot.send_message(user_id, Config.MSG_USER_APPROVED)
-                LOGGER.info(f"Admin approved user {user_id}.")
+                await event.edit(f"✅ User `{user_id_to_act_on}` has been approved.")
+                await self.bot.send_message(user_id_to_act_on, Config.MSG_USER_APPROVED)
+                LOGGER.info(f"Admin approved user {user_id_to_act_on}.")
             else:
-                await event.edit(f"⚠️ User `{user_id}` was not found in the pending list.")
+                await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
         elif action == "deny":
-            if user_id in self.pending_users:
-                self.pending_users.remove(user_id)
+            if user_id_to_act_on in self.pending_users:
+                self.pending_users.remove(user_id_to_act_on)
                 self._save_pending_users()
-                await event.edit(f"❌ User `{user_id}` has been denied.")
-                await self.bot.send_message(user_id, Config.MSG_USER_DENIED)
-                LOGGER.info(f"Admin denied user {user_id}.")
+                await event.edit(f"❌ User `{user_id_to_act_on}` has been denied.")
+                await self.bot.send_message(user_id_to_act_on, Config.MSG_USER_DENIED)
+                LOGGER.info(f"Admin denied user {user_id_to_act_on}.")
             else:
-                await event.edit(f"⚠️ User `{user_id}` was not found in the pending list.")
+                await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
 
-    async def _daily_conversation_scheduler(self):
+    async def _daily_feature_suggestion(self):
         while True:
-            await asyncio.sleep(3600)
-            now_ts = datetime.now().timestamp()
-            groups_to_simulate = []
-            for group_id, data in self.created_groups.items():
-                last_simulated_ts = data.get("last_simulated", 0)
-                if (now_ts - last_simulated_ts) > 86400:
-                    # Find the user_id from the worker key
-                    owner_worker_key = data.get("owner_worker_key")
-                    if owner_worker_key:
-                        owner_user_id_str = owner_worker_key.split(':', 1)[0]
-                        groups_to_simulate.append((int(group_id), int(owner_user_id_str)))
+            await asyncio.sleep(86400) # Run once a day
+            try:
+                with open(__file__, 'r') as f:
+                    current_code = f.read()
+                
+                prompt = (
+                    "Analyze the following Python code for a Telegram bot. "
+                    "Suggest one new feature or a refinement to an existing one. "
+                    "Provide a brief explanation and the code for the new feature. "
+                    "Format the response as a JSON object with 'suggestion' and 'code' keys."
+                )
+                
+                # This would be a call to your AI model
+                # For this example, we'll just simulate a response
+                simulated_response = {
+                    "suggestion": "Add a new admin command `/stats` to show detailed statistics about bot usage.",
+                    "code": "async def _stats_handler(self, event): ... "
+                }
+                
+                suggestion = simulated_response['suggestion']
+                code_suggestion = simulated_response['code']
+                
+                message = f"**💡 AI Feature Suggestion**\n\n{suggestion}\n\n" \
+                          f"Would you like to apply this change?\n\n" \
+                          f"```python\n{code_suggestion}\n```"
 
-            if not groups_to_simulate:
-                continue
-            LOGGER.info(f"Daily scheduler found {len(groups_to_simulate)} groups needing conversation simulation.")
-            for group_id, owner_id in groups_to_simulate:
-                asyncio.create_task(self._run_conversation_task(owner_id, group_id, num_messages=self.daily_message_limit))
-                self.created_groups[str(group_id)]["last_simulated"] = now_ts
-                await asyncio.sleep(5)
-            self._save_created_groups()
+                await self.bot.send_message(ADMIN_USER_ID, message, buttons=[
+                    [Button.inline("✅ Apply & Restart", data="patch_feature")],
+                    [Button.inline("❌ Ignore", data="ignore_feature")]
+                ])
+                self.suggested_code = current_code # Store the code to be patched
+            except Exception as e:
+                LOGGER.error(f"Failed to get daily feature suggestion: {e}")
 
     def register_handlers(self) -> None:
         self.bot.add_event_handler(self._start_handler, events.NewMessage(pattern='/start'))
@@ -2154,6 +2200,7 @@ class GroupCreatorBot:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service started successfully.")
             self.bot.loop.create_task(self._daily_conversation_scheduler())
+            self.bot.loop.create_task(self._daily_feature_suggestion())
             for worker_key, worker_data in self.active_workers_state.items():
                 user_id = worker_data["user_id"]
                 account_name = worker_data["account_name"]
@@ -2168,6 +2215,24 @@ class GroupCreatorBot:
             if self.known_users:
                 await self._broadcast_message("✅ Bot has started successfully and is now online.")
             await self.bot.run_until_disconnected()
+        except Exception as e:
+            LOGGER.critical(f"A critical error occurred in the main run loop: {e}", exc_info=True)
+            # AI-powered error analysis
+            with open(__file__, 'r') as f:
+                current_code = f.read()
+            error_traceback = traceback.format_exc()
+            
+            prompt = (
+                f"The following Python script for a Telegram bot crashed. "
+                f"Analyze the traceback and the source code to find the bug and suggest a fix.\n\n"
+                f"**Traceback:**\n{error_traceback}\n\n"
+                f"**Source Code:**\n```python\n{current_code}\n```\n\n"
+                f"Provide the fix as a complete, updated Python script inside a JSON object with a 'code' key."
+            )
+            # This would be a call to your AI model
+            # For this example, we'll just log it
+            LOGGER.info(f"AI analysis prompt for error:\n{prompt}")
+            
         finally:
             LOGGER.info("Bot service is shutting down. Disconnecting main bot client.")
             if self.bot.is_connected():
@@ -2176,4 +2241,7 @@ class GroupCreatorBot:
 
 if __name__ == "__main__":
     bot_instance = GroupCreatorBot(SessionManager)
-    asyncio.run(bot_instance.run())
+    try:
+        asyncio.run(bot_instance.run())
+    except Exception as e:
+        LOGGER.critical("Bot crashed at the top level.", exc_info=True)

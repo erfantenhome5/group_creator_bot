@@ -6,6 +6,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import traceback
 import uuid  # Added for generating random usernames
 from datetime import datetime, timedelta
@@ -34,7 +35,7 @@ from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Mess
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO, # Changed to INFO for production
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("bot_activity.log"),
@@ -51,8 +52,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
-MASTER_PASSWORD_HASH = os.getenv("MASTER_PASSWORD_HASH")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY, ADMIN_USER_ID]):
@@ -113,19 +112,11 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
 # --- Centralized Configuration ---
 class Config:
     """Holds all configurable values and UI strings for the bot."""
-    # Bot Settings
-    MAX_CONCURRENT_WORKERS = 5
-    GROUPS_TO_CREATE = 50
-    MIN_SLEEP_SECONDS = 300
-    MAX_SLEEP_SECONDS = 900
-    PROXY_FILE = "proxy.txt"
-    PROXY_TIMEOUT = 15
-    DAILY_MESSAGE_LIMIT_PER_GROUP = 20
-
     # --- UI Text & Buttons (All in Persian) ---
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
     BTN_SERVER_STATUS = "📊 وضعیت سرور"
     BTN_HELP = "ℹ️ راهنما"
+    BTN_SETTINGS = "⚙️ تنظیمات"
     BTN_ADD_ACCOUNT = "➕ افزودن حساب (API)"
     BTN_ADD_ACCOUNT_SELENIUM = "✨ افزودن حساب (مرورگر امن)"
     BTN_BACK = "⬅️ بازگشت"
@@ -252,13 +243,18 @@ class GroupCreatorBot:
         self.user_sessions: Dict[int, Dict[str, Any]] = {}
         self.active_workers: Dict[str, asyncio.Task] = {}
         self.active_conversations: Dict[str, asyncio.Task] = {}
-        self.max_workers = Config.MAX_CONCURRENT_WORKERS
-        self.worker_semaphore = asyncio.Semaphore(self.max_workers)
+        
+        self.config_file = SESSIONS_DIR / "config.json"
+        self.config = self._load_json_file(self.config_file, {})
+        self.update_config_from_file()
+
+        self.worker_semaphore = asyncio.Semaphore(self.config.get("MAX_CONCURRENT_WORKERS", 5))
+        
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
         self.daily_counts_file = SESSIONS_DIR / "daily_counts.json"
         self.daily_counts = self._load_daily_counts()
-        self.proxies = load_proxies_from_file(Config.PROXY_FILE)
+        self.proxies = load_proxies_from_file(self.config.get("PROXY_FILE", "proxy.txt"))
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
         self.known_users_file = SESSIONS_DIR / "known_users.json"
@@ -278,6 +274,8 @@ class GroupCreatorBot:
         self.conversation_accounts_file = SESSIONS_DIR / "conversation_accounts.json"
         self.conversation_accounts = self._load_conversation_accounts()
         self.sticker_sets: Dict[str, Any] = {}
+        self.pending_code_change_file = SESSIONS_DIR / "pending_code_change.json"
+        self.pending_code_change = self._load_json_file(self.pending_code_change_file, None)
         try:
             fernet = Fernet(ENCRYPTION_KEY.encode())
             self.session_manager = session_manager(fernet, SESSIONS_DIR)
@@ -286,8 +284,22 @@ class GroupCreatorBot:
 
         self._initialize_sentry()
 
+    def update_config_from_file(self):
+        """Update runtime config attributes from the loaded JSON."""
+        self.max_workers = self.config.get("MAX_CONCURRENT_WORKERS", 5)
+        self.groups_to_create = self.config.get("GROUPS_TO_CREATE", 50)
+        self.min_sleep_seconds = self.config.get("MIN_SLEEP_SECONDS", 300)
+        self.max_sleep_seconds = self.config.get("MAX_SLEEP_SECONDS", 900)
+        self.proxy_timeout = self.config.get("PROXY_TIMEOUT", 15)
+        self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", 20)
+        self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
+        self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", "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")
+        self.ai_model = self.config.get("AI_MODEL", "moonshotai/kimi-k2:free")
+        self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
+
     def _initialize_sentry(self):
-        if not SENTRY_DSN:
+        sentry_dsn = self.config.get("SENTRY_DSN", SENTRY_DSN)
+        if not sentry_dsn:
             return
 
         def before_send_hook(event: Event, hint: Hint) -> Optional[Event]:
@@ -312,7 +324,7 @@ class GroupCreatorBot:
         )
 
         sentry_options = {
-            "dsn": SENTRY_DSN,
+            "dsn": sentry_dsn,
             "integrations": [sentry_logging],
             "traces_sample_rate": 1.0,
             "before_send": before_send_hook,
@@ -470,6 +482,14 @@ class GroupCreatorBot:
     def _save_active_workers_state(self) -> None:
         self._save_json_file(self.active_workers_state, self.active_workers_file)
 
+    def _save_pending_change(self):
+        self._save_json_file({"code": self.pending_code_change}, self.pending_code_change_file)
+
+    def _clear_pending_change(self):
+        if self.pending_code_change_file.exists():
+            self.pending_code_change_file.unlink()
+        self.pending_code_change = None
+
     async def _broadcast_message(self, message_text: str):
         LOGGER.info(f"Broadcasting message to {len(self.known_users)} users.")
         for user_id in self.known_users:
@@ -488,7 +508,7 @@ class GroupCreatorBot:
         try:
             proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy"
             LOGGER.debug(f"Attempting login connection {proxy_info}")
-            client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
+            client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
             client.parse_mode = CustomMarkdown() # Apply custom parser
             await client.connect()
             return client
@@ -501,7 +521,7 @@ class GroupCreatorBot:
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
 
         client = TelegramClient(
-            session, API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT,
+            session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout,
             device_model=device_params['device_model'], system_version=device_params['system_version']
         )
         client.parse_mode = CustomMarkdown() # Apply custom parser
@@ -547,6 +567,7 @@ class GroupCreatorBot:
             [Button.text(Config.BTN_SET_KEYWORDS), Button.text(Config.BTN_SET_CONVERSATION_ACCOUNTS)],
             [Button.text(Config.BTN_SET_STICKERS)],
             [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)],
+            [Button.text(Config.BTN_SETTINGS)]
         ]
 
     def _build_accounts_menu(self, user_id: int) -> List[List[Button]]:
@@ -624,75 +645,72 @@ class GroupCreatorBot:
         return random.choice(documents) if documents else None
 
     async def _generate_persian_messages(self, user_id: int, prompt_override: Optional[str] = None) -> List[str]:
-        if not GEMINI_API_KEY:
-            LOGGER.warning("GEMINI_API_KEY not set. Skipping message generation.")
+        if not self.openrouter_api_key:
+            LOGGER.warning("OPENROUTER_API_KEY not set. Skipping message generation.")
             return []
 
         if prompt_override:
-            prompt = (
-                f"با توجه به این پیام: '{prompt_override}'. یک پاسخ کوتاه و مرتبط به زبان فارسی بنویس. "
-                "گاهی اوقات، از سینتکس ||کلمه یا عبارت|| برای مخفی کردن (اسپویلر) بخشی از متن استفاده کن."
-            )
+            prompt = prompt_override
         else:
             keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
-            prompt = (
-                f"یک عبارت کوتاه و جذاب برای شروع گفتگو به زبان فارسی ایجاد کن. "
-                f"این عبارت باید درباره این موضوعات باشد: {', '.join(keywords)}. "
+            base_prompt = self.custom_prompt or (
+                "یک عبارت کوتاه و جذاب برای شروع گفتگو به زبان فارسی ایجاد کن. "
+                "این عبارت باید درباره این موضوعات باشد: {keywords}. "
                 "مثال: 'موفقیت مثل یک سفر است، نه یک مقصد. اولین قدم شما چیست؟'"
             )
+            prompt = base_prompt.format(keywords=', '.join(keywords))
 
-        models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash"]
-        headers = {'Content-Type': 'application/json'}
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "model": self.ai_model,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        api_url = "https://openrouter.ai/api/v1/chat/completions"
 
-        # Prepare proxy for httpx if available
         proxy_url = None
         if self.proxies:
             proxy_info = random.choice(self.proxies)
             proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}"
-            LOGGER.info(f"Using proxy {proxy_url} for Gemini API request.")
+            LOGGER.info(f"Using proxy {proxy_url} for OpenRouter API request.")
         else:
-            LOGGER.warning("No proxies configured. Making direct request to Gemini API.")
+            LOGGER.warning("No proxies configured. Making direct request to OpenRouter API.")
+        
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(proxy=proxy_url, timeout=40.0) as client:
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    response = await client.post(api_url, json=data, headers=headers)
+                    response.raise_for_status()
+                    res_json = response.json()
 
-        for model in models_to_try:
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            LOGGER.info(f"Attempting to generate message from Gemini using model: {model}.")
-            
-            for attempt in range(3): # Retry up to 3 times for rate limiting
-                try:
-                    async with httpx.AsyncClient(proxy=proxy_url, timeout=40.0) as client:
-                        # Add a small random delay to avoid hitting rate limits too quickly
-                        await asyncio.sleep(random.uniform(0.5, 1.5))
-                        response = await client.post(api_url, json=payload, headers=headers)
-                        response.raise_for_status()
-                        data = response.json()
-
-                        if data.get("candidates") and data["candidates"][0].get("content", {}).get("parts"):
-                            message = data["candidates"][0]["content"]["parts"][0]["text"]
-                            LOGGER.info(f"Successfully generated message from Gemini using {model}.")
-                            return [message.strip()]
-                        else:
-                            LOGGER.warning(f"Unexpected Gemini API response structure from {model}: {data}")
-                            break # Don't retry if the structure is wrong
-
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 429:
-                        LOGGER.warning(f"Rate limit hit with model {model}. Attempt {attempt + 1}/3. Retrying after a delay...")
-                        if attempt < 2:
-                            await asyncio.sleep(random.uniform(1, 3)) # Wait 1-3 seconds before retrying
-                        else:
-                            LOGGER.error(f"Failed to generate message after 3 attempts due to rate limiting with {model}.")
-                            break # Move to the next model
+                    if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
+                        message = res_json["choices"][0]["message"]["content"]
+                        LOGGER.info(f"Successfully generated message from OpenRouter using {self.ai_model}.")
+                        return [message.strip()]
                     else:
-                        LOGGER.error(f"HTTP error with model {model}: {e}. Trying next model.")
-                        sentry_sdk.capture_exception(e)
-                        break # Try the next model on other HTTP errors
-                except Exception as e:
-                    LOGGER.error(f"An unexpected error occurred during message generation with {model}: {e}.")
-                    sentry_sdk.capture_exception(e)
-                    break # Try the next model
+                        LOGGER.warning(f"Unexpected OpenRouter API response structure: {res_json}")
+                        return []
 
-        LOGGER.error("Failed to generate message from Gemini after trying all available models.")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    LOGGER.warning(f"Rate limit hit with model {self.ai_model}. Attempt {attempt + 1}/3. Retrying after a delay...")
+                    if attempt < 2:
+                        await asyncio.sleep(random.uniform(2, 5))
+                    else:
+                        LOGGER.error(f"Failed to generate message after 3 attempts due to rate limiting.")
+                else:
+                    LOGGER.error(f"HTTP error with model {self.ai_model}: {e}", exc_info=True)
+                    sentry_sdk.capture_exception(e)
+                    break
+            except Exception as e:
+                LOGGER.error(f"An unexpected error occurred during message generation with {self.ai_model}: {e}", exc_info=True)
+                sentry_sdk.capture_exception(e)
+                break
+        
+        LOGGER.error("Failed to generate message from OpenRouter.")
         return []
 
     async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 1) -> bool:
@@ -737,11 +755,11 @@ class GroupCreatorBot:
 
         # Make a mutable copy of the list to allow removing problematic clients
         active_clients_meta = list(clients_with_meta)
-        emojis = ["😊", "👍", "�", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
+        emojis = ["😊", "👍", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
 
         try:
             # 1. Kick-off message
-            if self._get_daily_count_for_group(group_id) >= Config.DAILY_MESSAGE_LIMIT_PER_GROUP:
+            if self._get_daily_count_for_group(group_id) >= self.daily_message_limit:
                 LOGGER.info(f"Daily message limit for group {group_id} reached. Skipping conversation.")
                 return
 
@@ -768,7 +786,7 @@ class GroupCreatorBot:
             messages_sent_this_session = 1
 
             # 2. Main reply loop
-            while self._get_daily_count_for_group(group_id) < Config.DAILY_MESSAGE_LIMIT_PER_GROUP and messages_sent_this_session < num_messages:
+            while self._get_daily_count_for_group(group_id) < self.daily_message_limit and messages_sent_this_session < num_messages:
                 await asyncio.sleep(random.uniform(3, 8))
 
                 last_sender_id = last_message.sender_id
@@ -866,7 +884,7 @@ class GroupCreatorBot:
                 u_account_name = me.first_name or me.username or f"ID:{me.id}"
                 all_clients_meta = [{'client': user_client, 'user_id': user_id, 'account_id': me.id, 'account_name': u_account_name}] + participant_clients_meta
 
-                for i in range(Config.GROUPS_TO_CREATE):
+                for i in range(self.groups_to_create):
                     try:
                         current_semester = self._get_group_count(worker_key) + 1
                         group_title = f"collage Semester {current_semester}"
@@ -919,7 +937,7 @@ class GroupCreatorBot:
                         if len(successful_clients_meta) < 2:
                              LOGGER.warning(f"Not enough clients ({len(successful_clients_meta)}) could cache the group. Aborting conversation for group {new_supergroup.id}.")
                         else:
-                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
+                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=self.daily_message_limit)
 
                         self._set_group_count(worker_key, current_semester)
                         
@@ -927,14 +945,14 @@ class GroupCreatorBot:
                         groups_done = i + 1
                         elapsed_time = (datetime.now() - start_time).total_seconds()
                         avg_time_per_group = elapsed_time / groups_done
-                        remaining_groups = Config.GROUPS_TO_CREATE - groups_done
+                        remaining_groups = self.groups_to_create - groups_done
                         estimated_remaining_seconds = remaining_groups * avg_time_per_group
                         eta_str = self._format_time_delta(estimated_remaining_seconds)
                         
                         try:
                             await progress_message.edit(
                                 f"📊 [{account_name}] Group '{group_title}' created. "
-                                f"({groups_done}/{Config.GROUPS_TO_CREATE})\n\n"
+                                f"({groups_done}/{self.groups_to_create})\n\n"
                                 f"⏳ **Estimated time remaining:** {eta_str}"
                             )
                         except errors.MessageNotModifiedError:
@@ -942,7 +960,7 @@ class GroupCreatorBot:
                         except Exception as e:
                             LOGGER.warning(f"Could not edit progress message: {e}")
 
-                        await asyncio.sleep(random.randint(Config.MIN_SLEEP_SECONDS, Config.MAX_SLEEP_SECONDS))
+                        await asyncio.sleep(random.randint(self.min_sleep_seconds, self.max_sleep_seconds))
 
                     except errors.AuthKeyUnregisteredError as e:
                         LOGGER.error(f"Auth key unregistered for '{account_name}'. Deleting session.")
@@ -956,7 +974,7 @@ class GroupCreatorBot:
                         if progress_message: await progress_message.edit("❌ Unexpected Error. Check logs.")
                         break
                 else: # This block runs if the for loop completes without a break
-                    if progress_message: await progress_message.edit(f"✅ [{account_name}] Finished creating {Config.GROUPS_TO_CREATE} groups.")
+                    if progress_message: await progress_message.edit(f"✅ [{account_name}] Finished creating {self.groups_to_create} groups.")
 
         except asyncio.CancelledError:
             LOGGER.info(f"Task for {worker_key} was cancelled.")
@@ -1171,7 +1189,7 @@ class GroupCreatorBot:
         pre_approve_match = re.match(r"/pre_approve (\d+)", text)
         ban_match = re.match(r"/ban (\d+)", text)
         unban_match = re.match(r"/unban (\d+)", text)
-        set_limit_match = re.match(r"/set_worker_limit (\d+)", text)
+        set_config_match = re.match(r"/set_config (\w+) (.*)", text, re.DOTALL)
         terminate_match = re.match(r"/terminate_worker (.*)", text)
         restart_match = re.match(r"/restart_worker (.*)", text)
 
@@ -1181,8 +1199,8 @@ class GroupCreatorBot:
             await self._ban_user_handler(event, int(ban_match.group(1)))
         elif unban_match:
             await self._unban_user_handler(event, int(unban_match.group(1)))
-        elif set_limit_match:
-            await self._set_worker_limit_handler(event, int(set_limit_match.group(1)))
+        elif set_config_match:
+            await self._set_config_handler(event, set_config_match.group(1), set_config_match.group(2))
         elif terminate_match:
             await self._terminate_worker_handler(event, terminate_match.group(1))
         elif restart_match:
@@ -1196,6 +1214,8 @@ class GroupCreatorBot:
             await self._list_groups_handler(event)
         elif text == "/list_conv_accounts":
             await self._list_conv_accounts_handler(event)
+        elif text == "/view_config":
+            await self._view_config_handler(event)
         elif text == "/debug_proxies":
             await self._debug_test_proxies_handler(event)
         elif text == "/clean_sessions":
@@ -1246,13 +1266,30 @@ class GroupCreatorBot:
         )
         await event.reply(message)
 
-    async def _set_worker_limit_handler(self, event: events.NewMessage.Event, limit: int):
-        if limit > 0:
-            self.max_workers = limit
+    async def _set_config_handler(self, event: events.NewMessage.Event, key: str, value: str):
+        key = key.upper()
+        # Try to convert to number if possible
+        try:
+            if '.' in value:
+                value = float(value)
+            else:
+                value = int(value)
+        except ValueError:
+            pass # Keep as string
+        
+        self.config[key] = value
+        self._save_json_file(self.config, self.config_file)
+        self.update_config_from_file() # Reload config into memory
+        
+        if key == "MAX_CONCURRENT_WORKERS":
             self.worker_semaphore = asyncio.Semaphore(self.max_workers)
-            await event.reply(f"✅ Max concurrent workers set to `{limit}`.")
-        else:
-            await event.reply("❌ Please provide a positive number for the limit.")
+
+        await event.reply(f"✅ Config key `{key}` has been set to `{value}`.")
+
+    async def _view_config_handler(self, event: events.NewMessage.Event):
+        config_str = json.dumps(self.config, indent=2)
+        message = f"**🔧 Current Configuration**\n\n```json\n{config_str}\n```"
+        await event.reply(message)
 
     async def _terminate_worker_handler(self, event: events.NewMessage.Event, worker_key: str):
         if worker_key in self.active_workers:
@@ -1347,7 +1384,7 @@ class GroupCreatorBot:
             try:
                 device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
                 LOGGER.debug(f"Testing proxy: {proxy['addr']} with device: {device_params}")
-                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=Config.PROXY_TIMEOUT, **device_params)
+                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
                 await client.connect()
                 if client.is_connected():
                     LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
@@ -1361,7 +1398,7 @@ class GroupCreatorBot:
         try:
             device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
             LOGGER.debug(f"Testing direct connection with device: {device_params}")
-            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=Config.PROXY_TIMEOUT, **device_params)
+            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=self.proxy_timeout, **device_params)
             await client.connect()
             if client.is_connected():
                 LOGGER.info("  ✅ SUCCESS: Direct Connection")
@@ -1538,6 +1575,7 @@ class GroupCreatorBot:
             Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
             Config.BTN_HELP: self._help_handler,
             Config.BTN_BACK: self._start_handler,
+            Config.BTN_SETTINGS: self._settings_handler,
             Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
@@ -1664,7 +1702,7 @@ class GroupCreatorBot:
             await event.reply(Config.MSG_WELCOME, buttons=self._build_main_menu())
             return
         hashed_input = hashlib.sha256(event.message.text.strip().encode()).hexdigest()
-        if hashed_input == MASTER_PASSWORD_HASH:
+        if hashed_input == self.master_password_hash:
             if user_id not in self.pending_users:
                 self.pending_users.append(user_id)
                 self._save_pending_users()
@@ -2099,7 +2137,7 @@ class GroupCreatorBot:
                 continue
             LOGGER.info(f"Daily scheduler found {len(groups_to_simulate)} groups needing conversation simulation.")
             for group_id, owner_id in groups_to_simulate:
-                asyncio.create_task(self._run_conversation_task(owner_id, group_id, num_messages=Config.DAILY_MESSAGE_LIMIT_PER_GROUP))
+                asyncio.create_task(self._run_conversation_task(owner_id, group_id, num_messages=self.daily_message_limit))
                 self.created_groups[str(group_id)]["last_simulated"] = now_ts
                 await asyncio.sleep(5)
             self._save_created_groups()

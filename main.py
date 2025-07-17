@@ -22,13 +22,15 @@ from telethon import Button, TelegramClient, errors, events, types
 from telethon.extensions import markdown
 from telethon.sessions import StringSession
 from telethon.tl import functions
-from telethon.tl.functions.channels import CreateChannelRequest, InviteToChannelRequest
-from telethon.tl.functions.messages import (GetAllStickersRequest,
+from telethon.tl.functions.channels import (CreateChannelRequest, GetParticipantRequest,
+                                            InviteToChannelRequest)
+from telethon.tl.functions.messages import (ExportChatInviteRequest,
+                                            GetAllStickersRequest,
                                             GetStickerSetRequest,
                                             ImportChatInviteRequest,
                                             SendReactionRequest)
-from telethon.tl.types import (InputStickerSetID, Message, PeerChannel,
-                               ReactionEmoji)
+from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Message,
+                               PeerChannel, ReactionEmoji)
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
@@ -113,11 +115,12 @@ class Config:
     """Holds all configurable values and UI strings for the bot."""
     # Bot Settings
     MAX_CONCURRENT_WORKERS = 5
-    GROUPS_TO_CREATE = 5
+    GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 300
     MAX_SLEEP_SECONDS = 900
     PROXY_FILE = "proxy.txt"
     PROXY_TIMEOUT = 15
+    DAILY_MESSAGE_LIMIT_PER_GROUP = 20
 
     # --- UI Text & Buttons (All in Persian) ---
     BTN_MANAGE_ACCOUNTS = "👤 مدیریت حساب‌ها"
@@ -130,9 +133,12 @@ class Config:
     BTN_STOP_PREFIX = "⏹️ توقف برای"
     BTN_DELETE_PREFIX = "🗑️ حذف"
     BTN_SET_KEYWORDS = "📝 تنظیم کلمات کلیدی AI"
+    BTN_SET_STICKERS = "🎨 تنظیم استیکرها"
     BTN_SET_CONVERSATION_ACCOUNTS = "🗣️ تنظیم حساب‌های گفتگو"
     BTN_JOIN_VIA_LINK = "🔗 عضویت با لینک"
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
+    BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
+    BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -151,8 +157,14 @@ class Config:
         "یکی از حساب‌های خود را با استفاده از لینک دعوت در یک یا چند گروه/کانال عضو کنید.\n\n"
         f"**{BTN_EXPORT_LINKS}**\n"
         "لینک‌های دعوت تمام گروه‌هایی که توسط یک حساب خاص ساخته شده را دریافت کنید.\n\n"
+        f"**{BTN_FORCE_CONVERSATION}**\n"
+        "مکالمه را به صورت دستی در تمام گروه‌های ساخته شده توسط یک حساب خاص فعال کنید.\n\n"
+        f"**{BTN_STOP_FORCE_CONVERSATION}**\n"
+        "یک مکالمه دستی در حال اجرا را متوقف کنید.\n\n"
         f"**{BTN_SET_KEYWORDS}**\n"
         "کلمات کلیدی مورد نظر خود را برای تولید محتوای هوش مصنوعی تنظیم کنید.\n\n"
+        f"**{BTN_SET_STICKERS}**\n"
+        "بسته‌های استیکر مورد علاقه خود را برای استفاده در گفتگوها تنظیم کنید.\n\n"
         f"**{BTN_SET_CONVERSATION_ACCOUNTS}**\n"
         "حساب‌هایی که باید در گروه‌های جدید به گفتگو بپردازند را مشخص کنید.\n\n"
         f"**{BTN_SERVER_STATUS}**\n"
@@ -163,6 +175,8 @@ class Config:
     MSG_BROWSER_RUNNING = "⏳ در حال آماده‌سازی مرورگر امن... این کار ممکن است چند لحظه طول بکشد."
     MSG_PROMPT_KEYWORDS = "📝 لطفاً کلمات کلیدی مورد نظر خود را برای تولید محتوای هوش مصنوعی وارد کنید. کلمات را با کاما (,) از هم جدا کنید.\n\nمثال: موفقیت, بازاریابی, ارز دیجیتال, فروش آنلاین"
     MSG_KEYWORDS_SET = "✅ کلمات کلیدی شما با موفقیت ذخیره شد."
+    MSG_PROMPT_STICKERS = "🎨 لطفاً نام کوتاه یک یا چند بسته استیکر را وارد کنید. نام‌ها را با کاما (,) از هم جدا کنید.\n\nمثال: AnimatedStickers, Cats"
+    MSG_STICKERS_SET = "✅ بسته‌های استیکر شما با موفقیت ذخیره شد."
     MSG_PROMPT_CONVERSATION_ACCOUNTS = "🗣️ لطفاً نام مستعار حساب‌هایی که می‌خواهید در گفتگوها شرکت کنند را وارد کنید. نام‌ها را با کاما (,) از هم جدا کنید.\n\nاین حساب‌ها در گروه‌های جدید ساخته شده با یکدیگر گفتگو خواهند کرد. برای غیرفعال کردن این ویژگی، این بخش را خالی بگذارید."
     MSG_CONVERSATION_ACCOUNTS_SET = "✅ حساب‌های گفتگو با موفقیت ذخیره شدند."
     MSG_AWAITING_APPROVAL = "⏳ درخواست دسترسی شما برای ادمین ارسال شد. لطفاً منتظر تایید بمانید."
@@ -170,11 +184,18 @@ class Config:
     MSG_USER_DENIED = "❌ متاسفانه درخواست دسترسی شما رد شد."
     MSG_PROMPT_JOIN_ACCOUNT = "👤 لطفاً حسابی که می‌خواهید با آن عضو شوید را انتخاب کنید:"
     MSG_PROMPT_EXPORT_ACCOUNT = "📤 لطفاً حسابی که می‌خواهید لینک‌های آن را استخراج کنید، انتخاب نمایید:"
+    MSG_PROMPT_FORCE_CONV_ACCOUNT = "💬 لطفاً حسابی که گروه‌ها را ساخته است، انتخاب کنید تا مکالمه در آنها فعال شود:"
+    MSG_PROMPT_NUM_MESSAGES = "🔢 لطفاً تعداد پیام‌هایی که می‌خواهید ارسال شود را وارد کنید (مثلاً: 20):"
+    MSG_PROMPT_STOP_FORCE_CONV = "⛔️ کدام مکالمه دستی را می‌خواهید متوقف کنید؟"
+    MSG_NO_ACTIVE_FORCE_CONV = "ℹ️ در حال حاضر هیچ مکالمه دستی فعالی وجود ندارد."
     MSG_PROMPT_JOIN_LINK_MULTIPLE = "🔗 لطفاً یک یا چند لینک دعوت را ارسال کنید. هر لینک را در یک خط جدید وارد کنید:"
     MSG_JOIN_SUMMARY = "🏁 **گزارش عضویت برای `{account_name}`:**\n\n✅ **موفق:** {success_count}\n❌ **ناموفق:** {fail_count}\n\n{fail_details}"
     MSG_EXPORTING_LINKS = "⏳ در حال استخراج لینک‌های دعوت برای حساب `{account_name}`... این عملیات ممکن است کمی طول بکشد."
     MSG_EXPORT_SUCCESS = "✅ لینک‌های دعوت با موفقیت استخراج شدند و در فایل زیر برای شما ارسال شد."
     MSG_EXPORT_FAIL = "❌ خطایی در استخراج لینک‌ها رخ داد یا این حساب گروهی نساخته است."
+    MSG_FORCE_CONV_STARTED = "✅ فعال‌سازی مکالمه در {count} گروه متعلق به `{account_name}` آغاز شد."
+    MSG_FORCE_CONV_STOPPED = "✅ مکالمه دستی برای حساب `{account_name}` متوقف شد."
+    MSG_FORCE_CONV_NO_GROUPS = "ℹ️ هیچ گروهی برای فعال‌سازی مکالمه توسط حساب `{account_name}` یافت نشد."
 
 
 class SessionManager:
@@ -230,14 +251,20 @@ class GroupCreatorBot:
         self.bot = TelegramClient('bot_session', API_ID, API_HASH)
         self.user_sessions: Dict[int, Dict[str, Any]] = {}
         self.active_workers: Dict[str, asyncio.Task] = {}
-        self.worker_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_WORKERS)
+        self.active_conversations: Dict[str, asyncio.Task] = {}
+        self.max_workers = Config.MAX_CONCURRENT_WORKERS
+        self.worker_semaphore = asyncio.Semaphore(self.max_workers)
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
+        self.daily_counts_file = SESSIONS_DIR / "daily_counts.json"
+        self.daily_counts = self._load_daily_counts()
         self.proxies = load_proxies_from_file(Config.PROXY_FILE)
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
         self.known_users_file = SESSIONS_DIR / "known_users.json"
         self.known_users = self._load_known_users()
+        self.banned_users_file = SESSIONS_DIR / "banned_users.json"
+        self.banned_users = self._load_banned_users()
         self.pending_users_file = SESSIONS_DIR / "pending_users.json"
         self.pending_users = self._load_pending_users()
         self.created_groups_file = SESSIONS_DIR / "created_groups.json"
@@ -246,8 +273,11 @@ class GroupCreatorBot:
         self.active_workers_state = self._load_active_workers_state()
         self.keywords_file = SESSIONS_DIR / "keywords.json"
         self.user_keywords = self._load_user_keywords()
+        self.user_sticker_packs_file = SESSIONS_DIR / "user_sticker_packs.json"
+        self.user_sticker_packs = self._load_user_sticker_packs()
         self.conversation_accounts_file = SESSIONS_DIR / "conversation_accounts.json"
         self.conversation_accounts = self._load_conversation_accounts()
+        self.sticker_sets: Dict[str, Any] = {}
         try:
             fernet = Fernet(ENCRYPTION_KEY.encode())
             self.session_manager = session_manager(fernet, SESSIONS_DIR)
@@ -357,11 +387,46 @@ class GroupCreatorBot:
     def _save_group_counts(self) -> None:
         self._save_json_file(self.group_counts, self.counts_file)
 
+    def _load_banned_users(self) -> List[int]:
+        return self._load_json_file(self.banned_users_file, [])
+
+    def _save_banned_users(self) -> None:
+        self._save_json_file(self.banned_users, self.banned_users_file)
+
+    def _load_daily_counts(self) -> Dict[str, Any]:
+        today_str = str(datetime.utcnow().date())
+        data = self._load_json_file(self.daily_counts_file, {"date": today_str, "groups": {}})
+        if data.get("date") != today_str:
+            LOGGER.info("New day detected, resetting daily message counts for all groups.")
+            data = {"date": today_str, "groups": {}}
+            self._save_json_file(data, self.daily_counts_file)
+        return data
+
+    def _get_daily_count_for_group(self, group_id: int) -> int:
+        today_str = str(datetime.utcnow().date())
+        if self.daily_counts.get("date") != today_str:
+            self.daily_counts = self._load_daily_counts()
+        return self.daily_counts.get("groups", {}).get(str(group_id), 0)
+
+    def _increment_daily_count_for_group(self, group_id: int):
+        count = self._get_daily_count_for_group(group_id)
+        group_id_str = str(group_id)
+        if "groups" not in self.daily_counts:
+            self.daily_counts["groups"] = {}
+        self.daily_counts["groups"][group_id_str] = count + 1
+        self._save_json_file(self.daily_counts, self.daily_counts_file)
+
     def _load_user_keywords(self) -> Dict[str, List[str]]:
         return self._load_json_file(self.keywords_file, {})
 
     def _save_user_keywords(self) -> None:
         self._save_json_file(self.user_keywords, self.keywords_file)
+
+    def _load_user_sticker_packs(self) -> Dict[str, List[str]]:
+        return self._load_json_file(self.user_sticker_packs_file, {})
+
+    def _save_user_sticker_packs(self) -> None:
+        self._save_json_file(self.user_sticker_packs, self.user_sticker_packs_file)
 
     def _load_conversation_accounts(self) -> Dict[str, List[str]]:
         return self._load_json_file(self.conversation_accounts_file, {})
@@ -478,7 +543,9 @@ class GroupCreatorBot:
         return [
             [Button.text(Config.BTN_MANAGE_ACCOUNTS), Button.text(Config.BTN_JOIN_VIA_LINK)],
             [Button.text(Config.BTN_EXPORT_LINKS)],
+            [Button.text(Config.BTN_FORCE_CONVERSATION), Button.text(Config.BTN_STOP_FORCE_CONVERSATION)],
             [Button.text(Config.BTN_SET_KEYWORDS), Button.text(Config.BTN_SET_CONVERSATION_ACCOUNTS)],
+            [Button.text(Config.BTN_SET_STICKERS)],
             [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)],
         ]
 
@@ -508,149 +575,234 @@ class GroupCreatorBot:
         """Converts ||spoiler|| syntax to [spoiler](spoiler) for custom markdown."""
         return re.sub(r'\|\|(.*?)\|\|', r'[\1](spoiler)', text)
 
-    async def _generate_persian_messages(self, user_id: int) -> List[str]:
+    async def _get_random_sticker(self, client: TelegramClient, user_id: int) -> Optional[types.Document]:
+        """Gets a random sticker from one of the user's configured sticker packs."""
+        user_sticker_packs = self.user_sticker_packs.get(str(user_id))
+        if not user_sticker_packs:
+            return None
+
+        pack_name_to_use = random.choice(user_sticker_packs)
+
+        if pack_name_to_use not in self.sticker_sets:
+            try:
+                LOGGER.info(f"Loading sticker set '{pack_name_to_use}' for the first time for user {user_id}.")
+                sticker_set = await client(GetStickerSetRequest(
+                    stickerset=InputStickerSetShortName(short_name=pack_name_to_use),
+                    hash=0
+                ))
+                self.sticker_sets[pack_name_to_use] = sticker_set.documents
+            except Exception as e:
+                LOGGER.error(f"Could not load sticker set '{pack_name_to_use}' for user {user_id}: {e}")
+                if str(user_id) in self.user_sticker_packs and pack_name_to_use in self.user_sticker_packs[str(user_id)]:
+                    self.user_sticker_packs[str(user_id)].remove(pack_name_to_use)
+                    self._save_user_sticker_packs()
+                return None
+
+        documents = self.sticker_sets.get(pack_name_to_use)
+        return random.choice(documents) if documents else None
+
+    async def _generate_persian_messages(self, user_id: int, prompt_override: Optional[str] = None) -> List[str]:
         if not GEMINI_API_KEY:
             LOGGER.warning("GEMINI_API_KEY not set. Skipping message generation.")
             return []
 
-        keywords = self.user_keywords.get(str(user_id), ["زندگی", "خدا", "موفقیت"])
-        prompt = (
-            f"ایجاد ۲۰ پیام یا نقل قول منحصر به فرد و عمیق به زبان فارسی. "
-            f"این پیام‌ها باید درباره این موضوعات باشند: {', '.join(keywords)}. "
-            "گاهی اوقات، از سینتکس ||کلمه یا عبارت|| برای مخفی کردن (اسپویلر) بخشی از متن استفاده کن. "
-            "لطفا پاسخ را در قالب یک آرایه JSON از رشته‌ها برگردانید. مثال: "
-            '["پیام اول", "پیام دوم حاوی ||متن مخفی|| است", ...]'
-            "فقط و فقط آرایه JSON را بدون هیچ متن اضافی، توضیحات یا قالب‌بندی دیگری برگردانید."
-        )
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
+        if prompt_override:
+            prompt = (
+                f"با توجه به این پیام: '{prompt_override}'. یک پاسخ کوتاه و مرتبط به زبان فارسی بنویس. "
+                "گاهی اوقات، از سینتکس ||کلمه یا عبارت|| برای مخفی کردن (اسپویلر) بخشی از متن استفاده کن."
+            )
+        else:
+            keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
+            prompt = (
+                f"یک عبارت کوتاه و جذاب برای شروع گفتگو به زبان فارسی ایجاد کن. "
+                f"این عبارت باید درباره این موضوعات باشد: {', '.join(keywords)}. "
+                "مثال: 'موفقیت مثل یک سفر است، نه یک مقصد. اولین قدم شما چیست؟'"
+            )
+
+        models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash"]
         headers = {'Content-Type': 'application/json'}
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
-        LOGGER.info("Attempting to generate messages from Gemini using server IP.")
+        for model in models_to_try:
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            LOGGER.info(f"Attempting to generate message from Gemini using model: {model}.")
 
-        try:
-            async with httpx.AsyncClient(timeout=40.0) as client:
-                response = await client.post(api_url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+            for attempt in range(3): # Retry up to 3 times for rate limiting
+                try:
+                    async with httpx.AsyncClient(timeout=40.0) as client:
+                        # Add a small random delay to avoid hitting rate limits too quickly
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                        response = await client.post(api_url, json=payload, headers=headers)
+                        response.raise_for_status()
+                        data = response.json()
 
-                if data.get("candidates") and data["candidates"][0].get("content", {}).get("parts"):
-                    json_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    messages = json.loads(json_text)
-                    if isinstance(messages, list) and all(isinstance(item, str) for item in messages):
-                        LOGGER.info(f"Successfully generated {len(messages)} messages from Gemini.")
-                        return messages
+                        if data.get("candidates") and data["candidates"][0].get("content", {}).get("parts"):
+                            message = data["candidates"][0]["content"]["parts"][0]["text"]
+                            LOGGER.info(f"Successfully generated message from Gemini using {model}.")
+                            return [message.strip()]
+                        else:
+                            LOGGER.warning(f"Unexpected Gemini API response structure from {model}: {data}")
+                            break # Don't retry if the structure is wrong
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        LOGGER.warning(f"Rate limit hit with model {model}. Attempt {attempt + 1}/3. Retrying after a delay...")
+                        if attempt < 2:
+                            await asyncio.sleep(random.uniform(1, 3)) # Wait 1-3 seconds before retrying
+                        else:
+                            LOGGER.error(f"Failed to generate message after 3 attempts due to rate limiting with {model}.")
+                            break # Move to the next model
                     else:
-                        LOGGER.warning(f"Gemini API returned an unexpected format inside JSON: {messages}")
-                else:
-                    LOGGER.warning(f"Unexpected Gemini API response structure: {data}")
+                        LOGGER.error(f"HTTP error with model {model}: {e}. Trying next model.")
+                        sentry_sdk.capture_exception(e)
+                        break # Try the next model on other HTTP errors
+                except Exception as e:
+                    LOGGER.error(f"An unexpected error occurred during message generation with {model}: {e}.")
+                    sentry_sdk.capture_exception(e)
+                    break # Try the next model
 
-        except httpx.RequestError as e:
-            LOGGER.error(f"Failed to connect to Gemini API: {e}.")
-            sentry_sdk.capture_exception(e)
-        except json.JSONDecodeError as e:
-            LOGGER.error(f"Error decoding JSON from Gemini response: {e}.")
-            sentry_sdk.capture_exception(e)
-        except Exception as e:
-            LOGGER.error(f"An unexpected error occurred during message generation: {e}.")
-            sentry_sdk.capture_exception(e)
-
+        LOGGER.error("Failed to generate message from Gemini after trying all available models.")
         return []
 
-    async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 5) -> bool:
-        for i in range(retries):
+    async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 1) -> bool:
+        """Ensures the client has cached the group entity and is a participant."""
+        for attempt in range(retries):
             try:
-                # Attempt to get the entity
-                await client.get_entity(PeerChannel(group_id))
-                # Trigger updates to help cache synchronization
-                await client.get_dialogs(limit=1)
-                LOGGER.info(f"Account '{account_name}' successfully cached entity for group {group_id}.")
+                # Step 1: Resolve the entity. This also helps in caching.
+                group_entity = await client.get_entity(PeerChannel(group_id))
+
+                # Step 2: Verify participation.
+                me = await client.get_me()
+                await client(GetParticipantRequest(channel=group_entity, participant=me))
+
+                LOGGER.info(f"Account '{account_name}' successfully verified as participant in group {group_id}.")
                 return True
+            except errors.rpcerrorlist.UserNotParticipantError:
+                LOGGER.warning(f"Attempt {attempt + 1}/{retries}: Account '{account_name}' is not yet a participant in group {group_id}. Retrying in {delay}s.")
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    LOGGER.error(f"Account '{account_name}' failed to confirm participation in group {group_id} after {retries} retries.")
+                    return False
             except ValueError as e:
-                LOGGER.warning(f"Attempt {i+1}/{retries}: Account '{account_name}' could not find entity for group {group_id}. Retrying in {delay}s. Error: {e}")
-                await asyncio.sleep(delay)
+                # This can happen if the entity isn't in the dialogs list yet.
+                LOGGER.warning(f"Attempt {attempt + 1}/{retries}: Account '{account_name}' could not find entity for group {group_id}. Retrying in {delay}s. Error: {e}")
+                if attempt < retries - 1:
+                    await client.get_dialogs(limit=1) # Force update dialogs
+                    await asyncio.sleep(delay)
+                else:
+                     LOGGER.error(f"Account '{account_name}' failed to cache entity for group {group_id} after {retries} retries.")
+                     return False
             except Exception as e:
-                LOGGER.error(f"Unexpected error while ensuring entity cached for '{account_name}': {e}")
+                LOGGER.error(f"Unexpected error while ensuring entity cached for '{account_name}' in group {group_id}: {e}", exc_info=True)
                 sentry_sdk.capture_exception(e)
                 return False
-        LOGGER.error(f"Account '{account_name}' failed to cache entity for group {group_id} after {retries} retries.")
         return False
 
-    async def _simulate_conversation(self, user_id: int, group_id: int, clients_with_meta: List[Dict]):
+    async def _run_interactive_conversation(self, user_id: int, group_id: int, clients_with_meta: List[Dict], num_messages: int):
         if len(clients_with_meta) < 2:
-            LOGGER.warning(f"Not enough clients to simulate conversation in group {group_id}.")
+            LOGGER.warning(f"Not enough clients to simulate interactive conversation in group {group_id}.")
             return
 
+        # Make a mutable copy of the list to allow removing problematic clients
+        active_clients_meta = list(clients_with_meta)
+        emojis = ["😊", "👍", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
+
         try:
-            chat_messages = await self._generate_persian_messages(user_id)
-            if not chat_messages:
-                LOGGER.warning("Failed to generate messages for conversation simulation.")
+            # 1. Kick-off message
+            if self._get_daily_count_for_group(group_id) >= Config.DAILY_MESSAGE_LIMIT_PER_GROUP:
+                LOGGER.info(f"Daily message limit for group {group_id} reached. Skipping conversation.")
                 return
 
-            num_messages_to_send = random.randint(5, 15)
-            LOGGER.info(f"Starting to send {num_messages_to_send} messages in group {group_id}.")
-            last_message = None
+            starter_info = random.choice(active_clients_meta)
+            starter_client = starter_info['client']
+            starter_name = starter_info['account_name']
 
-            for i in range(num_messages_to_send):
-                sender_info = random.choice(clients_with_meta)
-                sender_client = sender_info['client']
-                sender_account_name = sender_info['account_name']
+            initial_messages = await self._generate_persian_messages(user_id)
+            if not initial_messages:
+                LOGGER.warning("Could not generate initial message for conversation.")
+                return
 
-                try:
-                    # Use PeerChannel to be explicit
-                    group_entity = await sender_client.get_entity(PeerChannel(group_id))
-                    
-                    # Decide whether to send a text or a sticker
-                    if random.random() < 0.15: # 15% chance to send a sticker
+            initial_message_text = self._prepare_spoiler_text(initial_messages[0])
+
+            try:
+                starter_group_entity = await starter_client.get_entity(PeerChannel(group_id))
+                last_message = await starter_client.send_message(starter_group_entity, initial_message_text)
+                self._increment_daily_count_for_group(group_id)
+                LOGGER.info(f"Account '{starter_name}' started conversation in group {group_id}.")
+            except errors.rpcerrorlist.ChannelInvalidError as e:
+                LOGGER.error(f"Starter account '{starter_name}' cannot send message to group {group_id}: {e}")
+                return # Can't start the conversation
+
+            messages_sent_this_session = 1
+
+            # 2. Main reply loop
+            while self._get_daily_count_for_group(group_id) < Config.DAILY_MESSAGE_LIMIT_PER_GROUP and messages_sent_this_session < num_messages:
+                await asyncio.sleep(random.uniform(3, 8))
+
+                last_sender_id = last_message.sender_id
+
+                # Find a different bot to reply
+                possible_repliers = [m for m in active_clients_meta if m.get('account_id') != last_sender_id]
+                if not possible_repliers:
+                    LOGGER.info("No other bot available to reply. Ending conversation.")
+                    break
+
+                replier_info = random.choice(possible_repliers)
+                replier_client = replier_info['client']
+                replier_name = replier_info['account_name']
+                replier_user_id = replier_info['user_id']
+
+                # Decide whether to send a sticker or text
+                if random.random() < 0.2: # 20% chance to send a sticker
+                    sticker = await self._get_random_sticker(replier_client, replier_user_id)
+                    if sticker:
                         try:
-                            sticker_sets = await sender_client(GetAllStickersRequest(0))
-                            if sticker_sets.sets:
-                                chosen_set = random.choice(sticker_sets.sets)
-                                stickers = await sender_client(GetStickerSetRequest(
-                                    stickerset=InputStickerSetID(id=chosen_set.id, access_hash=chosen_set.access_hash),
-                                    hash=0
-                                ))
-                                if stickers.documents:
-                                    last_message = await sender_client.send_file(group_entity, random.choice(stickers.documents))
-                                    LOGGER.info(f"Account '{sender_account_name}' sent a sticker to group {group_id}.")
-                                else: # Fallback to text if sticker set is empty
-                                    continue
-                            else: # Fallback to text if no sticker sets
-                                continue
+                            await asyncio.sleep(1) # Wait before responding
+                            replier_group_entity = await replier_client.get_entity(PeerChannel(group_id))
+                            last_message = await replier_client.send_file(replier_group_entity, sticker, reply_to=last_message.id)
+                            self._increment_daily_count_for_group(group_id)
+                            messages_sent_this_session += 1
+                            LOGGER.info(f"Account '{replier_name}' sent a sticker in group {group_id}.")
+                            continue
                         except Exception as e:
-                            LOGGER.warning(f"Could not send sticker for {sender_account_name}: {e}")
-                            continue # Skip to next message on sticker error
-                    else:
-                        message_text = random.choice(chat_messages)
-                        chat_messages.remove(message_text)
-                        formatted_text = self._prepare_spoiler_text(message_text)
-                        last_message = await sender_client.send_message(group_entity, formatted_text)
-                        LOGGER.info(f"Account '{sender_account_name}' sent message {i+1}/{num_messages_to_send} to group {group_id}.")
+                            LOGGER.warning(f"Could not send sticker from '{replier_name}': {e}")
 
-                    # Chance for another user to react
-                    if last_message and random.random() < 0.4: # 40% chance to react
-                        await asyncio.sleep(random.uniform(5, 15)) # Delay before reacting
-                        # Ensure there's at least one other client to react
-                        other_clients = [c for c in clients_with_meta if c['client'] != sender_client]
-                        if other_clients:
-                            reactor_info = random.choice(other_clients)
-                            reactor_client = reactor_info['client']
-                            reaction = random.choice(['❤️', '👍', '😂', '🔥', '👏', '😁'])
-                            try:
-                                await reactor_client(SendReactionRequest(
-                                    peer=group_entity,
-                                    msg_id=last_message.id,
-                                    reaction=[ReactionEmoji(emoticon=reaction)]
-                                ))
-                                LOGGER.info(f"Account '{reactor_info['account_name']}' reacted with {reaction} in group {group_id}.")
-                            except Exception as e:
-                                LOGGER.warning(f"Could not send reaction from {reactor_info['account_name']}: {e}")
+                # Use last message as prompt for text reply
+                prompt = last_message.raw_text
+                if not prompt: # If last message was a sticker or media
+                    prompt = "یک پاسخ جالب بده"
 
+                reply_messages = await self._generate_persian_messages(user_id, prompt_override=prompt)
+                if not reply_messages:
+                    LOGGER.warning(f"Could not generate reply for '{replier_name}'.")
+                    continue
+
+                reply_text = self._prepare_spoiler_text(reply_messages[0]) + " " + random.choice(emojis)
+
+                # Send the reply
+                try:
+                    await asyncio.sleep(1) # Wait before responding
+                    replier_group_entity = await replier_client.get_entity(PeerChannel(group_id))
+                    last_message = await replier_client.send_message(replier_group_entity, reply_text, reply_to=last_message.id)
+                    self._increment_daily_count_for_group(group_id)
+                    messages_sent_this_session += 1
+                    LOGGER.info(f"Account '{replier_name}' replied in group {group_id}. Daily count for group: {self._get_daily_count_for_group(group_id)}")
+                except errors.rpcerrorlist.ChannelInvalidError as e:
+                    LOGGER.error(f"Account '{replier_name}' cannot send message to group {group_id}: {e}")
+                    active_clients_meta.remove(replier_info) # Remove problematic client
+                    continue
                 except Exception as e:
-                    LOGGER.error(f"Account '{sender_account_name}' failed to send simulation message to {group_id}: {e}")
-                await asyncio.sleep(random.uniform(15, 45))
+                    LOGGER.error(f"Unexpected error when '{replier_name}' tried sending a message in group {group_id}: {e}", exc_info=True)
+                    active_clients_meta.remove(replier_info) # Remove problematic client
+                    continue
+
+
+        except asyncio.CancelledError:
+            LOGGER.info(f"Interactive conversation for group {group_id} was cancelled.")
+            raise
         except Exception as e:
-            LOGGER.error(f"Unexpected error during conversation simulation: {e}")
+            LOGGER.error(f"Unexpected error during interactive conversation for group {group_id}: {e}", exc_info=True)
 
 
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
@@ -673,11 +825,11 @@ class GroupCreatorBot:
                         temp_clients.append(client)
                         me = await client.get_me()
                         p_account_name = me.first_name or me.username or f"ID:{me.id}"
-                        participant_clients_meta.append({'client': client, 'user_id': user_id, 'account_name': p_account_name})
+                        participant_clients_meta.append({'client': client, 'user_id': user_id, 'account_id': me.id, 'account_name': p_account_name})
 
                 me = await user_client.get_me()
                 u_account_name = me.first_name or me.username or f"ID:{me.id}"
-                all_clients_meta = [{'client': user_client, 'user_id': user_id, 'account_name': u_account_name}] + participant_clients_meta
+                all_clients_meta = [{'client': user_client, 'user_id': user_id, 'account_id': me.id, 'account_name': u_account_name}] + participant_clients_meta
 
                 for i in range(Config.GROUPS_TO_CREATE):
                     try:
@@ -688,36 +840,51 @@ class GroupCreatorBot:
                         )
                         new_supergroup = create_result.chats[0]
                         LOGGER.info(f"Successfully created supergroup '{new_supergroup.title}' (ID: {new_supergroup.id}).")
-                        # Correctly associate the group with the worker key
                         self.created_groups[str(new_supergroup.id)] = {"owner_worker_key": worker_key, "last_simulated": 0}
                         self._save_created_groups()
 
-                        users_to_invite = [await p_meta['client'].get_me() for p_meta in participant_clients_meta]
-                        if users_to_invite:
-                            LOGGER.info(f"Creator '{account_name}' inviting {len(users_to_invite)} users.")
-                            await self._send_request_with_reconnect(
-                                user_client, InviteToChannelRequest(channel=new_supergroup.id, users=users_to_invite), account_name
-                            )
-                        
-                        # Ensure all clients have the group entity cached before proceeding
+                        invite_link = None
+                        try:
+                            link_result = await user_client(ExportChatInviteRequest(new_supergroup.id))
+                            invite_link = link_result.link
+                            LOGGER.info(f"Successfully exported invite link for group {new_supergroup.id}: {invite_link}")
+                        except Exception as e:
+                            LOGGER.error(f"Could not export invite link for new group {new_supergroup.id}: {e}")
+                            continue
+
+                        if invite_link:
+                            match = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', invite_link)
+                            if match:
+                                invite_hash = match.group(1)
+                                for p_meta in participant_clients_meta:
+                                    p_client = p_meta['client']
+                                    p_name = p_meta['account_name']
+                                    try:
+                                        await p_client(ImportChatInviteRequest(invite_hash))
+                                        LOGGER.info(f"Account '{p_name}' successfully joined group {new_supergroup.id} via link.")
+                                        await asyncio.sleep(random.uniform(5, 10)) # Delay to allow server processing
+                                    except Exception as e:
+                                        LOGGER.warning(f"Account '{p_name}' failed to join group {new_supergroup.id} via link: {e}")
+                            else:
+                                LOGGER.error(f"Could not extract hash from invite link: {invite_link}")
+                                continue
+
                         successful_clients_meta = []
                         ensure_tasks = [self._ensure_entity_cached(meta['client'], new_supergroup.id, meta['account_name']) for meta in all_clients_meta]
                         results = await asyncio.gather(*ensure_tasks)
-                        
+
                         for idx, meta in enumerate(all_clients_meta):
                             if results[idx]:
                                 successful_clients_meta.append(meta)
                             else:
                                 LOGGER.warning(f"Account '{meta['account_name']}' failed to cache group entity and will not participate.")
-                                # Disconnect clients that failed and are temporary
                                 if meta['client'] in temp_clients and meta['client'].is_connected():
                                     await meta['client'].disconnect()
-
 
                         if len(successful_clients_meta) < 2:
                              LOGGER.warning(f"Not enough clients ({len(successful_clients_meta)}) could cache the group. Aborting conversation for group {new_supergroup.id}.")
                         else:
-                            await self._simulate_conversation(user_id, new_supergroup.id, successful_clients_meta)
+                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
 
                         self._set_group_count(worker_key, current_semester)
                         await self.bot.send_message(user_id, f"📊 [{account_name}] Group '{group_title}' created. ({i+1}/{Config.GROUPS_TO_CREATE})")
@@ -749,13 +916,13 @@ class GroupCreatorBot:
             if user_client and user_client.is_connected():
                 await user_client.disconnect()
 
-    async def _run_scheduled_simulation(self, user_id: int, group_id: int):
+    async def _run_conversation_task(self, user_id: int, group_id: int, num_messages: Optional[int] = None):
         clients_with_meta = []
         clients_to_disconnect = []
         try:
             participant_names = self.conversation_accounts.get(str(user_id), [])
             if len(participant_names) < 2:
-                LOGGER.warning(f"[Scheduler] Not enough accounts for user {user_id} to simulate.")
+                LOGGER.warning(f"[Conversation Task] Not enough accounts for user {user_id} to simulate.")
                 return
 
             for acc_name in participant_names:
@@ -767,21 +934,27 @@ class GroupCreatorBot:
                     clients_to_disconnect.append(client)
                     me = await client.get_me()
                     p_account_name = me.first_name or me.username or f"ID:{me.id}"
-                    clients_with_meta.append({'client': client, 'user_id': user_id, 'account_name': p_account_name})
+                    clients_with_meta.append({'client': client, 'user_id': user_id, 'account_id': me.id, 'account_name': p_account_name})
 
             if len(clients_with_meta) >= 2:
-                await self._simulate_conversation(user_id, group_id, clients_with_meta)
+                await self._run_interactive_conversation(user_id, group_id, clients_with_meta, num_messages=num_messages)
             else:
-                LOGGER.warning(f"[Scheduler] Not enough clients could connect for user {user_id}.")
+                LOGGER.warning(f"[Conversation Task] Not enough clients could connect for user {user_id}.")
 
+        except asyncio.CancelledError:
+            LOGGER.info(f"[Conversation Task] for group {group_id} was cancelled.")
+            raise
         except Exception as e:
-            LOGGER.error(f"[Scheduler] Error for group {group_id}: {e}", exc_info=True)
+            LOGGER.error(f"[Conversation Task] Error for group {group_id}: {e}", exc_info=True)
             sentry_sdk.capture_exception(e)
         finally:
-            LOGGER.info(f"[Scheduler] Disconnecting {len(clients_to_disconnect)} clients for group {group_id}.")
+            LOGGER.info(f"[Conversation Task] Disconnecting {len(clients_to_disconnect)} clients for group {group_id}.")
             for client in clients_to_disconnect:
-                if client.is_connected():
-                    await client.disconnect()
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                except Exception as e:
+                    LOGGER.warning(f"Failed to disconnect client for group {group_id}: {e}")
 
     async def on_login_success(self, event: events.NewMessage.Event, user_client: TelegramClient) -> None:
         user_id = event.sender_id
@@ -809,6 +982,9 @@ class GroupCreatorBot:
 
     async def _start_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
+        if user_id in self.banned_users:
+            await event.reply("❌ You are banned from using this bot.")
+            return
         if user_id not in self.known_users and user_id != ADMIN_USER_ID:
             self.user_sessions[user_id] = {'state': 'awaiting_master_password'}
             await event.reply(Config.MSG_PROMPT_MASTER_PASSWORD, buttons=Button.clear())
@@ -827,18 +1003,29 @@ class GroupCreatorBot:
 
     async def _server_status_handler(self, event: events.NewMessage.Event) -> None:
         active_count = len(self.active_workers)
-        max_workers = Config.MAX_CONCURRENT_WORKERS
+        active_conv_count = len(self.active_conversations)
+
         status_text = f"**📊 Server Status**\n\n"
-        status_text += f"**Active Workers:** {active_count} / {max_workers}\n"
+        status_text += f"**Active Group Creators:** {active_count} / {self.max_workers}\n"
+        status_text += f"**Active Manual Conversations:** {active_conv_count}\n"
+
         if active_count > 0:
-            status_text += "\n**Accounts in Operation:**\n"
+            status_text += "\n**Accounts Creating Groups:**\n"
             for worker_key in self.active_workers.keys():
                 _, acc_name = worker_key.split(":", 1)
                 proxy_info = self.account_proxies.get(worker_key)
                 proxy_str = f" (Proxy: {proxy_info['addr']})" if proxy_info else ""
-                status_text += f"- `{acc_name}`{proxy_str}\n"
-        else:
+                status_text += f"- `{worker_key}`{proxy_str}\n"
+
+        if active_conv_count > 0:
+            status_text += "\n**Accounts in Manual Conversation:**\n"
+            for worker_key in self.active_conversations.keys():
+                _, acc_name = worker_key.split(":", 1)
+                status_text += f"- `{worker_key}`\n"
+
+        if active_count == 0 and active_conv_count == 0:
             status_text += "\nℹ️ No accounts are currently in operation."
+
         await event.reply(status_text, buttons=self._build_main_menu())
         raise events.StopPropagation
 
@@ -850,6 +1037,11 @@ class GroupCreatorBot:
         user_id = event.sender_id
         self.user_sessions[user_id]['state'] = 'awaiting_keywords'
         await event.reply(Config.MSG_PROMPT_KEYWORDS, buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _set_stickers_handler(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        self.user_sessions[user_id]['state'] = 'awaiting_sticker_packs'
+        await event.reply(Config.MSG_PROMPT_STICKERS, buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _set_conv_accs_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
@@ -886,11 +1078,203 @@ class GroupCreatorBot:
         buttons.append([Button.text(Config.BTN_BACK)])
         await event.reply(Config.MSG_PROMPT_EXPORT_ACCOUNT, buttons=buttons)
 
-    async def _admin_command_handler(self, event: events.NewMessage.Event, handler: callable):
+    async def _force_conversation_handler(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        accounts = self.session_manager.get_user_accounts(user_id)
+        if not accounts:
+            await event.reply("❌ شما هیچ حسابی برای این کار ندارید. ابتدا یک حساب اضافه کنید.")
+            return
+
+        self.user_sessions[user_id]['state'] = 'awaiting_force_conv_account_selection'
+        buttons = [[Button.text(acc)] for acc in accounts]
+        buttons.append([Button.text(Config.BTN_BACK)])
+        await event.reply(Config.MSG_PROMPT_FORCE_CONV_ACCOUNT, buttons=buttons)
+
+    async def _stop_force_conversation_handler(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        active_conv_keys = [key for key in self.active_conversations.keys() if key.startswith(f"{user_id}:")]
+
+        if not active_conv_keys:
+            await event.reply(Config.MSG_NO_ACTIVE_FORCE_CONV)
+            return
+
+        self.user_sessions[user_id]['state'] = 'awaiting_stop_force_conv_selection'
+        buttons = [[Button.text(key.split(":", 1)[1])] for key in active_conv_keys]
+        buttons.append([Button.text(Config.BTN_BACK)])
+        await event.reply(Config.MSG_PROMPT_STOP_FORCE_CONV, buttons=buttons)
+
+    async def _admin_command_handler(self, event: events.NewMessage.Event) -> None:
         if event.sender_id != ADMIN_USER_ID:
             await event.reply("❌ You are not authorized to use this command.")
             return
-        await handler(event)
+
+        text = event.message.text
+
+        # Commands with arguments
+        pre_approve_match = re.match(r"/pre_approve (\d+)", text)
+        ban_match = re.match(r"/ban (\d+)", text)
+        unban_match = re.match(r"/unban (\d+)", text)
+        set_limit_match = re.match(r"/set_worker_limit (\d+)", text)
+        terminate_match = re.match(r"/terminate_worker (.*)", text)
+        restart_match = re.match(r"/restart_worker (.*)", text)
+
+        if pre_approve_match:
+            await self._pre_approve_handler(event, int(pre_approve_match.group(1)))
+        elif ban_match:
+            await self._ban_user_handler(event, int(ban_match.group(1)))
+        elif unban_match:
+            await self._unban_user_handler(event, int(unban_match.group(1)))
+        elif set_limit_match:
+            await self._set_worker_limit_handler(event, int(set_limit_match.group(1)))
+        elif terminate_match:
+            await self._terminate_worker_handler(event, terminate_match.group(1))
+        elif restart_match:
+            await self._restart_worker_handler(event, restart_match.group(1))
+        # Commands without arguments
+        elif text == "/list_users":
+            await self._list_users_handler(event)
+        elif text == "/list_workers":
+            await self._list_workers_handler(event)
+        elif text == "/list_groups":
+            await self._list_groups_handler(event)
+        elif text == "/list_conv_accounts":
+            await self._list_conv_accounts_handler(event)
+        elif text == "/debug_proxies":
+            await self._debug_test_proxies_handler(event)
+        elif text == "/clean_sessions":
+            await self._clean_sessions_handler(event)
+        elif text == "/test_sentry":
+            await self._test_sentry_handler(event)
+        else:
+            await event.reply("Unknown admin command.")
+
+    async def _pre_approve_handler(self, event: events.NewMessage.Event, user_id_to_approve: int):
+        if user_id_to_approve not in self.known_users:
+            self.known_users.append(user_id_to_approve)
+            self._save_known_users()
+            await event.reply(f"✅ User `{user_id_to_approve}` has been pre-approved.")
+        else:
+            await event.reply(f"ℹ️ User `{user_id_to_approve}` is already an approved user.")
+
+    async def _ban_user_handler(self, event: events.NewMessage.Event, user_id_to_ban: int):
+        if user_id_to_ban == ADMIN_USER_ID:
+            await event.reply("❌ You cannot ban the admin.")
+            return
+        if user_id_to_ban not in self.banned_users:
+            self.banned_users.append(user_id_to_ban)
+            self._save_banned_users()
+            if user_id_to_ban in self.known_users:
+                self.known_users.remove(user_id_to_ban)
+                self._save_known_users()
+            await event.reply(f"🚫 User `{user_id_to_ban}` has been banned.")
+        else:
+            await event.reply(f"ℹ️ User `{user_id_to_ban}` is already banned.")
+
+    async def _unban_user_handler(self, event: events.NewMessage.Event, user_id_to_unban: int):
+        if user_id_to_unban in self.banned_users:
+            self.banned_users.remove(user_id_to_unban)
+            self._save_banned_users()
+            await event.reply(f"✅ User `{user_id_to_unban}` has been unbanned.")
+        else:
+            await event.reply(f"ℹ️ User `{user_id_to_unban}` is not banned.")
+
+    async def _list_users_handler(self, event: events.NewMessage.Event):
+        known_list = "\n".join(f"- `{uid}`" for uid in self.known_users) if self.known_users else "None"
+        banned_list = "\n".join(f"- `{uid}`" for uid in self.banned_users) if self.banned_users else "None"
+
+        message = (
+            f"**👥 User Lists**\n\n"
+            f"**Approved Users:**\n{known_list}\n\n"
+            f"**Banned Users:**\n{banned_list}"
+        )
+        await event.reply(message)
+
+    async def _set_worker_limit_handler(self, event: events.NewMessage.Event, limit: int):
+        if limit > 0:
+            self.max_workers = limit
+            self.worker_semaphore = asyncio.Semaphore(self.max_workers)
+            await event.reply(f"✅ Max concurrent workers set to `{limit}`.")
+        else:
+            await event.reply("❌ Please provide a positive number for the limit.")
+
+    async def _terminate_worker_handler(self, event: events.NewMessage.Event, worker_key: str):
+        if worker_key in self.active_workers:
+            task = self.active_workers[worker_key]
+            task.cancel()
+            LOGGER.info(f"Admin initiated termination for worker {worker_key}.")
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass # Expected
+            await event.reply(f"✅ Worker `{worker_key}` has been terminated.")
+        else:
+            await event.reply(f"❌ No active worker found with key `{worker_key}`.")
+
+    async def _restart_worker_handler(self, event: events.NewMessage.Event, worker_key: str):
+        if worker_key in self.active_workers:
+            await event.reply(f"🔄 Restarting worker `{worker_key}`...")
+            await self._terminate_worker_handler(event, worker_key)
+            await asyncio.sleep(2) # Give it a moment to fully stop
+
+            try:
+                user_id_str, account_name = worker_key.split(":", 1)
+                user_id = int(user_id_str)
+                # Create a mock event to pass to the start handler
+                mock_event = events.NewMessage.Event(event.message)
+                mock_event.sender_id = user_id
+                await self._start_process_handler(mock_event, account_name, from_admin=True)
+                await event.reply(f"✅ Worker `{worker_key}` restart initiated.")
+            except ValueError:
+                await event.reply("❌ Invalid worker key format. Use `user_id:account_name`.")
+        else:
+            await event.reply(f"❌ No active worker found with key `{worker_key}` to restart.")
+
+    async def _list_workers_handler(self, event: events.NewMessage.Event):
+        if not self.active_workers:
+            await event.reply("ℹ️ No active workers are currently running.")
+            return
+
+        message = "**- Active Workers -**\n\n"
+        for worker_key, task in self.active_workers.items():
+            proxy_info = self.account_proxies.get(worker_key)
+            proxy_str = f"Proxy: {proxy_info['addr']}:{proxy_info['port']}" if proxy_info else "Proxy: None"
+            message += f"- **Key:** `{worker_key}`\n  - **Status:** {'Running' if not task.done() else 'Finished'}\n  - **{proxy_str}**\n\n"
+
+        await event.reply(message)
+
+    async def _list_groups_handler(self, event: events.NewMessage.Event):
+        if not self.created_groups:
+            await event.reply("ℹ️ No groups have been created by the bot yet.")
+            return
+
+        message = "**- Created Groups -**\n\n"
+        for group_id, data in self.created_groups.items():
+            owner_key = data.get("owner_worker_key", "Unknown")
+            message += f"- **Group ID:** `{group_id}`\n  - **Owner Key:** `{owner_key}`\n\n"
+
+        if len(message) > 4096:
+            try:
+                with open("created_groups.txt", "w", encoding="utf-8") as f:
+                    f.write(message)
+                await self.bot.send_file(event.chat_id, "created_groups.txt", caption="List of created groups.")
+                os.remove("created_groups.txt")
+            except Exception as e:
+                LOGGER.error(f"Failed to send groups list as file: {e}")
+                await event.reply("Failed to send the list as a file due to an error.")
+        else:
+            await event.reply(message)
+
+    async def _list_conv_accounts_handler(self, event: events.NewMessage.Event):
+        if not self.conversation_accounts:
+            await event.reply("ℹ️ No conversation accounts have been set.")
+            return
+
+        message = "**- Conversation Accounts per User -**\n\n"
+        for user_id, accounts in self.conversation_accounts.items():
+            accounts_str = ", ".join(f"`{acc}`" for acc in accounts) if accounts else "None"
+            message += f"- **User ID:** `{user_id}`\n  - **Accounts:** {accounts_str}\n\n"
+
+        await event.reply(message)
 
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
         LOGGER.info(f"Admin {event.sender_id} initiated silent proxy test.")
@@ -1017,8 +1401,21 @@ class GroupCreatorBot:
     async def _message_router(self, event: events.NewMessage.Event) -> None:
         if not isinstance(getattr(event, 'message', None), Message) or not event.message.text:
             return
+
         text = event.message.text
         user_id = event.sender_id
+
+        if user_id in self.banned_users:
+            await event.reply("❌ You are banned from using this bot.")
+            return
+
+        if text.startswith('/'):
+            if user_id == ADMIN_USER_ID:
+                await self._admin_command_handler(event)
+            else:
+                await event.reply("❌ You are not authorized to use commands.")
+            return
+
         if user_id not in self.known_users and user_id != ADMIN_USER_ID:
             if user_id in self.pending_users:
                 await event.reply(Config.MSG_AWAITING_APPROVAL)
@@ -1028,13 +1425,16 @@ class GroupCreatorBot:
         session = self.user_sessions.get(user_id, {})
         state = session.get('state')
 
-        if text == Config.BTN_BACK and state in ['awaiting_keywords', 'awaiting_conv_accounts', 'awaiting_join_account_selection', 'awaiting_join_link', 'awaiting_export_account_selection']:
+        if text == Config.BTN_BACK and state in ['awaiting_keywords', 'awaiting_sticker_packs', 'awaiting_conv_accounts', 'awaiting_join_account_selection', 'awaiting_join_link', 'awaiting_export_account_selection', 'awaiting_force_conv_account_selection', 'awaiting_force_conv_num_messages', 'awaiting_stop_force_conv_selection']:
             self.user_sessions[user_id]['state'] = 'authenticated'
             await self._start_handler(event)
             return
 
         if state == 'awaiting_keywords':
             await self._handle_keywords_input(event)
+            return
+        if state == 'awaiting_sticker_packs':
+            await self._handle_sticker_packs_input(event)
             return
         if state == 'awaiting_conv_accounts':
             await self._handle_conv_accounts_input(event)
@@ -1047,6 +1447,15 @@ class GroupCreatorBot:
             return
         if state == 'awaiting_export_account_selection':
             await self._handle_export_account_selection(event)
+            return
+        if state == 'awaiting_force_conv_account_selection':
+            await self._handle_force_conv_account_selection(event)
+            return
+        if state == 'awaiting_force_conv_num_messages':
+            await self._handle_force_conv_num_messages(event)
+            return
+        if state == 'awaiting_stop_force_conv_selection':
+            await self._handle_stop_force_conv_selection(event)
             return
 
         login_flow_states = ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']
@@ -1068,15 +1477,6 @@ class GroupCreatorBot:
             await self._start_handler(event)
             return
 
-        admin_routes = {
-            "/debug_proxies": self._debug_test_proxies_handler,
-            "/clean_sessions": self._clean_sessions_handler,
-            "/test_sentry": self._test_sentry_handler,
-        }
-        if text in admin_routes:
-            await self._admin_command_handler(event, admin_routes[text])
-            return
-
         route_map = {
             Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
             Config.BTN_HELP: self._help_handler,
@@ -1085,9 +1485,12 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
             Config.BTN_SET_KEYWORDS: self._set_keywords_handler,
+            Config.BTN_SET_STICKERS: self._set_stickers_handler,
             Config.BTN_SET_CONVERSATION_ACCOUNTS: self._set_conv_accs_handler,
             Config.BTN_JOIN_VIA_LINK: self._join_via_link_handler,
             Config.BTN_EXPORT_LINKS: self._export_links_handler,
+            Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
+            Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
         }
         handler = route_map.get(text)
         if handler:
@@ -1109,45 +1512,55 @@ class GroupCreatorBot:
             await self._delete_account_handler(event, delete_match.group(1))
             return
 
-    async def _start_process_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
+    async def _start_process_handler(self, event: events.NewMessage.Event, account_name: str, from_admin=False) -> None:
         user_id = event.sender_id
         worker_key = f"{user_id}:{account_name}"
         if worker_key in self.active_workers:
-            await event.reply('⏳ An operation for this account is already in progress.')
+            if not from_admin:
+                await event.reply('⏳ An operation for this account is already in progress.')
             return
         session_str = self.session_manager.load_session_string(user_id, account_name)
         if not session_str:
-            await event.reply('❌ No session found for this account. Please delete and add it again.')
+            if not from_admin:
+                await event.reply('❌ No session found for this account. Please delete and add it again.')
             return
-        await event.reply(f'🚀 Preparing to start operation for account `{account_name}`...')
+
+        if not from_admin:
+            await event.reply(f'🚀 Preparing to start operation for account `{account_name}`...')
+
         user_client = None
         try:
             assigned_proxy = self.account_proxies.get(worker_key)
             user_client = await self._create_worker_client(session_str, assigned_proxy)
             if not user_client:
-                await event.reply(f'❌ Failed to connect to Telegram for account `{account_name}`.')
+                if not from_admin:
+                    await event.reply(f'❌ Failed to connect to Telegram for account `{account_name}`.')
                 return
             if await user_client.is_user_authorized():
                 task = asyncio.create_task(self.run_group_creation_worker(user_id, account_name, user_client))
                 self.active_workers[worker_key] = task
                 self.active_workers_state[worker_key] = {"user_id": user_id, "account_name": account_name}
                 self._save_active_workers_state()
-                await self._send_accounts_menu(event)
+                if not from_admin:
+                    await self._send_accounts_menu(event)
             else:
                 self.session_manager.delete_session_file(user_id, account_name)
                 self._remove_group_count(worker_key)
-                await event.reply(f'⚠️ Session for `{account_name}` has expired. Please add it again.')
+                if not from_admin:
+                    await event.reply(f'⚠️ Session for `{account_name}` has expired. Please add it again.')
         except errors.AuthKeyUnregisteredError as e:
             LOGGER.error(f"Auth key is unregistered for '{account_name}'. Deleting session.")
             sentry_sdk.capture_exception(e)
             self.session_manager.delete_session_file(user_id, account_name)
             self._remove_group_count(worker_key)
-            await event.reply(f"🚨 Session for `{account_name}` revoked. Account removed.")
-            await self._send_accounts_menu(event)
+            if not from_admin:
+                await event.reply(f"🚨 Session for `{account_name}` revoked. Account removed.")
+                await self._send_accounts_menu(event)
         except Exception as e:
             LOGGER.error(f"Error starting process for {worker_key}", exc_info=True)
             sentry_sdk.capture_exception(e)
-            await event.reply(f'❌ An error occurred while connecting to `{account_name}`.')
+            if not from_admin:
+                await event.reply(f'❌ An error occurred while connecting to `{account_name}`.')
         finally:
             if user_client and not self.active_workers.get(worker_key):
                 if user_client.is_connected():
@@ -1218,6 +1631,22 @@ class GroupCreatorBot:
         self.user_sessions[event.sender_id]['state'] = 'authenticated'
         raise events.StopPropagation
 
+    async def _handle_sticker_packs_input(self, event: events.NewMessage.Event) -> None:
+        user_id = str(event.sender_id)
+        packs_text = event.message.text.strip()
+        if packs_text:
+            packs = [pack.strip() for pack in packs_text.split(',')]
+            self.user_sticker_packs[user_id] = packs
+            self._save_user_sticker_packs()
+            await event.reply(Config.MSG_STICKERS_SET, buttons=self._build_main_menu())
+        else:
+            # Allow clearing the list
+            self.user_sticker_packs[user_id] = []
+            self._save_user_sticker_packs()
+            await event.reply("✅ لیست استیکرهای شما پاک شد.", buttons=self._build_main_menu())
+        self.user_sessions[event.sender_id]['state'] = 'authenticated'
+        raise events.StopPropagation
+
     async def _handle_conv_accounts_input(self, event: events.NewMessage.Event) -> None:
         user_id = str(event.sender_id)
         input_text = event.message.text.strip()
@@ -1261,7 +1690,7 @@ class GroupCreatorBot:
         text = event.message.text.strip()
         # Split by newlines or commas and filter out empty strings
         links = [link.strip() for link in re.split(r'[\n,]+', text) if link.strip()]
-        
+
         if not links:
             await event.reply("❌ لینکی وارد نشده است. لطفاً حداقل یک لینک ارسال کنید.")
             return
@@ -1279,7 +1708,7 @@ class GroupCreatorBot:
             return
 
         await event.reply(f"⏳ در حال تلاش برای عضویت حساب `{account_name}` در {len(links)} لینک...")
-        
+
         client = None
         success_count = 0
         fail_count = 0
@@ -1297,7 +1726,7 @@ class GroupCreatorBot:
                     fail_count += 1
                     fail_details_list.append(f"- `{link}` (فرمت نامعتبر)")
                     continue
-                
+
                 invite_hash = match.group(1)
                 try:
                     await client(ImportChatInviteRequest(invite_hash))
@@ -1307,7 +1736,7 @@ class GroupCreatorBot:
                     fail_count += 1
                     fail_details_list.append(f"- `{link}` ({e.__class__.__name__})")
                     LOGGER.warning(f"Account '{account_name}' failed to join {link}: {e}")
-                
+
                 # Add a delay to avoid getting limited by Telegram
                 if i < len(links) - 1:
                     await asyncio.sleep(random.uniform(5, 15))
@@ -1333,13 +1762,13 @@ class GroupCreatorBot:
     async def _handle_export_account_selection(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         account_name = event.message.text.strip()
-        
+
         if account_name not in self.session_manager.get_user_accounts(user_id):
             await event.reply("❌ حساب انتخاب شده نامعتبر است. لطفاً از دکمه‌ها استفاده کنید.")
             return
 
         await event.reply(Config.MSG_EXPORTING_LINKS.format(account_name=account_name))
-        
+
         worker_key_to_find = f"{user_id}:{account_name}"
         owned_group_ids = [
             int(gid) for gid, data in self.created_groups.items()
@@ -1361,21 +1790,31 @@ class GroupCreatorBot:
                 await event.reply(f"❌ اتصال به حساب `{account_name}` ناموفق بود.", buttons=self._build_main_menu())
                 return
 
+            # Ensure dialogs are updated to cache group entities
+            await client.get_dialogs(limit=100)  # Fetch dialogs to populate entity cache
+
             for group_id in owned_group_ids:
                 try:
-                    link = await client.export_chat_invite_link(group_id)
-                    links.append(link)
+                    # Resolve the group entity
+                    group_entity = await client.get_entity(PeerChannel(group_id))
+                    # Export the invite link using the resolved entity
+                    result = await client(ExportChatInviteRequest(group_entity))
+                    links.append(result.link)
+                    LOGGER.info(f"Successfully exported link for group {group_id}: {result.link}")
+                except ValueError as e:
+                    LOGGER.warning(f"Could not resolve entity for group {group_id} with account {account_name}: {e}")
+                    links.append(f"Error exporting for group ID {group_id}: Entity not found")
                 except Exception as e:
                     LOGGER.warning(f"Could not export link for group {group_id} with account {account_name}: {e}")
                     links.append(f"Error exporting for group ID {group_id}: {e.__class__.__name__}")
-            
+
             if links:
                 file_path = SESSIONS_DIR / f"invite_links_{account_name}_{user_id}.txt"
                 with open(file_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(links))
-                
+
                 await self.bot.send_file(user_id, file_path, caption=Config.MSG_EXPORT_SUCCESS)
-                os.remove(file_path) # Clean up the file after sending
+                os.remove(file_path)  # Clean up the file after sending
             else:
                 await event.reply(Config.MSG_EXPORT_FAIL.format(account_name=account_name))
 
@@ -1388,6 +1827,82 @@ class GroupCreatorBot:
                 await client.disconnect()
             self.user_sessions[user_id]['state'] = 'authenticated'
             await self._start_handler(event)
+
+    async def _handle_force_conv_account_selection(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        account_name = event.message.text.strip()
+
+        if account_name not in self.session_manager.get_user_accounts(user_id):
+            await event.reply("❌ حساب انتخاب شده نامعتبر است. لطفاً از دکمه‌ها استفاده کنید.")
+            return
+
+        self.user_sessions[user_id]['force_conv_account_name'] = account_name
+        self.user_sessions[user_id]['state'] = 'awaiting_force_conv_num_messages'
+        await event.reply(Config.MSG_PROMPT_NUM_MESSAGES, buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _handle_force_conv_num_messages(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        try:
+            num_messages = int(event.message.text.strip())
+            if num_messages <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            await event.reply("❌ لطفاً یک عدد معتبر و مثبت وارد کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
+            return
+
+        account_name = self.user_sessions[user_id].get('force_conv_account_name')
+        if not account_name:
+            await event.reply("خطای داخلی رخ داده است. لطفاً از ابتدا شروع کنید.", buttons=self._build_main_menu())
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        worker_key = f"{user_id}:{account_name}"
+        if worker_key in self.active_conversations:
+            await event.reply(f"❌ مکالمه دستی برای حساب `{account_name}` از قبل فعال است. ابتدا آن را متوقف کنید.", buttons=self._build_main_menu())
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        owned_group_ids = [
+            int(gid) for gid, data in self.created_groups.items()
+            if data.get("owner_worker_key") == worker_key
+        ]
+
+        if not owned_group_ids:
+            await event.reply(Config.MSG_FORCE_CONV_NO_GROUPS.format(account_name=account_name), buttons=self._build_main_menu())
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        await event.reply(Config.MSG_FORCE_CONV_STARTED.format(count=len(owned_group_ids), account_name=account_name), buttons=self._build_main_menu())
+
+        async def conversation_runner():
+            try:
+                tasks = [self._run_conversation_task(user_id, group_id, num_messages=num_messages) for group_id in owned_group_ids]
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                LOGGER.info(f"Force conversation task for {worker_key} was cancelled.")
+            finally:
+                # Clean up the task from the dictionary once it's done or cancelled
+                if worker_key in self.active_conversations:
+                    del self.active_conversations[worker_key]
+                    LOGGER.info(f"Force conversation task for {worker_key} finished and cleaned up.")
+
+        task = asyncio.create_task(conversation_runner())
+        self.active_conversations[worker_key] = task
+        self.user_sessions[user_id]['state'] = 'authenticated'
+
+    async def _handle_stop_force_conv_selection(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        account_name = event.message.text.strip()
+        worker_key = f"{user_id}:{account_name}"
+
+        if worker_key in self.active_conversations:
+            task = self.active_conversations[worker_key]
+            task.cancel()
+            await event.reply(Config.MSG_FORCE_CONV_STOPPED.format(account_name=account_name), buttons=self._build_main_menu())
+        else:
+            await event.reply(f"❌ مکالمه دستی فعالی برای حساب `{account_name}` یافت نشد.", buttons=self._build_main_menu())
+
+        self.user_sessions[user_id]['state'] = 'authenticated'
 
 
     async def _handle_phone_input(self, event: events.NewMessage.Event) -> None:
@@ -1527,7 +2042,7 @@ class GroupCreatorBot:
                 continue
             LOGGER.info(f"Daily scheduler found {len(groups_to_simulate)} groups needing conversation simulation.")
             for group_id, owner_id in groups_to_simulate:
-                asyncio.create_task(self._run_scheduled_simulation(owner_id, group_id))
+                asyncio.create_task(self._run_conversation_task(owner_id, group_id, num_messages=Config.DAILY_MESSAGE_LIMIT_PER_GROUP))
                 self.created_groups[str(group_id)]["last_simulated"] = now_ts
                 await asyncio.sleep(5)
             self._save_created_groups()

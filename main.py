@@ -194,6 +194,8 @@ class Config:
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
+    BTN_TOGGLE_KIMI = "🔄 تغییر وضعیت مدل Kimi"
+
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -374,7 +376,8 @@ class GroupCreatorBot:
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
         self.gemini_api_key = self.config.get("GEMINI_API_KEY", GEMINI_API_KEY)
-        self.ai_model = self.config.get("AI_MODEL", "moonshotai/kimi-k2:free")
+        self.ai_model = self.config.get("AI_MODEL", "google/gemini-flash-1.5") # Default fallback
+        self.use_kimi_model = self.config.get("USE_KIMI_MODEL", False) # Kimi is disabled by default
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
     async def _initialize_sentry(self):
@@ -786,7 +789,8 @@ class GroupCreatorBot:
 
         async def make_gemini_request(model_name: str, proxy_info: Optional[Dict], timeout: int = 40):
             if not self.gemini_api_key: return None
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={self.gemini_api_key}"
+            # Use the requested model name in the URL
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.gemini_api_key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
             headers = {'Content-Type': 'application/json'}
             proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
@@ -797,18 +801,28 @@ class GroupCreatorBot:
                 res_json = response.json()
                 if res_json.get("candidates") and res_json["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text"):
                     message = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                    LOGGER.info("Successfully generated message from Gemini fallback.")
+                    LOGGER.info(f"Successfully generated message from Gemini model: {model_name}.")
                     return [message.strip()]
             return None
 
-        # Try primary model with backoff
-        result = await make_request_with_backoff(make_openrouter_request, self.ai_model)
+        # --- [NEW] AI Model Logic ---
+
+        # 1. Primary attempt: Gemini 2.0 Flash
+        LOGGER.info("Attempting AI generation with primary model: gemini-2.0-flash")
+        result = await make_request_with_backoff(make_gemini_request, "gemini-2.0-flash")
         if result:
             return result
-        
-        # If primary fails, try Gemini fallback with backoff
-        LOGGER.warning(f"Primary AI model '{self.ai_model}' failed. Trying fallback Gemini model.")
-        result = await make_request_with_backoff(make_gemini_request, "gemini-1.5-flash")
+
+        # 2. Fallback 1: Kimi (if enabled)
+        if self.use_kimi_model:
+            LOGGER.warning("Primary model failed. Attempting fallback 1: Kimi")
+            result = await make_request_with_backoff(make_openrouter_request, "moonshotai/kimi-k2:free")
+            if result:
+                return result
+
+        # 3. Final Fallback: Default OpenRouter model
+        LOGGER.warning("Primary (and Kimi, if enabled) models failed. Attempting final fallback.")
+        result = await make_request_with_backoff(make_openrouter_request, self.ai_model)
         if result:
             return result
 
@@ -1295,9 +1309,11 @@ class GroupCreatorBot:
         if event.sender_id != ADMIN_USER_ID:
             return
         
+        kimi_status = "Enabled" if self.use_kimi_model else "Disabled"
         buttons = [
             [Button.text("Set AI Model"), Button.text("Set API Key")],
             [Button.text("Set Custom Prompt")],
+            [Button.text(f"{Config.BTN_TOGGLE_KIMI} ({kimi_status})")],
             [Button.text("Set Worker Limit"), Button.text("Set Group Count")],
             [Button.text("Set Sleep Times"), Button.text("Set Daily Msg Limit")],
             [Button.text("Set Proxy Timeout"), Button.text("Set Master Password")],
@@ -1719,6 +1735,10 @@ class GroupCreatorBot:
             
             # Admin settings buttons
             if user_id == ADMIN_USER_ID:
+                if text.startswith(Config.BTN_TOGGLE_KIMI):
+                    await self._toggle_kimi_handler(event)
+                    return
+
                 admin_settings_map = {
                     "Set AI Model": "AI_MODEL", "Set API Key": "OPENROUTER_API_KEY",
                     "Set Custom Prompt": "CUSTOM_PROMPT", "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
@@ -2416,6 +2436,21 @@ class GroupCreatorBot:
 
     async def _stop_dm_chat_handler(self, event: events.NewMessage.Event):
         await event.reply("DM chat stopping functionality is not yet implemented.")
+
+    async def _toggle_kimi_handler(self, event: events.NewMessage.Event):
+        """Toggles the USE_KIMI_MODEL setting."""
+        if event.sender_id != ADMIN_USER_ID:
+            return
+        
+        current_status = self.config.get("USE_KIMI_MODEL", False)
+        new_status = not current_status
+        self.config["USE_KIMI_MODEL"] = new_status
+        self._save_json_file(self.config, self.config_file)
+        self.update_config_from_file()
+
+        status_text = "Enabled" if new_status else "Disabled"
+        await event.reply(f"✅ Kimi fallback model has been **{status_text}**.")
+        await self._settings_handler(event) # Refresh settings menu
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id

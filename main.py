@@ -974,9 +974,12 @@ class GroupCreatorBot:
                         if progress_message: await progress_message.edit(f"🚨 Session for `{account_name}` revoked. Account removed.")
                         break
                     except Exception as e:
-                        LOGGER.error(f"Worker error for {worker_key}", exc_info=True)
-                        sentry_sdk.capture_exception(e)
-                        if progress_message: await progress_message.edit("❌ Unexpected Error. Check logs.")
+                        await self._send_error_explanation(user_id, e)
+                        if progress_message:
+                            try:
+                                await progress_message.edit("❌ عملیات با خطا مواجه شد. لطفا گزارش ارسال شده را بررسی کنید.")
+                            except Exception:
+                                pass # Ignore if we can't edit the message
                         break
                 else: # This block runs if the for loop completes without a break
                     if progress_message: await progress_message.edit(f"✅ [{account_name}] Finished creating {self.groups_to_create} groups.")
@@ -1518,117 +1521,122 @@ class GroupCreatorBot:
         if not isinstance(getattr(event, 'message', None), Message) or not event.message.text:
             return
         
-        text = event.message.text
         user_id = event.sender_id
-
-        if user_id in self.banned_users:
-            await event.reply("❌ You are banned from using this bot.")
-            return
-
-        if text.startswith('/'):
-            if user_id == ADMIN_USER_ID:
-                await self._admin_command_handler(event)
-            else:
-                await event.reply("❌ You are not authorized to use commands.")
-            return
-
-        if user_id not in self.known_users and user_id != ADMIN_USER_ID:
-            if user_id in self.pending_users:
-                await event.reply(Config.MSG_AWAITING_APPROVAL)
-                return
-            await self._handle_master_password(event)
-            return
         
-        session = self.user_sessions.get(user_id, {})
-        state = session.get('state')
-
-        # --- State Handling ---
-        state_handlers = {
-            'awaiting_keywords': self._handle_keywords_input,
-            'awaiting_sticker_packs': self._handle_sticker_packs_input,
-            'awaiting_conv_accounts': self._handle_conv_accounts_input,
-            'awaiting_join_account_selection': self._handle_join_account_selection,
-            'awaiting_join_link': self._handle_join_link_input,
-            'awaiting_export_account_selection': self._process_export_link_request,
-            'awaiting_force_conv_account_selection': self._handle_force_conv_account_selection,
-            'awaiting_force_conv_num_messages': self._handle_force_conv_num_messages,
-            'awaiting_stop_force_conv_selection': self._handle_stop_force_conv_selection,
-            'awaiting_phone': self._handle_phone_input,
-            'awaiting_code': self._handle_code_input,
-            'awaiting_password': self._handle_password_input,
-            'awaiting_account_name': self._handle_account_name_input,
-            'awaiting_config_value': self._handle_config_value_input,
-        }
-
-        if text == Config.BTN_BACK:
-            if state in ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']:
-                self.user_sessions[user_id]['state'] = 'authenticated'
-                await self._send_accounts_menu(event)
+        try:
+            text = event.message.text
+            if user_id in self.banned_users:
+                await event.reply("❌ You are banned from using this bot.")
                 return
-            elif state in state_handlers:
-                self.user_sessions[user_id]['state'] = 'authenticated'
+
+            if text.startswith('/'):
+                if user_id == ADMIN_USER_ID:
+                    await self._admin_command_handler(event)
+                else:
+                    await event.reply("❌ You are not authorized to use commands.")
+                return
+
+            if user_id not in self.known_users and user_id != ADMIN_USER_ID:
+                if user_id in self.pending_users:
+                    await event.reply(Config.MSG_AWAITING_APPROVAL)
+                    return
+                await self._handle_master_password(event)
+                return
+            
+            session = self.user_sessions.get(user_id, {})
+            state = session.get('state')
+
+            # --- State Handling ---
+            state_handlers = {
+                'awaiting_keywords': self._handle_keywords_input,
+                'awaiting_sticker_packs': self._handle_sticker_packs_input,
+                'awaiting_conv_accounts': self._handle_conv_accounts_input,
+                'awaiting_join_account_selection': self._handle_join_account_selection,
+                'awaiting_join_link': self._handle_join_link_input,
+                'awaiting_export_account_selection': self._process_export_link_request,
+                'awaiting_force_conv_account_selection': self._handle_force_conv_account_selection,
+                'awaiting_force_conv_num_messages': self._handle_force_conv_num_messages,
+                'awaiting_stop_force_conv_selection': self._handle_stop_force_conv_selection,
+                'awaiting_phone': self._handle_phone_input,
+                'awaiting_code': self._handle_code_input,
+                'awaiting_password': self._handle_password_input,
+                'awaiting_account_name': self._handle_account_name_input,
+                'awaiting_config_value': self._handle_config_value_input,
+            }
+
+            if text == Config.BTN_BACK:
+                if state in ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']:
+                    self.user_sessions[user_id]['state'] = 'authenticated'
+                    await self._send_accounts_menu(event)
+                    return
+                elif state in state_handlers:
+                    self.user_sessions[user_id]['state'] = 'authenticated'
+                    await self._start_handler(event)
+                    return
+
+            if state in state_handlers:
+                await state_handlers[state](event)
+                return
+
+            if state != 'authenticated':
                 await self._start_handler(event)
                 return
 
-        if state in state_handlers:
-            await state_handlers[state](event)
-            return
-
-        if state != 'authenticated':
-            await self._start_handler(event)
-            return
-
-        # --- Authenticated Text/Button Handling ---
-        button_handlers = {
-            Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
-            Config.BTN_HELP: self._help_handler,
-            Config.BTN_BACK: self._start_handler,
-            Config.BTN_SETTINGS: self._settings_handler,
-            Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
-            Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
-            Config.BTN_SERVER_STATUS: self._server_status_handler,
-            Config.BTN_SET_KEYWORDS: self._set_keywords_handler,
-            Config.BTN_SET_STICKERS: self._set_stickers_handler,
-            Config.BTN_SET_CONVERSATION_ACCOUNTS: self._set_conv_accs_handler,
-            Config.BTN_JOIN_VIA_LINK: self._join_via_link_handler,
-            Config.BTN_EXPORT_LINKS: self._export_links_handler,
-            Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
-            Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
-        }
-        
-        # Admin settings buttons
-        if user_id == ADMIN_USER_ID:
-            admin_settings_map = {
-                "Set AI Model": "AI_MODEL", "Set API Key": "OPENROUTER_API_KEY",
-                "Set Custom Prompt": "CUSTOM_PROMPT", "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
-                "Set Group Count": "GROUPS_TO_CREATE", "Set Sleep Times": "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS",
-                "Set Daily Msg Limit": "DAILY_MESSAGE_LIMIT_PER_GROUP", "Set Proxy Timeout": "PROXY_TIMEOUT",
-                "Set Master Password": "MASTER_PASSWORD_HASH",
-                "View Config": "VIEW_CONFIG" # Special case
+            # --- Authenticated Text/Button Handling ---
+            button_handlers = {
+                Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
+                Config.BTN_HELP: self._help_handler,
+                Config.BTN_BACK: self._start_handler,
+                Config.BTN_SETTINGS: self._settings_handler,
+                Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
+                Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
+                Config.BTN_SERVER_STATUS: self._server_status_handler,
+                Config.BTN_SET_KEYWORDS: self._set_keywords_handler,
+                Config.BTN_SET_STICKERS: self._set_stickers_handler,
+                Config.BTN_SET_CONVERSATION_ACCOUNTS: self._set_conv_accs_handler,
+                Config.BTN_JOIN_VIA_LINK: self._join_via_link_handler,
+                Config.BTN_EXPORT_LINKS: self._export_links_handler,
+                Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
+                Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
             }
-            if text in admin_settings_map:
-                await self._handle_admin_setting_button(event, admin_settings_map[text])
+            
+            # Admin settings buttons
+            if user_id == ADMIN_USER_ID:
+                admin_settings_map = {
+                    "Set AI Model": "AI_MODEL", "Set API Key": "OPENROUTER_API_KEY",
+                    "Set Custom Prompt": "CUSTOM_PROMPT", "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
+                    "Set Group Count": "GROUPS_TO_CREATE", "Set Sleep Times": "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS",
+                    "Set Daily Msg Limit": "DAILY_MESSAGE_LIMIT_PER_GROUP", "Set Proxy Timeout": "PROXY_TIMEOUT",
+                    "Set Master Password": "MASTER_PASSWORD_HASH",
+                    "View Config": "VIEW_CONFIG" # Special case
+                }
+                if text in admin_settings_map:
+                    await self._handle_admin_setting_button(event, admin_settings_map[text])
+                    return
+
+            handler = button_handlers.get(text)
+            if handler:
+                await handler(event)
                 return
 
-        handler = button_handlers.get(text)
-        if handler:
-            await handler(event)
-            return
+            start_match = re.match(rf"{re.escape(Config.BTN_START_PREFIX)} (.*)", text)
+            if start_match:
+                await self._start_process_handler(event, start_match.group(1))
+                return
 
-        start_match = re.match(rf"{re.escape(Config.BTN_START_PREFIX)} (.*)", text)
-        if start_match:
-            await self._start_process_handler(event, start_match.group(1))
-            return
+            stop_match = re.match(rf"{re.escape(Config.BTN_STOP_PREFIX)} (.*)", text)
+            if stop_match:
+                await self._cancel_worker_handler(event, stop_match.group(1))
+                return
 
-        stop_match = re.match(rf"{re.escape(Config.BTN_STOP_PREFIX)} (.*)", text)
-        if stop_match:
-            await self._cancel_worker_handler(event, stop_match.group(1))
-            return
-
-        delete_match = re.match(rf"{re.escape(Config.BTN_DELETE_PREFIX)} (.*)", text)
-        if delete_match:
-            await self._delete_account_handler(event, delete_match.group(1))
-            return
+            delete_match = re.match(rf"{re.escape(Config.BTN_DELETE_PREFIX)} (.*)", text)
+            if delete_match:
+                await self._delete_account_handler(event, delete_match.group(1))
+                return
+        
+        except Exception as e:
+            # Global error handler for the message router
+            await self._send_error_explanation(user_id, e)
 
     async def _start_worker_task(self, user_id: int, account_name: str) -> Optional[TelegramClient]:
         """Core logic to initialize and start a group creation worker."""
@@ -1673,9 +1681,7 @@ class GroupCreatorBot:
                 await user_client.disconnect()
             return None
         except Exception as e:
-            LOGGER.error(f"Error starting process for {worker_key}", exc_info=True)
-            sentry_sdk.capture_exception(e)
-            await self.bot.send_message(user_id, f'❌ An error occurred while connecting to `{account_name}`.')
+            await self._send_error_explanation(user_id, e)
             if user_client and user_client.is_connected():
                 await user_client.disconnect()
             return None
@@ -1886,9 +1892,7 @@ class GroupCreatorBot:
             await event.reply(summary_msg, buttons=self._build_main_menu())
 
         except Exception as e:
-            LOGGER.error(f"Unexpected error during multi-join for '{account_name}': {e}", exc_info=True)
-            sentry_sdk.capture_exception(e)
-            await event.reply(f"❌ یک خطای پیش‌بینی نشده در حین عملیات رخ داد.", buttons=self._build_main_menu())
+            await self._send_error_explanation(user_id, e)
         finally:
             if client and client.is_connected():
                 await client.disconnect()
@@ -1958,9 +1962,7 @@ class GroupCreatorBot:
                 await event.reply(Config.MSG_EXPORT_FAIL.format(account_name=account_name))
 
         except Exception as e:
-            LOGGER.error(f"Unexpected error during link export for '{account_name}': {e}", exc_info=True)
-            sentry_sdk.capture_exception(e)
-            await event.reply(Config.MSG_EXPORT_FAIL.format(account_name=account_name))
+            await self._send_error_explanation(user_id, e)
         finally:
             if client and client.is_connected():
                 await client.disconnect()
@@ -2070,13 +2072,8 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['state'] = 'awaiting_code'
             await event.reply('💬 A login code has been sent. Please send it here.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"Phone input error for {user_id}", exc_info=True)
-            sentry_sdk.capture_exception(e)
+            await self._send_error_explanation(user_id, e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
-            await event.reply(
-                '❌ **Error:** Invalid phone number or issue sending code. Please try again with the international format (+countrycode) or cancel.',
-                buttons=[[Button.text(Config.BTN_BACK)]]
-            )
         finally:
             if user_client and self.user_sessions.get(user_id, {}).get('state') != 'awaiting_code':
                  if user_client.is_connected():
@@ -2100,15 +2097,11 @@ class GroupCreatorBot:
                 self.user_sessions[user_id]['state'] = 'awaiting_code'
                 await event.reply('⚠️ The code expired. A new code has been sent. Please enter the new code.', buttons=[[Button.text(Config.BTN_BACK)]])
             except Exception as e:
-                LOGGER.error(f"Failed to resend code for {user_id} after expiration: {e}", exc_info=True)
-                sentry_sdk.capture_exception(e)
+                await self._send_error_explanation(user_id, e)
                 self.user_sessions[user_id]['state'] = 'awaiting_phone'
-                await event.reply('❌ **Error:** The previous code expired and resending failed. Please enter the phone number again.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"Code input error for {user_id}", exc_info=True)
-            sentry_sdk.capture_exception(e)
+            await self._send_error_explanation(user_id, e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
-            await event.reply('❌ **Error:** The code is invalid. Please enter the phone number again.', buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_password_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
@@ -2117,10 +2110,8 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['state'] = 'awaiting_account_name'
             await event.reply('✅ Login successful! Please enter a nickname for this account (e.g., `Main Account` or `Second Number`).', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
-            LOGGER.error(f"Password input error for {user_id}", exc_info=True)
-            sentry_sdk.capture_exception(e)
+            await self._send_error_explanation(user_id, e)
             self.user_sessions[user_id]['state'] = 'awaiting_password'
-            await event.reply('❌ **Error:** Incorrect password. Please try again.', buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_account_name_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
@@ -2326,6 +2317,58 @@ class GroupCreatorBot:
                 except Exception as e:
                     LOGGER.error(f"[Scheduler] Failed to start conversation task for owner {owner_key}: {e}", exc_info=True)
 
+    async def _get_ai_error_explanation(self, traceback_str: str) -> Optional[str]:
+        """Asks the AI to explain a Python traceback to the user."""
+        if not self.openrouter_api_key:
+            LOGGER.warning("OPENROUTER_API_KEY not set. Cannot generate AI error explanation.")
+            return None
+
+        prompt = (
+            "You are a Python expert debugging a Telegram bot. The following error occurred. "
+            "Analyze the traceback and explain the likely cause in simple, user-friendly terms. "
+            "Keep the explanation concise (2-3 sentences) and write it in Persian.\n\n"
+            f"**Traceback:**\n```\n{traceback_str}\n```"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "model": self.ai_model,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        api_url = "https://openrouter.ai/api/v1/chat/completions"
+        
+        try:
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                response = await client.post(api_url, json=data, headers=headers)
+                response.raise_for_status()
+                res_json = response.json()
+                if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
+                    return res_json["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            LOGGER.error(f"Failed to get AI error explanation: {e}", exc_info=True)
+        
+        return None
+
+    async def _send_error_explanation(self, user_id: int, e: Exception):
+        """Logs an error and sends an AI-powered explanation to the user."""
+        LOGGER.error(f"An error occurred for user {user_id}", exc_info=True)
+        sentry_sdk.capture_exception(e)
+
+        traceback_str = traceback.format_exc()
+        ai_explanation = await self._get_ai_error_explanation(traceback_str)
+        
+        user_message = "❌ یک خطای پیش‌بینی نشده رخ داد. لطفاً دوباره تلاش کنید."
+        if ai_explanation:
+            user_message += f"\n\n**تحلیل هوش مصنوعی:**\n{ai_explanation}"
+        
+        try:
+            await self.bot.send_message(user_id, user_message)
+        except Exception as send_error:
+            LOGGER.error(f"Failed to send error explanation message to user {user_id}: {send_error}")
+
     async def _generate_ai_code_suggestion(self, prompt: str, current_code: str) -> Optional[Dict]:
         """Calls the OpenRouter API to get a code suggestion."""
         if not self.openrouter_api_key:
@@ -2355,7 +2398,6 @@ class GroupCreatorBot:
                 
                 # [FIX] More robust JSON extraction to handle malformed AI responses.
                 json_str = message_content
-                # Find the start and end of the JSON object
                 start_index = json_str.find('{')
                 end_index = json_str.rfind('}')
                 
@@ -2367,7 +2409,12 @@ class GroupCreatorBot:
                 json_str = json_str[start_index:end_index+1]
                 
                 try:
-                    parsed_json = json.loads(json_str)
+                    # It's possible the string inside the JSON is not properly escaped.
+                    # This is a common issue with LLMs generating JSON.
+                    # We can try to fix common issues like unescaped newlines.
+                    json_str_cleaned = json_str.replace('\n', '\\n')
+                    parsed_json = json.loads(json_str_cleaned)
+
                     if "suggestion" in parsed_json and "code" in parsed_json:
                         return parsed_json
                     else:

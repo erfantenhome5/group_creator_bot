@@ -2326,6 +2326,53 @@ class GroupCreatorBot:
                 except Exception as e:
                     LOGGER.error(f"[Scheduler] Failed to start conversation task for owner {owner_key}: {e}", exc_info=True)
 
+    async def _generate_ai_code_suggestion(self, prompt: str, current_code: str) -> Optional[Dict]:
+        """Calls the OpenRouter API to get a code suggestion."""
+        if not self.openrouter_api_key:
+            LOGGER.error("OPENROUTER_API_KEY not set. Cannot generate AI code suggestion.")
+            await self.bot.send_message(ADMIN_USER_ID, "❌ `OPENROUTER_API_KEY` is not set. Cannot generate AI code suggestion.")
+            return None
+
+        full_prompt = (
+            f"{prompt}\n\n"
+            "The response must be a valid JSON object with two string keys: 'suggestion' and 'code'. "
+            "'suggestion' should be a brief, one-line explanation of the change. "
+            "'code' must contain the complete, modified, and runnable Python source code for the bot.\n\n"
+            f"**Current Source Code:**\n```python\n{current_code}\n```"
+        )
+
+        headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
+        data = {"model": self.ai_model, "messages": [{"role": "user", "content": full_prompt}]}
+        api_url = "https://openrouter.ai/api/v1/chat/completions"
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(api_url, json=data, headers=headers)
+                response.raise_for_status()
+                res_json = response.json()
+                
+                message_content = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                # Clean the response to extract only the JSON part
+                json_match = re.search(r'\{.*\}', message_content, re.DOTALL)
+                if not json_match:
+                    LOGGER.error(f"AI response did not contain a valid JSON object. Response: {message_content}")
+                    await self.bot.send_message(ADMIN_USER_ID, f"❌ AI response was not valid JSON:\n`{message_content}`")
+                    return None
+                
+                parsed_json = json.loads(json_match.group(0))
+                if "suggestion" in parsed_json and "code" in parsed_json:
+                    return parsed_json
+                else:
+                    LOGGER.error(f"AI JSON response was missing 'suggestion' or 'code' keys. Response: {parsed_json}")
+                    await self.bot.send_message(ADMIN_USER_ID, f"❌ AI JSON was missing required keys:\n`{parsed_json}`")
+                    return None
+
+        except Exception as e:
+            LOGGER.error(f"An error occurred during AI code suggestion: {e}", exc_info=True)
+            await self.bot.send_message(ADMIN_USER_ID, f"❌ An error occurred during AI API call: `{e}`")
+            return None
+
     async def _trigger_ai_suggestion(self, test_mode=False):
         """Contains the core logic for generating and proposing an AI code suggestion."""
         try:
@@ -2337,39 +2384,33 @@ class GroupCreatorBot:
             else:
                 prompt = (
                     "Analyze the following Python code for a Telegram bot. "
-                    "Suggest one new feature or a refinement to an existing one. "
-                    "Provide a brief explanation and the full, updated Python code for the new feature. "
-                    "The response must be a JSON object with two keys: 'suggestion' (a string explaining the change) "
-                    "and 'code' (a string containing the complete, modified source code)."
+                    "Suggest one new feature or a refinement to an existing one."
                 )
 
-            # In a real implementation, you would call your AI model here.
-            # This is a simulated response for demonstration.
-            simulated_response = {
-                "suggestion": "This is a test suggestion to confirm the self-patching mechanism works. A comment has been added to the top of the file.",
-                "code": f"# AI Refinement Test: {datetime.now().isoformat()}\n{current_code}"
-            }
-            
-            suggestion = simulated_response['suggestion']
-            code_suggestion = simulated_response['code']
-            
-            self.suggested_code = code_suggestion
-            
-            message = (
-                f"**💡 AI Feature Suggestion**\n\n"
-                f"{suggestion}\n\n"
-                f"Do you want to apply this change? The bot will restart if you approve."
-            )
+            ai_response = await self._generate_ai_code_suggestion(prompt, current_code)
 
-            await self.bot.send_message(
-                ADMIN_USER_ID, 
-                message, 
-                buttons=[
-                    [Button.inline("✅ Apply & Restart", data="patch_feature")],
-                    [Button.inline("❌ Ignore", data="ignore_feature")]
-                ]
-            )
-            LOGGER.info("Sent AI feature suggestion to admin for approval.")
+            if ai_response:
+                self.suggested_code = ai_response['code']
+                suggestion_text = ai_response['suggestion']
+                
+                message = (
+                    f"**💡 AI Feature Suggestion**\n\n"
+                    f"{suggestion_text}\n\n"
+                    f"Do you want to apply this change? The bot will restart if you approve."
+                )
+                await self.bot.send_message(
+                    ADMIN_USER_ID, 
+                    message, 
+                    buttons=[
+                        [Button.inline("✅ Apply & Restart", data="patch_feature")],
+                        [Button.inline("❌ Ignore", data="ignore_feature")]
+                    ]
+                )
+                LOGGER.info("Sent AI feature suggestion to admin for approval.")
+            else:
+                LOGGER.error("Failed to get a valid AI suggestion.")
+                await self.bot.send_message(ADMIN_USER_ID, "❌ Failed to get a valid response from the AI.")
+
         except Exception as e:
             LOGGER.error(f"Failed to get AI feature suggestion: {e}", exc_info=True)
             await self.bot.send_message(ADMIN_USER_ID, f"❌ An error occurred during AI analysis: {e}")
@@ -2391,6 +2432,7 @@ class GroupCreatorBot:
             "The error will be reported to Sentry if configured."
         )
         await asyncio.sleep(2)
+        # This will crash the bot. The OS/process manager is responsible for restarting it.
         raise RuntimeError("Simulating a critical failure for self-healing test.")
 
     async def _test_ai_generation_handler(self, event: events.NewMessage.Event):

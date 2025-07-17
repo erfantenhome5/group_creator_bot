@@ -2353,19 +2353,30 @@ class GroupCreatorBot:
                 
                 message_content = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
                 
-                # Clean the response to extract only the JSON part
-                json_match = re.search(r'\{.*\}', message_content, re.DOTALL)
-                if not json_match:
-                    LOGGER.error(f"AI response did not contain a valid JSON object. Response: {message_content}")
-                    await self.bot.send_message(ADMIN_USER_ID, f"❌ AI response was not valid JSON:\n`{message_content}`")
-                    return None
+                # [FIX] More robust JSON extraction to handle malformed AI responses.
+                json_str = message_content
+                # Find the start and end of the JSON object
+                start_index = json_str.find('{')
+                end_index = json_str.rfind('}')
                 
-                parsed_json = json.loads(json_match.group(0))
-                if "suggestion" in parsed_json and "code" in parsed_json:
-                    return parsed_json
-                else:
-                    LOGGER.error(f"AI JSON response was missing 'suggestion' or 'code' keys. Response: {parsed_json}")
-                    await self.bot.send_message(ADMIN_USER_ID, f"❌ AI JSON was missing required keys:\n`{parsed_json}`")
+                if start_index == -1 or end_index == -1:
+                    LOGGER.error(f"AI response did not contain a JSON object. Response: {message_content}")
+                    await self.bot.send_message(ADMIN_USER_ID, f"❌ AI response did not contain a JSON object:\n`{message_content}`")
+                    return None
+
+                json_str = json_str[start_index:end_index+1]
+                
+                try:
+                    parsed_json = json.loads(json_str)
+                    if "suggestion" in parsed_json and "code" in parsed_json:
+                        return parsed_json
+                    else:
+                        LOGGER.error(f"AI JSON response was missing 'suggestion' or 'code' keys. Response: {parsed_json}")
+                        await self.bot.send_message(ADMIN_USER_ID, f"❌ AI JSON was missing required keys:\n`{parsed_json}`")
+                        return None
+                except json.JSONDecodeError as e:
+                    LOGGER.error(f"Failed to decode JSON from AI response: {e}. Raw text: {json_str}", exc_info=True)
+                    await self.bot.send_message(ADMIN_USER_ID, f"❌ Failed to decode JSON from AI. Error: `{e}`\n\n**Raw Text:**\n`{json_str}`")
                     return None
 
         except Exception as e:

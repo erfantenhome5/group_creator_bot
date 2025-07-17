@@ -7,7 +7,7 @@ import random
 import re
 import shutil
 import traceback
-import uuid  # Added for generating random usernames
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,7 +22,6 @@ from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events, types
 from telethon.extensions import markdown
 from telethon.sessions import StringSession
-from telethon.tl import functions
 from telethon.tl.functions.channels import (CreateChannelRequest, GetParticipantRequest,
                                             InviteToChannelRequest)
 from telethon.tl.functions.messages import (ExportChatInviteRequest,
@@ -532,11 +531,12 @@ class GroupCreatorBot:
             await client.connect()
             LOGGER.info(f"Worker connected successfully {proxy_info}")
             return client
+        except errors.AuthKeyUnregisteredError:
+            # Re-raise this specific error to be handled by the caller
+            raise
         except Exception as e:
             LOGGER.error(f"Worker connection {proxy_info} failed: {e}")
             sentry_sdk.capture_exception(e)
-            if isinstance(e, errors.AuthKeyUnregisteredError):
-                raise
             return None
 
     async def _send_request_with_reconnect(self, client: TelegramClient, request: Any, account_name: str) -> Any:
@@ -755,7 +755,7 @@ class GroupCreatorBot:
 
         # Make a mutable copy of the list to allow removing problematic clients
         active_clients_meta = list(clients_with_meta)
-        emojis = ["😊", "👍", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
+        emojis = ["😊", "�", "🤔", "🎉", "💡", "🚀", "🔥", "💯", "✅"]
 
         try:
             # 1. Kick-off message
@@ -845,7 +845,11 @@ class GroupCreatorBot:
                     LOGGER.error(f"Unexpected error when '{replier_name}' tried sending a message in group {group_id}: {e}", exc_info=True)
                     active_clients_meta.remove(replier_info) # Remove problematic client
                     continue
-
+            
+            # After the conversation loop finishes, update the timestamp
+            self.created_groups[str(group_id)]["last_simulated"] = datetime.utcnow().timestamp()
+            self._save_created_groups()
+            LOGGER.info(f"Updated 'last_simulated' timestamp for group {group_id}.")
 
         except asyncio.CancelledError:
             LOGGER.info(f"Interactive conversation for group {group_id} was cancelled.")
@@ -1327,10 +1331,7 @@ class GroupCreatorBot:
             try:
                 user_id_str, account_name = worker_key.split(":", 1)
                 user_id = int(user_id_str)
-                # Create a mock event to pass to the start handler
-                mock_event = events.NewMessage.Event(event.message)
-                mock_event.sender_id = user_id
-                await self._start_process_handler(mock_event, account_name, from_admin=True)
+                await self._start_worker_task(user_id, account_name)
                 await event.reply(f"✅ Worker `{worker_key}` restart initiated.")
             except ValueError:
                 await event.reply("❌ Invalid worker key format. Use `user_id:account_name`.")
@@ -1554,7 +1555,7 @@ class GroupCreatorBot:
             await self._handle_join_link_input(event)
             return
         if state == 'awaiting_export_account_selection':
-            await self._handle_export_account_selection(event)
+            await self._process_export_link_request(event)
             return
         if state == 'awaiting_force_conv_account_selection':
             await self._handle_force_conv_account_selection(event)
@@ -1621,6 +1622,56 @@ class GroupCreatorBot:
             await self._delete_account_handler(event, delete_match.group(1))
             return
 
+    async def _start_worker_task(self, user_id: int, account_name: str) -> Optional[TelegramClient]:
+        """Core logic to initialize and start a group creation worker."""
+        worker_key = f"{user_id}:{account_name}"
+        session_str = self.session_manager.load_session_string(user_id, account_name)
+        if not session_str:
+            LOGGER.error(f"No session found for account '{account_name}' of user {user_id}.")
+            await self.bot.send_message(user_id, f'❌ No session found for account `{account_name}`. Please delete and add it again.')
+            return None
+
+        user_client = None
+        try:
+            assigned_proxy = self.account_proxies.get(worker_key)
+            user_client = await self._create_worker_client(session_str, assigned_proxy)
+            if not user_client:
+                LOGGER.error(f"Failed to connect to Telegram for account '{account_name}'.")
+                await self.bot.send_message(user_id, f'❌ Failed to connect to Telegram for account `{account_name}`.')
+                return None
+
+            if await user_client.is_user_authorized():
+                task = asyncio.create_task(self.run_group_creation_worker(user_id, account_name, user_client))
+                self.active_workers[worker_key] = task
+                self.active_workers_state[worker_key] = {"user_id": user_id, "account_name": account_name}
+                self._save_active_workers_state()
+                LOGGER.info(f"Successfully started worker task for {worker_key}.")
+                return user_client # Return client so the caller knows not to disconnect it
+            else:
+                LOGGER.warning(f"Session for '{account_name}' has expired. Deleting.")
+                self.session_manager.delete_session_file(user_id, account_name)
+                self._remove_group_count(worker_key)
+                await self.bot.send_message(user_id, f'⚠️ Session for `{account_name}` has expired. Please add it again.')
+                if user_client.is_connected():
+                    await user_client.disconnect()
+                return None
+        except errors.AuthKeyUnregisteredError as e:
+            LOGGER.error(f"Auth key is unregistered for '{account_name}'. Deleting session.", exc_info=True)
+            sentry_sdk.capture_exception(e)
+            self.session_manager.delete_session_file(user_id, account_name)
+            self._remove_group_count(worker_key)
+            await self.bot.send_message(user_id, f"🚨 Session for `{account_name}` revoked. Account removed.")
+            if user_client and user_client.is_connected():
+                await user_client.disconnect()
+            return None
+        except Exception as e:
+            LOGGER.error(f"Error starting process for {worker_key}", exc_info=True)
+            sentry_sdk.capture_exception(e)
+            await self.bot.send_message(user_id, f'❌ An error occurred while connecting to `{account_name}`.')
+            if user_client and user_client.is_connected():
+                await user_client.disconnect()
+            return None
+
     async def _start_process_handler(self, event: events.NewMessage.Event, account_name: str, from_admin=False) -> None:
         user_id = event.sender_id
         worker_key = f"{user_id}:{account_name}"
@@ -1628,52 +1679,19 @@ class GroupCreatorBot:
             if not from_admin:
                 await event.reply('⏳ An operation for this account is already in progress.')
             return
-        session_str = self.session_manager.load_session_string(user_id, account_name)
-        if not session_str:
-            if not from_admin:
-                await event.reply('❌ No session found for this account. Please delete and add it again.')
-            return
-        
+
         if not from_admin:
             await event.reply(f'🚀 Preparing to start operation for account `{account_name}`...')
+
+        client = await self._start_worker_task(user_id, account_name)
         
-        user_client = None
-        try:
-            assigned_proxy = self.account_proxies.get(worker_key)
-            user_client = await self._create_worker_client(session_str, assigned_proxy)
-            if not user_client:
-                if not from_admin:
-                    await event.reply(f'❌ Failed to connect to Telegram for account `{account_name}`.')
-                return
-            if await user_client.is_user_authorized():
-                task = asyncio.create_task(self.run_group_creation_worker(user_id, account_name, user_client))
-                self.active_workers[worker_key] = task
-                self.active_workers_state[worker_key] = {"user_id": user_id, "account_name": account_name}
-                self._save_active_workers_state()
-                if not from_admin:
-                    await self._send_accounts_menu(event)
-            else:
-                self.session_manager.delete_session_file(user_id, account_name)
-                self._remove_group_count(worker_key)
-                if not from_admin:
-                    await event.reply(f'⚠️ Session for `{account_name}` has expired. Please add it again.')
-        except errors.AuthKeyUnregisteredError as e:
-            LOGGER.error(f"Auth key is unregistered for '{account_name}'. Deleting session.")
-            sentry_sdk.capture_exception(e)
-            self.session_manager.delete_session_file(user_id, account_name)
-            self._remove_group_count(worker_key)
-            if not from_admin:
-                await event.reply(f"🚨 Session for `{account_name}` revoked. Account removed.")
+        if client:
+             if not from_admin:
                 await self._send_accounts_menu(event)
-        except Exception as e:
-            LOGGER.error(f"Error starting process for {worker_key}", exc_info=True)
-            sentry_sdk.capture_exception(e)
-            if not from_admin:
-                await event.reply(f'❌ An error occurred while connecting to `{account_name}`.')
-        finally:
-            if user_client and not self.active_workers.get(worker_key):
-                if user_client.is_connected():
-                    await user_client.disconnect()
+        else:
+             if not from_admin:
+                await event.reply(f'❌ Failed to start worker for `{account_name}`. Check logs for details.')
+                await self._send_accounts_menu(event)
 
     async def _cancel_worker_handler(self, event: events.NewMessage.Event, account_name: str) -> None:
         user_id = event.sender_id
@@ -1868,7 +1886,11 @@ class GroupCreatorBot:
                 await client.disconnect()
             self.user_sessions[user_id]['state'] = 'authenticated'
 
-    async def _handle_export_account_selection(self, event: events.NewMessage.Event) -> None:
+    async def _process_export_link_request(self, event: events.NewMessage.Event) -> None:
+        """
+        Handles the logic for exporting group invite links for a selected account.
+        This method was renamed from _handle_export_account_selection for clarity.
+        """
         user_id = event.sender_id
         account_name = event.message.text.strip()
 
@@ -2153,7 +2175,67 @@ class GroupCreatorBot:
             else:
                 await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
 
+    async def _daily_conversation_scheduler(self):
+        """
+        [NEW] This background task periodically checks created groups and starts 
+        conversations in them to maintain activity. This fixes a bug where this
+        function was called but not defined.
+        """
+        while True:
+            # Check for groups to revive once per hour
+            await asyncio.sleep(3600) 
+            LOGGER.info("[Scheduler] Running daily conversation scheduler...")
+            now = datetime.utcnow().timestamp()
+            
+            groups_to_revive = []
+            for group_id_str, data in self.created_groups.items():
+                group_id = int(group_id_str)
+                last_simulated = data.get("last_simulated", 0)
+                
+                # Check if it has been more than 23 hours and daily limit is not reached
+                if (now - last_simulated > 82800) and (self._get_daily_count_for_group(group_id) < self.daily_message_limit):
+                    groups_to_revive.append((group_id, data))
+
+            if not groups_to_revive:
+                LOGGER.info("[Scheduler] No groups need reviving at this time.")
+                continue
+
+            LOGGER.info(f"[Scheduler] Found {len(groups_to_revive)} groups to revive.")
+            
+            # Group by owner to run conversations efficiently
+            groups_by_owner = {}
+            for group_id, data in groups_to_revive:
+                owner_key = data.get("owner_worker_key")
+                if not owner_key:
+                    continue
+                if owner_key not in groups_by_owner:
+                    groups_by_owner[owner_key] = []
+                groups_by_owner[owner_key].append(group_id)
+
+            for owner_key, group_ids in groups_by_owner.items():
+                try:
+                    user_id_str, account_name = owner_key.split(":", 1)
+                    user_id = int(user_id_str)
+                    
+                    if not self.conversation_accounts.get(str(user_id)):
+                        LOGGER.warning(f"[Scheduler] Cannot start conversation for owner {owner_key}, no conversation accounts configured.")
+                        continue
+                        
+                    if owner_key in self.active_conversations:
+                        LOGGER.info(f"[Scheduler] Manual conversation already active for {owner_key}, skipping scheduled one.")
+                        continue
+                        
+                    LOGGER.info(f"[Scheduler] Starting scheduled conversation task for owner {owner_key} in {len(group_ids)} groups.")
+                    # For scheduled tasks, send a smaller, random number of messages
+                    num_messages = random.randint(5, 15)
+                    tasks = [self._run_conversation_task(user_id, group_id, num_messages=num_messages) for group_id in group_ids]
+                    asyncio.create_task(asyncio.gather(*tasks))
+
+                except Exception as e:
+                    LOGGER.error(f"[Scheduler] Failed to start conversation task for owner {owner_key}: {e}", exc_info=True)
+
     async def _daily_feature_suggestion(self):
+        """[DISABLED] This experimental feature is disabled by default due to its potential risks."""
         while True:
             await asyncio.sleep(86400) # Run once a day
             try:
@@ -2195,27 +2277,37 @@ class GroupCreatorBot:
         self.bot.add_event_handler(self._approval_handler, events.CallbackQuery)
 
     async def run(self) -> None:
+        """Main entry point for the bot."""
         self.register_handlers()
         LOGGER.info("Starting bot...")
         try:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service started successfully.")
+
+            # [FIX] Start the background scheduler for automatic conversations.
             self.bot.loop.create_task(self._daily_conversation_scheduler())
-            self.bot.loop.create_task(self._daily_feature_suggestion())
-            for worker_key, worker_data in self.active_workers_state.items():
-                user_id = worker_data["user_id"]
-                account_name = worker_data["account_name"]
-                LOGGER.info(f"Resuming worker for account '{account_name}' after restart.")
-                try:
-                    await self.bot.send_message(
-                        user_id,
-                        f"⚠️ The bot has restarted. Please manually start the process again for account `{account_name}` from the 'Manage Accounts' menu."
-                    )
-                except Exception:
-                    pass
+            
+            # [IMPROVEMENT] The AI-powered self-patching feature is experimental and potentially
+            # risky as it modifies its own code. It is disabled by default.
+            # To enable, uncomment the line below.
+            # self.bot.loop.create_task(self._daily_feature_suggestion())
+            
+            # [IMPROVEMENT] Automatically resume workers that were active before a restart,
+            # instead of requiring the user to restart them manually.
+            if self.active_workers_state:
+                LOGGER.info(f"Found {len(self.active_workers_state)} workers to resume from previous session.")
+                for worker_key, worker_data in list(self.active_workers_state.items()):
+                    user_id = worker_data["user_id"]
+                    account_name = worker_data["account_name"]
+                    LOGGER.info(f"Attempting to resume worker for account '{account_name}' ({worker_key}).")
+                    # Use the refactored worker start logic to resume the task
+                    await self._start_worker_task(user_id, account_name)
+
             if self.known_users:
-                await self._broadcast_message("✅ Bot has started successfully and is now online.")
+                await self._broadcast_message("✅ Bot has restarted successfully and is now online.")
+            
             await self.bot.run_until_disconnected()
+
         except Exception as e:
             LOGGER.critical(f"A critical error occurred in the main run loop: {e}", exc_info=True)
             # AI-powered error analysis
@@ -2246,3 +2338,4 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+�

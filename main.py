@@ -112,10 +112,15 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
         LOGGER.warning(f"Proxy file '{proxy_file_path}' not found.")
     return proxy_list
 
-# --- [NEW] Proxy Manager for Global Rate Limiting ---
+# --- Proxy Manager for Global Rate Limiting ---
 class ProxyManager:
-    """Manages proxy selection and enforces a global rate limit."""
-    RATE_LIMIT = 500  # requests
+    """
+    Manages proxy selection and enforces a global rate limit (RPM).
+    Note: This manager primarily handles Requests Per Minute (RPM). While it helps
+    mitigate other limits like Tokens Per Minute/Day (TPM/TPD) by spacing out
+    requests, it does not explicitly track token counts or daily quotas.
+    """
+    RATE_LIMIT = 480  # requests (kept slightly below 500 for safety)
     TIME_WINDOW = 60  # seconds
 
     def __init__(self, proxies: List[Dict]):
@@ -164,6 +169,19 @@ class Config:
     MESSAGE_SEND_DELAY_MIN = 1
     MESSAGE_SEND_DELAY_MAX = 5
 
+    # [NEW] Predefined fallback messages for when AI fails
+    PREDEFINED_FALLBACK_MESSAGES = [
+        "سلام دوستان!",
+        "چه خبر؟",
+        "کسی اینجا هست؟",
+        "🤔",
+        "�",
+        "عالیه!",
+        "موافقم.",
+        "جالبه.",
+        "چه روز خوبی!",
+        "امیدوارم همگی خوب باشید."
+    ]
 
     # [NEW] Personas for more human-like conversations
     PERSONAS = [
@@ -194,8 +212,6 @@ class Config:
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
-    BTN_TOGGLE_KIMI = "🔄 تغییر وضعیت مدل Kimi"
-
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -376,8 +392,17 @@ class GroupCreatorBot:
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
         self.gemini_api_key = self.config.get("GEMINI_API_KEY", GEMINI_API_KEY)
-        self.ai_model = self.config.get("AI_MODEL", "google/gemini-flash-1.5") # Default fallback
-        self.use_kimi_model = self.config.get("USE_KIMI_MODEL", False) # Kimi is disabled by default
+        
+        # [MODIFIED] AI Model Configuration
+        self.ai_model_hierarchy = self.config.get("AI_MODEL_HIERARCHY", [
+            "gemini-2.5-pro-latest",
+            "gemini-2.5-flash-latest",
+            "gemini-2.5-flash-lite-preview-0617",
+            "gemini-2.0-flash-latest",
+            "gemini-2.0-flash-lite-latest",
+            "gemini-1.5-flash-latest"
+        ])
+        
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
     async def _initialize_sentry(self):
@@ -724,11 +749,51 @@ class GroupCreatorBot:
         documents = self.sticker_sets.get(pack_name_to_use)
         return random.choice(documents) if documents else None
 
+    async def _execute_ai_request(self, model_name: str, prompt: str, proxy_info: Optional[Dict]) -> Optional[List[str]]:
+        """A unified function to execute an AI request against either Gemini or OpenRouter."""
+        proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
+        
+        # --- Gemini Logic ---
+        if model_name.startswith("google/") or model_name.startswith("gemini-"):
+            if not self.gemini_api_key: return None
+            # Normalize model name for the API endpoint
+            clean_model_name = model_name.split('/')[-1]
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model_name}:generateContent?key={self.gemini_api_key}"
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            headers = {'Content-Type': 'application/json'}
+            
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=40) as client:
+                response = await client.post(api_url, json=payload, headers=headers)
+                response.raise_for_status()
+                res_json = response.json()
+                if res_json.get("candidates") and res_json["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text"):
+                    message = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                    LOGGER.info(f"Successfully generated message from Gemini model: {model_name}.")
+                    return [message.strip()]
+        
+        # --- OpenRouter Logic ---
+        else:
+            if not self.openrouter_api_key: return None
+            headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
+            data = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
+            api_url = "https://openrouter.ai/api/v1/chat/completions"
+            
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=25) as client:
+                response = await client.post(api_url, json=data, headers=headers)
+                response.raise_for_status()
+                res_json = response.json()
+                if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
+                    message = res_json["choices"][0]["message"]["content"]
+                    LOGGER.info(f"Successfully generated message from OpenRouter model: {model_name}.")
+                    return [message.strip()]
+        
+        return None
+
     async def _generate_persian_messages(self, user_id: int, persona: str, previous_message: Optional[str] = None) -> List[str]:
         """Generates a message using a specific persona, optionally replying to a previous message."""
         if not self.openrouter_api_key and not self.gemini_api_key:
             LOGGER.warning("No AI API keys are set. Skipping message generation.")
-            return []
+            return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
 
         keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
         
@@ -747,87 +812,38 @@ class GroupCreatorBot:
                 f"Use slang and emojis if it fits your personality."
             )
         
-        async def make_request_with_backoff(request_func, model_name, max_retries=4, initial_delay=2):
+        async def make_request_with_backoff(request_func, model_name, prompt_text, max_retries=4, initial_delay=2):
             delay = initial_delay
             for attempt in range(max_retries):
                 try:
-                    # [MODIFIED] Get a new proxy on each attempt
                     proxy_info = await self.proxy_manager.get_proxy()
-                    result = await request_func(model_name, proxy_info)
+                    result = await request_func(model_name, prompt_text, proxy_info)
                     if result:
                         return result
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 429:
                         LOGGER.warning(f"Rate limit hit for {model_name} on attempt {attempt + 1}. Retrying in {delay} seconds with a new proxy.")
                         await asyncio.sleep(delay)
-                        delay *= 2  # Exponential backoff
+                        delay *= 2
                     else:
                         LOGGER.error(f"HTTP error for {model_name}: {e}", exc_info=True)
-                        return None # Don't retry on other HTTP errors
+                        return None
                 except Exception as e:
                     LOGGER.error(f"Request failed for {model_name}: {e}", exc_info=True)
                     return None
             LOGGER.error(f"AI request for {model_name} failed after {max_retries} retries.")
             return None
 
-        async def make_openrouter_request(model_name: str, proxy_info: Optional[Dict], timeout: int = 25):
-            if not self.openrouter_api_key: return None
-            headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-            data = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
-            api_url = "https://openrouter.ai/api/v1/chat/completions"
-            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
-            
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
-                response = await client.post(api_url, json=data, headers=headers)
-                response.raise_for_status()
-                res_json = response.json()
-                if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
-                    message = res_json["choices"][0]["message"]["content"]
-                    LOGGER.info(f"Successfully generated message from OpenRouter using model: {model_name}.")
-                    return [message.strip()]
-            return None
-
-        async def make_gemini_request(model_name: str, proxy_info: Optional[Dict], timeout: int = 40):
-            if not self.gemini_api_key: return None
-            # Use the requested model name in the URL
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.gemini_api_key}"
-            payload = {"contents": [{"parts": [{"text": prompt}]}]}
-            headers = {'Content-Type': 'application/json'}
-            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
-
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
-                response = await client.post(api_url, json=payload, headers=headers)
-                response.raise_for_status()
-                res_json = response.json()
-                if res_json.get("candidates") and res_json["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text"):
-                    message = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                    LOGGER.info(f"Successfully generated message from Gemini model: {model_name}.")
-                    return [message.strip()]
-            return None
-
-        # --- [NEW] AI Model Logic ---
-
-        # 1. Primary attempt: Gemini 2.0 Flash
-        LOGGER.info("Attempting AI generation with primary model: gemini-2.0-flash")
-        result = await make_request_with_backoff(make_gemini_request, "gemini-2.0-flash")
-        if result:
-            return result
-
-        # 2. Fallback 1: Kimi (if enabled)
-        if self.use_kimi_model:
-            LOGGER.warning("Primary model failed. Attempting fallback 1: Kimi")
-            result = await make_request_with_backoff(make_openrouter_request, "moonshotai/kimi-k2:free")
+        # [MODIFIED] Iterate through the model hierarchy
+        for model in self.ai_model_hierarchy:
+            LOGGER.info(f"Attempting AI generation with model: {model}")
+            result = await make_request_with_backoff(self._execute_ai_request, model, prompt)
             if result:
                 return result
+            LOGGER.warning(f"Model {model} failed. Trying next model in hierarchy.")
 
-        # 3. Final Fallback: Default OpenRouter model
-        LOGGER.warning("Primary (and Kimi, if enabled) models failed. Attempting final fallback.")
-        result = await make_request_with_backoff(make_openrouter_request, self.ai_model)
-        if result:
-            return result
-
-        LOGGER.error("All AI models failed to generate a response.")
-        return []
+        LOGGER.error("All AI models in the hierarchy failed. Using a predefined fallback message.")
+        return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
 
     async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 7, delay: int = 3) -> bool:
         """[FIXED] Ensures the client has cached the group entity and is a participant."""
@@ -1309,11 +1325,11 @@ class GroupCreatorBot:
         if event.sender_id != ADMIN_USER_ID:
             return
         
-        kimi_status = "Enabled" if self.use_kimi_model else "Disabled"
+        fallback_status = "Enabled" if self.use_fallback_model else "Disabled"
+        
         buttons = [
-            [Button.text("Set AI Model"), Button.text("Set API Key")],
-            [Button.text("Set Custom Prompt")],
-            [Button.text(f"{Config.BTN_TOGGLE_KIMI} ({kimi_status})")],
+            [Button.text("Set AI Model"), Button.text("Set Fallback AI Model")],
+            [Button.text(f"Toggle Fallback AI ({fallback_status})")],
             [Button.text("Set Worker Limit"), Button.text("Set Group Count")],
             [Button.text("Set Sleep Times"), Button.text("Set Daily Msg Limit")],
             [Button.text("Set Proxy Timeout"), Button.text("Set Master Password")],
@@ -1735,20 +1751,22 @@ class GroupCreatorBot:
             
             # Admin settings buttons
             if user_id == ADMIN_USER_ID:
-                if text.startswith(Config.BTN_TOGGLE_KIMI):
-                    await self._toggle_kimi_handler(event)
-                    return
-
                 admin_settings_map = {
-                    "Set AI Model": "AI_MODEL", "Set API Key": "OPENROUTER_API_KEY",
-                    "Set Custom Prompt": "CUSTOM_PROMPT", "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
-                    "Set Group Count": "GROUPS_TO_CREATE", "Set Sleep Times": "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS",
-                    "Set Daily Msg Limit": "DAILY_MESSAGE_LIMIT_PER_GROUP", "Set Proxy Timeout": "PROXY_TIMEOUT",
+                    "Set AI Model": "AI_MODEL", 
+                    "Set Fallback AI Model": "FALLBACK_AI_MODEL",
+                    "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
+                    "Set Group Count": "GROUPS_TO_CREATE", 
+                    "Set Sleep Times": "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS",
+                    "Set Daily Msg Limit": "DAILY_MESSAGE_LIMIT_PER_GROUP", 
+                    "Set Proxy Timeout": "PROXY_TIMEOUT",
                     "Set Master Password": "MASTER_PASSWORD_HASH",
                     "View Config": "VIEW_CONFIG" # Special case
                 }
                 if text in admin_settings_map:
                     await self._handle_admin_setting_button(event, admin_settings_map[text])
+                    return
+                if text.startswith("Toggle Fallback AI"):
+                    await self._toggle_fallback_handler(event)
                     return
 
             handler = button_handlers.get(text)
@@ -2338,6 +2356,18 @@ class GroupCreatorBot:
         session['state'] = 'authenticated'
         session.pop('config_key_to_set', None)
         await self._settings_handler(event)
+        
+    async def _toggle_fallback_handler(self, event: events.NewMessage.Event):
+        """Toggles the USE_FALLBACK_MODEL setting."""
+        current_status = self.config.get("USE_FALLBACK_MODEL", False)
+        new_status = not current_status
+        self.config["USE_FALLBACK_MODEL"] = new_status
+        self._save_json_file(self.config, self.config_file)
+        self.update_config_from_file() # Reload config
+        
+        await event.reply(f"✅ Fallback AI model has been **{'Enabled' if new_status else 'Disabled'}**.")
+        await self._settings_handler(event)
+
 
     # --- [FIXED] DM Chat Handlers ---
     async def _start_dm_chat_handler(self, event: events.NewMessage.Event):
@@ -2436,21 +2466,6 @@ class GroupCreatorBot:
 
     async def _stop_dm_chat_handler(self, event: events.NewMessage.Event):
         await event.reply("DM chat stopping functionality is not yet implemented.")
-
-    async def _toggle_kimi_handler(self, event: events.NewMessage.Event):
-        """Toggles the USE_KIMI_MODEL setting."""
-        if event.sender_id != ADMIN_USER_ID:
-            return
-        
-        current_status = self.config.get("USE_KIMI_MODEL", False)
-        new_status = not current_status
-        self.config["USE_KIMI_MODEL"] = new_status
-        self._save_json_file(self.config, self.config_file)
-        self.update_config_from_file()
-
-        status_text = "Enabled" if new_status else "Disabled"
-        await event.reply(f"✅ Kimi fallback model has been **{status_text}**.")
-        await self._settings_handler(event) # Refresh settings menu
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id
@@ -2596,7 +2611,7 @@ class GroupCreatorBot:
             "Content-Type": "application/json",
         }
         data = {
-            "model": self.ai_model,
+            "model": self.ai_model_hierarchy[0], # Use the primary model for explanations
             "messages": [{"role": "user", "content": prompt}]
         }
         api_url = "https://openrouter.ai/api/v1/chat/completions"
@@ -2649,7 +2664,7 @@ class GroupCreatorBot:
         )
 
         headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-        data = {"model": self.ai_model, "messages": [{"role": "user", "content": full_prompt}]}
+        data = {"model": self.ai_model_hierarchy[0], "messages": [{"role": "user", "content": full_prompt}]}
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
         try:

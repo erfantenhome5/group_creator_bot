@@ -379,8 +379,6 @@ class GroupCreatorBot:
         except (ValueError, TypeError):
             raise ValueError("Invalid ENCRYPTION_KEY. Please generate a valid key.")
 
-        self._initialize_sentry()
-
     def update_config_from_file(self):
         """Update runtime config attributes from the loaded JSON."""
         self.max_workers = self.config.get("MAX_CONCURRENT_WORKERS", Config.MAX_CONCURRENT_WORKERS)
@@ -406,6 +404,7 @@ class GroupCreatorBot:
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
     async def _initialize_sentry(self):
+        """Initializes Sentry for error reporting, tracing, and logging."""
         sentry_dsn = self.config.get("SENTRY_DSN", SENTRY_DSN)
         if not sentry_dsn:
             return
@@ -426,15 +425,19 @@ class GroupCreatorBot:
                             return None
             return event
 
+        # Configure LoggingIntegration to send INFO level logs to Sentry
         sentry_logging = LoggingIntegration(
-            level=logging.INFO,
-            event_level=logging.ERROR
+            level=logging.INFO,        # Capture INFO level logs from Python's logging
+            event_level=logging.ERROR  # Send logs of level ERROR as Sentry events
         )
 
         sentry_options = {
             "dsn": sentry_dsn,
             "integrations": [sentry_logging],
-            "traces_sample_rate": 1.0,
+            "traces_sample_rate": 1.0, # To capture 100% of transactions for tracing
+            "_experiments": {
+                "enable_logs": True, # To enable the Sentry Logs feature
+            },
             "before_send": before_send_hook,
         }
         
@@ -448,7 +451,7 @@ class GroupCreatorBot:
             LOGGER.info("Sentry will not use a proxy (none found).")
 
         sentry_sdk.init(**sentry_options)
-        LOGGER.info("Sentry initialized for error reporting.")
+        LOGGER.info("Sentry initialized for error reporting, tracing, and logging.")
 
     # --- Proxy Helpers ---
     def _load_account_proxies(self) -> Dict[str, Dict]:
@@ -2829,3 +2832,4 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+

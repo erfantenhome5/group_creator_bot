@@ -353,7 +353,7 @@ class GroupCreatorBot:
         self.daily_counts_file = SESSIONS_DIR / "daily_counts.json"
         self.daily_counts = self._load_daily_counts()
         self.proxies = load_proxies_from_file(self.config.get("PROXY_FILE", "proxy.txt"))
-        self.proxy_manager = ProxyManager(self.proxies) # [NEW] Initialize proxy manager
+        self.proxy_manager = ProxyManager(self.proxies)
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
         self.known_users_file = SESSIONS_DIR / "known_users.json"
@@ -395,12 +395,12 @@ class GroupCreatorBot:
         
         # [MODIFIED] AI Model Configuration
         self.ai_model_hierarchy = self.config.get("AI_MODEL_HIERARCHY", [
-            "gemini-2.5-pro-latest",
-            "gemini-2.5-flash-latest",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
             "gemini-2.5-flash-lite-preview-0617",
-            "gemini-2.0-flash-latest",
-            "gemini-2.0-flash-lite-latest",
-            "gemini-1.5-flash-latest"
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash"
         ])
         
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
@@ -755,8 +755,8 @@ class GroupCreatorBot:
         
         if not self.gemini_api_key: return None
         
-        # Correctly format the model name for the API URL
-        api_model_name = model_name.replace("google/", "") # Remove prefix if present
+        # [FIXED] Correctly format the model name for the API URL by removing suffixes
+        api_model_name = model_name.replace("-latest", "").replace("-preview-0617", "")
         
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model_name}:generateContent?key={self.gemini_api_key}"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}

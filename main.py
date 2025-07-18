@@ -644,16 +644,12 @@ class GroupCreatorBot:
         try:
             if not client.is_connected():
                 LOGGER.warning(f"Client for '{account_name}' is disconnected. Reconnecting...")
-                try:
-                    await client.connect()
-                    if client.is_connected():
-                        LOGGER.info(f"Client for '{account_name}' reconnected successfully.")
-                    else:
-                        LOGGER.error(f"Failed to reconnect client for '{account_name}'.")
-                        raise ConnectionError("Client reconnection failed.")
-                except Exception as conn_e:
-                    LOGGER.error(f"Reconnection attempt for '{account_name}' failed: {conn_e}")
-                    raise ConnectionError(f"Client reconnection failed: {conn_e}") from conn_e
+                await client.connect()
+                if client.is_connected():
+                    LOGGER.info(f"Client for '{account_name}' reconnected successfully.")
+                else:
+                    LOGGER.error(f"Failed to reconnect client for '{account_name}'.")
+                    raise ConnectionError("Client reconnection failed.")
             return await client(request)
         except ConnectionError as e:
             LOGGER.error(f"Connection error for '{account_name}' even after check: {e}")
@@ -836,7 +832,7 @@ class GroupCreatorBot:
         LOGGER.error("All AI models in the hierarchy failed. Using a predefined fallback message.")
         return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
 
-    async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 7, delay: int = 3) -> bool:
+    async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 1) -> bool:
         """[FIXED] Ensures the client has cached the group entity and is a participant."""
         for attempt in range(retries):
             try:
@@ -869,9 +865,6 @@ class GroupCreatorBot:
                 else:
                      LOGGER.error(f"Account '{account_name}' failed to cache entity for group {group_id} after {retries} retries.")
                      return False
-            except ConnectionError as e:
-                LOGGER.error(f"ConnectionError during entity caching for '{account_name}' in group {group_id}: {e}. Aborting for this account.")
-                return False
             except Exception as e:
                 LOGGER.error(f"Unexpected error while ensuring entity cached for '{account_name}' in group {group_id}: {e}", exc_info=True)
                 sentry_sdk.capture_exception(e)
@@ -1041,9 +1034,6 @@ class GroupCreatorBot:
                                         await p_client(ImportChatInviteRequest(invite_hash))
                                         LOGGER.info(f"Account '{p_name}' successfully joined group {new_supergroup.id} via link.")
                                         await asyncio.sleep(random.uniform(5, 10)) # Delay to allow server processing
-                                    except errors.FloodWaitError as e:
-                                        LOGGER.warning(f"Flood wait error for '{p_name}' when joining group. Waiting for {e.seconds} seconds.")
-                                        await asyncio.sleep(e.seconds + 5)
                                     except Exception as e:
                                         LOGGER.warning(f"Account '{p_name}' failed to join group {new_supergroup.id} via link: {e}")
                             else:
@@ -1788,7 +1778,7 @@ class GroupCreatorBot:
                 return
         
         except events.StopPropagation:
-            # This is not a real error. Re-raise it so Telethon can handle it.
+            # [FIX] This is not a real error. Re-raise it so Telethon can handle it.
             raise
         except Exception as e:
             # Global error handler for the message router
@@ -2030,11 +2020,6 @@ class GroupCreatorBot:
                     await client(ImportChatInviteRequest(invite_hash))
                     success_count += 1
                     LOGGER.info(f"Account '{account_name}' successfully joined chat with link {link}.")
-                except errors.FloodWaitError as e:
-                    fail_count += 1
-                    fail_details_list.append(f"- `{link}` (Rate Limited: wait {e.seconds}s)")
-                    LOGGER.warning(f"Flood wait on joining link {link}. Waiting {e.seconds} seconds.")
-                    await asyncio.sleep(e.seconds + 5) # Wait and add a buffer
                 except Exception as e:
                     fail_count += 1
                     fail_details_list.append(f"- `{link}` ({e.__class__.__name__})")
@@ -2619,15 +2604,13 @@ class GroupCreatorBot:
             "Content-Type": "application/json",
         }
         data = {
-            "model": self.ai_model_hierarchy[0], # Use the primary model for explanations
+            "model": self.ai_model,
             "messages": [{"role": "user", "content": prompt}]
         }
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
         try:
-            proxy_info = await self.proxy_manager.get_proxy()
-            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=40.0) as client:
+            async with httpx.AsyncClient(timeout=40.0) as client:
                 response = await client.post(api_url, json=data, headers=headers)
                 response.raise_for_status()
                 res_json = response.json()
@@ -2672,13 +2655,11 @@ class GroupCreatorBot:
         )
 
         headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-        data = {"model": self.ai_model_hierarchy[0], "messages": [{"role": "user", "content": full_prompt}]}
+        data = {"model": self.ai_model, "messages": [{"role": "user", "content": full_prompt}]}
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
         try:
-            proxy_info = await self.proxy_manager.get_proxy()
-            proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(api_url, json=data, headers=headers)
                 response.raise_for_status()
                 res_json = response.json()

@@ -2385,25 +2385,38 @@ class GroupCreatorBot:
         self.user_sessions[user_id]['dm_target'] = target_entity
         self.user_sessions[user_id]['state'] = 'awaiting_dm_account_selection'
         
-        accounts = self.session_manager.get_user_accounts(user_id)
-        if not accounts:
-            await event.reply("❌ You have no accounts to use for the DM. Please add an account first.")
+        # [MODIFIED] Allow admin to use any account from any user
+        all_accounts = self.session_manager.get_all_accounts()
+        if not all_accounts:
+            await event.reply("❌ No accounts from any user are connected to the bot.")
             self.user_sessions[user_id]['state'] = 'authenticated'
             return
 
-        buttons = [[Button.text(acc)] for acc in accounts]
+        buttons = [[Button.text(full_account_key)] for full_account_key in all_accounts.keys()]
         buttons.append([Button.text(Config.BTN_BACK)])
-        await event.reply("🤖 Please select the account that will initiate the DM chat.", buttons=buttons)
+        await event.reply("🤖 Please select the account that will initiate the DM chat (format is `UserID:AccountName`).", buttons=buttons)
 
     async def _handle_dm_account_selection(self, event: events.NewMessage.Event):
         """Handles selecting the account to use for the DM."""
         user_id = event.sender_id
-        account_name = event.text.strip()
-        if account_name not in self.session_manager.get_user_accounts(user_id):
+        full_account_key = event.text.strip()
+        all_accounts = self.session_manager.get_all_accounts()
+
+        if full_account_key not in all_accounts:
             await event.reply("❌ Invalid account selected. Please use the buttons.")
             return
+        
+        try:
+            dm_user_id_str, dm_account_name = full_account_key.split(":", 1)
+            dm_user_id = int(dm_user_id_str)
+        except ValueError:
+            await event.reply("❌ Invalid account format selected. Please try again.")
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            await self._start_handler(event)
+            return
 
-        self.user_sessions[user_id]['dm_account_name'] = account_name
+        self.user_sessions[user_id]['dm_user_id'] = dm_user_id
+        self.user_sessions[user_id]['dm_account_name'] = dm_account_name
         self.user_sessions[user_id]['state'] = 'awaiting_dm_initial_prompt'
         await event.reply("✍️ Please provide the initial message to send to the target user.", buttons=[[Button.text(Config.BTN_BACK)]])
 
@@ -2412,22 +2425,23 @@ class GroupCreatorBot:
         user_id = event.sender_id
         initial_message = event.text.strip()
         session_data = self.user_sessions.get(user_id, {})
+        
+        # [MODIFIED] Use the stored dm_user_id and dm_account_name
         account_name = session_data.get('dm_account_name')
+        dm_user_id = session_data.get('dm_user_id')
         target_entity = session_data.get('dm_target')
 
-        if not all([account_name, target_entity, initial_message]):
+        if not all([account_name, dm_user_id, target_entity, initial_message]):
             await event.reply("❌ An internal error occurred (missing DM data). Please start over.")
             self.user_sessions[user_id]['state'] = 'authenticated'
             return
 
         await event.reply(f"🚀 Starting DM chat from `{account_name}` to `{target_entity}`...")
         
-        # This part can be expanded into a full background task like the conversation worker
-        # For now, it will just send one message.
         client = None
         try:
-            session_str = self.session_manager.load_session_string(user_id, account_name)
-            proxy = self.account_proxies.get(f"{user_id}:{account_name}")
+            session_str = self.session_manager.load_session_string(dm_user_id, account_name)
+            proxy = self.account_proxies.get(f"{dm_user_id}:{account_name}")
             client = await self._create_worker_client(session_str, proxy)
             if not client:
                 await event.reply("❌ Failed to connect with the selected account.")
@@ -2446,6 +2460,7 @@ class GroupCreatorBot:
             # Clean up DM state
             session_data.pop('dm_target', None)
             session_data.pop('dm_account_name', None)
+            session_data.pop('dm_user_id', None)
             session_data['state'] = 'authenticated'
 
     # These are placeholders for the other DM states that were in the original router but not implemented

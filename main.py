@@ -2566,15 +2566,22 @@ class GroupCreatorBot:
                 await event.reply("❌ Failed to connect with the selected account.")
                 return
 
+            LOGGER.info(f"Fetching last 50 messages from conversation with {target_user} using account {account_name}.")
             history = await client.get_messages(target_user, limit=50)
-            history_text = "\n".join([f"{msg.sender.username if msg.sender else 'Unknown'}: {msg.text}" for msg in reversed(history) if msg.text])
-            
+            if not history:
+                LOGGER.warning(f"No message history found with {target_user}.")
+                await event.reply(f"No message history found with {target_user}.")
+                return
+
+            history_text = "\n".join([f"{(await client.get_me()).first_name if msg.out else target_user}: {msg.text}" for msg in reversed(history) if msg.text])
+            LOGGER.info(f"Formatted history of {len(history)} messages for AI context.")
+
             ai_prompt = (
-                f"This is a conversation history with {target_user}:\n\n{history_text}\n\n"
-                f"Based on this conversation, what is it about? After summarizing, follow this instruction: {prompt}"
+                f"This is a conversation history between me and {target_user}:\n\n---\n{history_text}\n---\n\n"
+                f"Based on this conversation, continue the chat naturally. My instruction is: {prompt}"
             )
+            LOGGER.info("Sending prompt to AI for message generation.")
             
-            # Using OpenRouter for this task
             model_name = self.openrouter_model_hierarchy[0]
             headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
             data = {"model": model_name, "messages": [{"role": "user", "content": ai_prompt}]}
@@ -2585,35 +2592,50 @@ class GroupCreatorBot:
                 response.raise_for_status()
                 res_json = response.json()
                 ai_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            if not ai_message:
+                LOGGER.error("AI failed to generate a message.")
+                await event.reply("❌ AI failed to generate a message.")
+                return
 
+            LOGGER.info(f"AI generated message: '{ai_message[:50]}...'")
             await client.send_message(target_user, ai_message)
             await event.reply("✅ Message sent. Waiting for reply...")
             
-            # Wait for a reply
-            @self.bot.on(events.NewMessage(from_users=target_user, chats=account_name))
+            @self.bot.on(events.NewMessage(from_users=target_user, chats=dm_user_id))
             async def reply_handler(reply_event):
+                LOGGER.info(f"Received reply from {target_user}: '{reply_event.text}'")
                 reply_text = reply_event.text
                 
-                # Feed reply back to AI
                 follow_up_prompt = f"The user replied: {reply_text}. What should be the response?"
                 data["messages"].append({"role": "assistant", "content": ai_message})
                 data["messages"].append({"role": "user", "content": follow_up_prompt})
 
+                LOGGER.info("Sending follow-up prompt to AI.")
                 async with httpx.AsyncClient(timeout=120.0) as http_client:
                     response = await http_client.post(api_url, json=data, headers=headers)
                     response.raise_for_status()
                     res_json = response.json()
                     follow_up_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
                 
-                await client.send_message(target_user, follow_up_message)
+                if follow_up_message:
+                    LOGGER.info(f"AI generated follow-up: '{follow_up_message[:50]}...'")
+                    await client.send_message(target_user, follow_up_message)
+                    LOGGER.info("Follow-up message sent.")
+                else:
+                    LOGGER.error("AI failed to generate follow-up message.")
+                
                 self.bot.remove_event_handler(reply_handler)
+                LOGGER.info("Reply handler removed.")
 
         except Exception as e:
+            LOGGER.error(f"Error in /dm_message flow: {e}", exc_info=True)
             await self._send_error_explanation(user_id, e)
         finally:
             if client and client.is_connected():
                 await client.disconnect()
             session_data['state'] = 'authenticated'
+            LOGGER.info("/dm_message flow finished.")
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id

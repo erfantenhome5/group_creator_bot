@@ -454,6 +454,22 @@ class GroupCreatorBot:
         sentry_sdk.init(**sentry_options)
         LOGGER.info("Sentry initialized for error reporting, tracing, and logging.")
 
+    # --- [NEW] Session Helper ---
+    def _ensure_session(self, user_id: int):
+        """
+        Ensures a session dictionary exists for the given user_id.
+        If a session doesn't exist, it initializes one with a default state.
+        """
+        if user_id not in self.user_sessions:
+            LOGGER.info(f"No session found for user {user_id}. Initializing a new one.")
+            # For the admin or other known users, go straight to authenticated state.
+            # This handles cases where the admin uses a command without /start.
+            if user_id == ADMIN_USER_ID or user_id in self.known_users:
+                self.user_sessions[user_id] = {'state': 'authenticated'}
+            else:
+                # For new, unknown users, set them to the initial password prompt state.
+                self.user_sessions[user_id] = {'state': 'awaiting_master_password'}
+
     # --- Proxy Helpers ---
     def _load_account_proxies(self) -> Dict[str, Dict]:
         if not self.account_proxy_file.exists():
@@ -1332,6 +1348,9 @@ class GroupCreatorBot:
         if event.sender_id != ADMIN_USER_ID:
             await event.reply("❌ You are not authorized to use this command.")
             return
+        
+        # [FIX] Ensure the admin's session is initialized to prevent KeyErrors
+        self._ensure_session(event.sender_id)
         
         text = event.message.text
         
@@ -2607,22 +2626,27 @@ class GroupCreatorBot:
             "Authorization": f"Bearer {self.openrouter_api_key}",
             "Content-Type": "application/json",
         }
-        data = {
-            "model": self.ai_model,
-            "messages": [{"role": "user", "content": prompt}]
-        }
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
-        try:
-            async with httpx.AsyncClient(timeout=40.0) as client:
-                response = await client.post(api_url, json=data, headers=headers)
-                response.raise_for_status()
-                res_json = response.json()
-                if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
-                    return res_json["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            LOGGER.error(f"Failed to get AI error explanation: {e}", exc_info=True)
+        # [FIX] Iterate through the model hierarchy for robustness
+        for model_name in self.ai_model_hierarchy:
+            LOGGER.info(f"Attempting AI error explanation with model: {model_name}")
+            data = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            try:
+                async with httpx.AsyncClient(timeout=40.0) as client:
+                    response = await client.post(api_url, json=data, headers=headers)
+                    response.raise_for_status()
+                    res_json = response.json()
+                    if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
+                        return res_json["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                LOGGER.warning(f"Failed to get AI error explanation from model {model_name}: {e}")
+                # Continue to the next model in the hierarchy
         
+        LOGGER.error("All AI models in the hierarchy failed for error explanation.")
         return None
 
     async def _send_error_explanation(self, user_id: int, e: Exception):
@@ -2659,51 +2683,50 @@ class GroupCreatorBot:
         )
 
         headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-        data = {"model": self.ai_model, "messages": [{"role": "user", "content": full_prompt}]}
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(api_url, json=data, headers=headers)
-                response.raise_for_status()
-                res_json = response.json()
-                
-                message_content = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
-                # [FIX] More robust JSON extraction to handle malformed AI responses.
-                json_str = message_content
-                start_index = json_str.find('{')
-                end_index = json_str.rfind('}')
-                
-                if start_index == -1 or end_index == -1:
-                    LOGGER.error(f"AI response did not contain a JSON object. Response: {message_content}")
-                    await self.bot.send_message(ADMIN_USER_ID, f"❌ AI response did not contain a JSON object:\n`{message_content}`")
-                    return None
+        # [FIX] Iterate through the model hierarchy for robustness
+        for model_name in self.ai_model_hierarchy:
+            LOGGER.info(f"Attempting AI code suggestion with model: {model_name}")
+            data = {"model": model_name, "messages": [{"role": "user", "content": full_prompt}]}
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(api_url, json=data, headers=headers)
+                    response.raise_for_status()
+                    res_json = response.json()
+                    
+                    message_content = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    
+                    json_str = message_content
+                    start_index = json_str.find('{')
+                    end_index = json_str.rfind('}')
+                    
+                    if start_index == -1 or end_index == -1:
+                        LOGGER.warning(f"AI response from model {model_name} did not contain a JSON object. Response: {message_content}")
+                        continue
 
-                json_str = json_str[start_index:end_index+1]
-                
-                try:
-                    # It's possible the string inside the JSON is not properly escaped.
-                    # This is a common issue with LLMs generating JSON.
-                    # We can try to fix common issues like unescaped newlines.
-                    json_str_cleaned = json_str.replace('\n', '\\n')
-                    parsed_json = json.loads(json_str_cleaned)
+                    json_str = json_str[start_index:end_index+1]
+                    
+                    try:
+                        json_str_cleaned = json_str.replace('\n', '\\n')
+                        parsed_json = json.loads(json_str_cleaned)
 
-                    if "suggestion" in parsed_json and "code" in parsed_json:
-                        return parsed_json
-                    else:
-                        LOGGER.error(f"AI JSON response was missing 'suggestion' or 'code' keys. Response: {parsed_json}")
-                        await self.bot.send_message(ADMIN_USER_ID, f"❌ AI JSON was missing required keys:\n`{parsed_json}`")
-                        return None
-                except json.JSONDecodeError as e:
-                    LOGGER.error(f"Failed to decode JSON from AI response: {e}. Raw text: {json_str}", exc_info=True)
-                    await self.bot.send_message(ADMIN_USER_ID, f"❌ Failed to decode JSON from AI. Error: `{e}`\n\n**Raw Text:**\n`{json_str}`")
-                    return None
+                        if "suggestion" in parsed_json and "code" in parsed_json:
+                            return parsed_json
+                        else:
+                            LOGGER.warning(f"AI JSON response from model {model_name} was missing 'suggestion' or 'code' keys. Response: {parsed_json}")
+                            continue
+                    except json.JSONDecodeError as e:
+                        LOGGER.warning(f"Failed to decode JSON from AI response from model {model_name}: {e}. Raw text: {json_str}")
+                        continue
 
-        except Exception as e:
-            LOGGER.error(f"An error occurred during AI code suggestion: {e}", exc_info=True)
-            await self.bot.send_message(ADMIN_USER_ID, f"❌ An error occurred during AI API call: `{e}`")
-            return None
+            except Exception as e:
+                LOGGER.warning(f"An error occurred during AI code suggestion with model {model_name}: {e}")
+                # Continue to the next model in the hierarchy
+        
+        LOGGER.error("All AI models in the hierarchy failed for code suggestion.")
+        await self.bot.send_message(ADMIN_USER_ID, "❌ All AI models failed to generate a valid code suggestion.")
+        return None
 
     async def _trigger_ai_suggestion(self, test_mode=False):
         """Contains the core logic for generating and proposing an AI code suggestion."""

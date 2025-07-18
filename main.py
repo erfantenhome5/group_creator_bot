@@ -30,7 +30,8 @@ from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             GetAllStickersRequest,
                                             GetStickerSetRequest,
                                             ImportChatInviteRequest,
-                                            SendReactionRequest)
+                                            SendReactionRequest,
+                                            SearchStickerSetsRequest)
 from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Message,
                                PeerChannel, ReactionEmoji)
 
@@ -2790,6 +2791,7 @@ class GroupCreatorBot:
 
     async def run(self) -> None:
         """Main entry point for the bot."""
+        await self._initialize_sentry()
         self.register_handlers()
         LOGGER.info("Starting bot...")
         try:
@@ -2832,4 +2834,3 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
-

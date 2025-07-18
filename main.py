@@ -30,8 +30,7 @@ from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             GetAllStickersRequest,
                                             GetStickerSetRequest,
                                             ImportChatInviteRequest,
-                                            SendReactionRequest,
-                                            SearchStickerSetsRequest)
+                                            SendReactionRequest)
 from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Message,
                                PeerChannel, ReactionEmoji)
 
@@ -2834,3 +2833,4 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+

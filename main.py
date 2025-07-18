@@ -393,7 +393,7 @@ class GroupCreatorBot:
         self.gemini_api_key = self.config.get("GEMINI_API_KEY", GEMINI_API_KEY)
         
         # [MODIFIED] AI Model Configuration
-        self.ai_model_hierarchy = self.config.get("AI_MODEL_HIERARCHY", [
+        self.gemini_model_hierarchy = self.config.get("GEMINI_MODEL_HIERARCHY", [
             "gemini-2.5-pro",
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite-preview-0617",
@@ -402,6 +402,11 @@ class GroupCreatorBot:
             "gemini-1.5-flash"
         ])
         
+        self.openrouter_model_hierarchy = self.config.get("OPENROUTER_MODEL_HIERARCHY", [
+            "moonshotai/kimi-k2:free",
+            "openrouter/auto"
+        ])
+
         self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
     async def _initialize_sentry(self):
@@ -765,13 +770,12 @@ class GroupCreatorBot:
         documents = self.sticker_sets.get(pack_name_to_use)
         return random.choice(documents) if documents else None
 
-    async def _execute_ai_request(self, model_name: str, prompt: str, proxy_info: Optional[Dict]) -> Optional[List[str]]:
+    async def _execute_gemini_request(self, model_name: str, prompt: str, proxy_info: Optional[Dict]) -> Optional[List[str]]:
         """A unified function to execute an AI request against the Gemini API."""
         proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
         
         if not self.gemini_api_key: return None
         
-        # [FIXED] Correctly format the model name for the API URL by removing suffixes
         api_model_name = model_name.replace("-latest", "").replace("-preview-0617", "")
         
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model_name}:generateContent?key={self.gemini_api_key}"
@@ -842,9 +846,9 @@ class GroupCreatorBot:
             return None
 
         # Iterate through the model hierarchy
-        for model in self.ai_model_hierarchy:
+        for model in self.gemini_model_hierarchy:
             LOGGER.info(f"Attempting AI generation with model: {model}")
-            result = await make_request_with_backoff(self._execute_ai_request, model, prompt)
+            result = await make_request_with_backoff(self._execute_gemini_request, model, prompt)
             if result:
                 return result
             LOGGER.warning(f"Model {model} failed. Trying next model in hierarchy.")
@@ -2305,7 +2309,7 @@ class GroupCreatorBot:
             return
         
         if config_key == "AI_MODEL_HIERARCHY":
-            current_hierarchy = ", ".join(self.ai_model_hierarchy)
+            current_hierarchy = ", ".join(self.gemini_model_hierarchy)
             prompt_message = f"Please enter the new AI model hierarchy, separated by commas.\n**Current:**\n`{current_hierarchy}`"
         elif config_key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
              prompt_message = f"Please enter the new min and max sleep times, separated by a comma (e.g., `300,900`).\nCurrent: `{self.min_sleep_seconds},{self.max_sleep_seconds}`"
@@ -2628,8 +2632,7 @@ class GroupCreatorBot:
         }
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
-        # [FIX] Iterate through the model hierarchy for robustness
-        for model_name in self.ai_model_hierarchy:
+        for model_name in self.openrouter_model_hierarchy:
             LOGGER.info(f"Attempting AI error explanation with model: {model_name}")
             data = {
                 "model": model_name,
@@ -2644,7 +2647,6 @@ class GroupCreatorBot:
                         return res_json["choices"][0]["message"]["content"].strip()
             except Exception as e:
                 LOGGER.warning(f"Failed to get AI error explanation from model {model_name}: {e}")
-                # Continue to the next model in the hierarchy
         
         LOGGER.error("All AI models in the hierarchy failed for error explanation.")
         return None
@@ -2659,7 +2661,6 @@ class GroupCreatorBot:
         
         user_message = "❌ یک خطای پیش‌بینی نشده رخ داد. لطفاً دوباره تلاش کنید."
         if ai_explanation:
-            # [FIX] Don't say "AI Analysis", just give the explanation.
             user_message += f"\n\n{ai_explanation}"
         
         try:
@@ -2685,8 +2686,7 @@ class GroupCreatorBot:
         headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
         api_url = "https://openrouter.ai/api/v1/chat/completions"
         
-        # [FIX] Iterate through the model hierarchy for robustness
-        for model_name in self.ai_model_hierarchy:
+        for model_name in self.openrouter_model_hierarchy:
             LOGGER.info(f"Attempting AI code suggestion with model: {model_name}")
             data = {"model": model_name, "messages": [{"role": "user", "content": full_prompt}]}
             try:
@@ -2722,7 +2722,6 @@ class GroupCreatorBot:
 
             except Exception as e:
                 LOGGER.warning(f"An error occurred during AI code suggestion with model {model_name}: {e}")
-                # Continue to the next model in the hierarchy
         
         LOGGER.error("All AI models in the hierarchy failed for code suggestion.")
         await self.bot.send_message(ADMIN_USER_ID, "❌ All AI models failed to generate a valid code suggestion.")

@@ -1405,6 +1405,8 @@ class GroupCreatorBot:
             await self._start_dm_chat_handler(event)
         elif text == "/stop_dm_chat":
             await self._stop_dm_chat_handler(event)
+        elif text == "/dm_message":
+            await self._start_dm_message_handler(event)
         else:
             await event.reply("Unknown admin command.")
 
@@ -1730,6 +1732,9 @@ class GroupCreatorBot:
                 'awaiting_dm_persona': self._handle_dm_persona,
                 'awaiting_dm_sticker_packs': self._handle_dm_sticker_packs,
                 'awaiting_dm_initial_prompt': self._handle_dm_initial_prompt,
+                'awaiting_dm_message_account_selection': self._handle_dm_message_account_selection,
+                'awaiting_dm_message_target_user': self._handle_dm_message_target_user,
+                'awaiting_dm_message_prompt': self._handle_dm_message_prompt,
             }
 
             if text == Config.BTN_BACK:
@@ -2486,6 +2491,129 @@ class GroupCreatorBot:
 
     async def _stop_dm_chat_handler(self, event: events.NewMessage.Event):
         await event.reply("DM chat stopping functionality is not yet implemented.")
+
+    # --- [NEW] AI-assisted DM message handlers ---
+    async def _start_dm_message_handler(self, event: events.NewMessage.Event):
+        """Starts the AI-assisted DM message workflow."""
+        user_id = event.sender_id
+        if user_id != ADMIN_USER_ID:
+            return
+        
+        self.user_sessions[user_id]['state'] = 'awaiting_dm_message_account_selection'
+        
+        all_accounts = self.session_manager.get_all_accounts()
+        if not all_accounts:
+            await event.reply("❌ No accounts are connected to the bot.")
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        buttons = [[Button.text(full_account_key)] for full_account_key in all_accounts.keys()]
+        buttons.append([Button.text(Config.BTN_BACK)])
+        await event.reply("🤖 Please select the account to send the message from (format is `UserID:AccountName`).", buttons=buttons)
+
+    async def _handle_dm_message_account_selection(self, event: events.NewMessage.Event):
+        user_id = event.sender_id
+        full_account_key = event.text.strip()
+        all_accounts = self.session_manager.get_all_accounts()
+
+        if full_account_key not in all_accounts:
+            await event.reply("❌ Invalid account selected. Please use the buttons.")
+            return
+        
+        try:
+            dm_user_id_str, dm_account_name = full_account_key.split(":", 1)
+            dm_user_id = int(dm_user_id_str)
+        except ValueError:
+            await event.reply("❌ Invalid account format selected. Please try again.")
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            await self._start_handler(event)
+            return
+
+        self.user_sessions[user_id]['dm_user_id'] = dm_user_id
+        self.user_sessions[user_id]['dm_account_name'] = dm_account_name
+        self.user_sessions[user_id]['state'] = 'awaiting_dm_message_target_user'
+        await event.reply("👤 Please enter the target username.", buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _handle_dm_message_target_user(self, event: events.NewMessage.Event):
+        user_id = event.sender_id
+        target_user = event.text.strip()
+        self.user_sessions[user_id]['dm_target'] = target_user
+        self.user_sessions[user_id]['state'] = 'awaiting_dm_message_prompt'
+        await event.reply("✍️ Please provide the prompt for the AI.", buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _handle_dm_message_prompt(self, event: events.NewMessage.Event):
+        user_id = event.sender_id
+        prompt = event.text.strip()
+        session_data = self.user_sessions.get(user_id, {})
+        
+        account_name = session_data.get('dm_account_name')
+        dm_user_id = session_data.get('dm_user_id')
+        target_user = session_data.get('dm_target')
+
+        if not all([account_name, dm_user_id, target_user, prompt]):
+            await event.reply("❌ An internal error occurred. Please start over.")
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        await event.reply(f"⏳ Reading message history with {target_user}...")
+        
+        client = None
+        try:
+            session_str = self.session_manager.load_session_string(dm_user_id, account_name)
+            proxy = self.account_proxies.get(f"{dm_user_id}:{account_name}")
+            client = await self._create_worker_client(session_str, proxy)
+            if not client:
+                await event.reply("❌ Failed to connect with the selected account.")
+                return
+
+            history = await client.get_messages(target_user, limit=50)
+            history_text = "\n".join([f"{msg.sender.username if msg.sender else 'Unknown'}: {msg.text}" for msg in reversed(history) if msg.text])
+            
+            ai_prompt = (
+                f"This is a conversation history with {target_user}:\n\n{history_text}\n\n"
+                f"Based on this conversation, what is it about? After summarizing, follow this instruction: {prompt}"
+            )
+            
+            # Using OpenRouter for this task
+            model_name = self.openrouter_model_hierarchy[0]
+            headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
+            data = {"model": model_name, "messages": [{"role": "user", "content": ai_prompt}]}
+            api_url = "https://openrouter.ai/api/v1/chat/completions"
+
+            async with httpx.AsyncClient(timeout=120.0) as http_client:
+                response = await http_client.post(api_url, json=data, headers=headers)
+                response.raise_for_status()
+                res_json = response.json()
+                ai_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+            await client.send_message(target_user, ai_message)
+            await event.reply("✅ Message sent. Waiting for reply...")
+            
+            # Wait for a reply
+            @self.bot.on(events.NewMessage(from_users=target_user, chats=account_name))
+            async def reply_handler(reply_event):
+                reply_text = reply_event.text
+                
+                # Feed reply back to AI
+                follow_up_prompt = f"The user replied: {reply_text}. What should be the response?"
+                data["messages"].append({"role": "assistant", "content": ai_message})
+                data["messages"].append({"role": "user", "content": follow_up_prompt})
+
+                async with httpx.AsyncClient(timeout=120.0) as http_client:
+                    response = await http_client.post(api_url, json=data, headers=headers)
+                    response.raise_for_status()
+                    res_json = response.json()
+                    follow_up_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                await client.send_message(target_user, follow_up_message)
+                self.bot.remove_event_handler(reply_handler)
+
+        except Exception as e:
+            await self._send_error_explanation(user_id, e)
+        finally:
+            if client and client.is_connected():
+                await client.disconnect()
+            session_data['state'] = 'authenticated'
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id

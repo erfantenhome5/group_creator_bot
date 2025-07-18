@@ -1384,7 +1384,7 @@ class GroupCreatorBot:
             await self._test_self_healing_handler(event)
         elif text == "/test_ai_generation":
             await self._test_ai_generation_handler(event)
-        elif text == "/start_dm_chat":
+        elif text == "/dm_chat":
             await self._start_dm_chat_handler(event)
         elif text == "/stop_dm_chat":
             await self._stop_dm_chat_handler(event)

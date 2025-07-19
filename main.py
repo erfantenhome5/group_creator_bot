@@ -169,7 +169,8 @@ class Config:
     DAILY_MESSAGE_LIMIT_PER_GROUP = 20
     MESSAGE_SEND_DELAY_MIN = 1
     MESSAGE_SEND_DELAY_MAX = 5
-    GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 604800 # [MODIFIED] 7 days
+    GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 604800 # 7 days
+    AI_REQUEST_TIMEOUT = 10 # [NEW]
 
     # [NEW] Predefined fallback messages for when AI fails
     PREDEFINED_FALLBACK_MESSAGES = [
@@ -194,6 +195,17 @@ class Config:
         "یک فرد عملگرا و واقع بین که همیشه به دنبال راه حل های عملی برای مشکلات است.",
         "یک هنرمند خلاق که در مورد هنر، موسیقی و زیبایی صحبت می کند.",
         "یک ورزشکار پرانرژی که در مورد تناسب اندام و سبک زندگی سالم صحبت می کند."
+    ]
+    
+    # [NEW & EXPANDED] User agents for more diverse client representation
+    USER_AGENTS = [
+        {'device_model': 'iPhone 15 Pro Max', 'system_version': '17.5.1'},
+        {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'},
+        {'device_model': 'iPhone 14 Pro', 'system_version': '17.4.1'},
+        {'device_model': 'Google Pixel 8 Pro', 'system_version': 'SDK 34'},
+        {'device_model': 'Samsung Galaxy Z Fold 5', 'system_version': 'SDK 33'},
+        {'device_model': 'iPhone 13', 'system_version': '16.6'},
+        {'device_model': 'Xiaomi 13T Pro', 'system_version': 'SDK 33'}
     ]
 
     # --- UI Text & Buttons (All in Persian) ---
@@ -222,6 +234,9 @@ class Config:
     MSG_HELP_TEXT = (
         "**راهنمای جامع ربات**\n\n"
         "این ربات به شما اجازه می‌دهد تا با چندین حساب تلگرام به صورت همزمان گروه‌های جدید بسازید.\n\n"
+        "**دستورات ادمین:**\n"
+        "- `/broadcast [message]`: ارسال پیام همگانی به تمام کاربران.\n"
+        "- `/set_user_limit [user_id] [limit]`: تنظیم محدودیت ورکر برای یک کاربر.\n\n"
         f"**{BTN_MANAGE_ACCOUNTS}**\n"
         "در این بخش می‌توانید حساب‌های خود را مدیریت کنید:\n"
         f"  - `{BTN_ADD_ACCOUNT}`: یک شماره تلفن جدید با روش API اضافه کنید.\n"
@@ -385,6 +400,8 @@ class GroupCreatorBot:
         self.user_sticker_packs = self._load_user_sticker_packs()
         self.conversation_accounts_file = SESSIONS_DIR / "conversation_accounts.json"
         self.conversation_accounts = self._load_conversation_accounts()
+        self.user_worker_limits_file = SESSIONS_DIR / "user_worker_limits.json" # [NEW]
+        self.user_worker_limits = self._load_user_worker_limits() # [NEW]
         self.sticker_sets: Dict[str, Any] = {}
         try:
             fernet = Fernet(ENCRYPTION_KEY.encode())
@@ -404,8 +421,8 @@ class GroupCreatorBot:
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
         self.gemini_api_key = self.config.get("GEMINI_API_KEY", GEMINI_API_KEY)
         self.health_check_interval = self.config.get("GROUP_HEALTH_CHECK_INTERVAL_SECONDS", Config.GROUP_HEALTH_CHECK_INTERVAL_SECONDS)
+        self.ai_request_timeout = self.config.get("AI_REQUEST_TIMEOUT", Config.AI_REQUEST_TIMEOUT)
         
-        # [MODIFIED] AI Model Configuration
         self.gemini_model_hierarchy = self.config.get("GEMINI_MODEL_HIERARCHY", [
             "gemini-2.5-pro",
             "gemini-2.5-flash",
@@ -444,7 +461,6 @@ class GroupCreatorBot:
                             return None
             return event
 
-        # Configure LoggingIntegration to send INFO level logs to Sentry
         sentry_logging = LoggingIntegration(
             level=logging.INFO,        # Capture INFO level logs from Python's logging
             event_level=logging.ERROR  # Send logs of level ERROR as Sentry events
@@ -472,7 +488,6 @@ class GroupCreatorBot:
         sentry_sdk.init(**sentry_options)
         LOGGER.info("Sentry initialized for error reporting, tracing, and logging.")
 
-    # --- [NEW] Session Helper ---
     def _ensure_session(self, user_id: int):
         """
         Ensures a session dictionary exists for the given user_id.
@@ -480,31 +495,17 @@ class GroupCreatorBot:
         """
         if user_id not in self.user_sessions:
             LOGGER.info(f"No session found for user {user_id}. Initializing a new one.")
-            # For the admin or other known users, go straight to authenticated state.
-            # This handles cases where the admin uses a command without /start.
             if user_id == ADMIN_USER_ID or user_id in self.known_users:
                 self.user_sessions[user_id] = {'state': 'authenticated'}
             else:
-                # For new, unknown users, set them to the initial password prompt state.
                 self.user_sessions[user_id] = {'state': 'awaiting_master_password'}
 
     # --- Proxy Helpers ---
     def _load_account_proxies(self) -> Dict[str, Dict]:
-        if not self.account_proxy_file.exists():
-            return {}
-        try:
-            with self.account_proxy_file.open("r", encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            LOGGER.error("Could not read or parse account_proxies.json. Starting with empty assignments.")
-            return {}
+        return self._load_json_file(self.account_proxy_file, {})
 
     def _save_account_proxies(self) -> None:
-        try:
-            with self.account_proxy_file.open("w", encoding='utf-8') as f:
-                json.dump(self.account_proxies, f, indent=4)
-        except IOError:
-            LOGGER.error("Could not save account_proxies.json.")
+        self._save_json_file(self.account_proxies, self.account_proxy_file)
 
     def _get_available_proxy(self) -> Optional[Dict]:
         if not self.proxies:
@@ -610,6 +611,12 @@ class GroupCreatorBot:
     def _save_created_groups(self) -> None:
         self._save_json_file(self.created_groups, self.created_groups_file)
 
+    def _load_user_worker_limits(self) -> Dict[str, int]: # [NEW]
+        return self._load_json_file(self.user_worker_limits_file, {})
+
+    def _save_user_worker_limits(self) -> None: # [NEW]
+        self._save_json_file(self.user_worker_limits, self.user_worker_limits_file)
+
     def _get_group_count(self, worker_key: str) -> int:
         return self.group_counts.get(worker_key, 0)
 
@@ -641,7 +648,7 @@ class GroupCreatorBot:
 
     async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         session = sessions.StringSession()
-        device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+        device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
 
         try:
             proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy (direct connection)"
@@ -656,7 +663,7 @@ class GroupCreatorBot:
 
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         session = sessions.StringSession(session_string)
-        device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+        device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
 
         client = TelegramClient(
             session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout,
@@ -795,7 +802,7 @@ class GroupCreatorBot:
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         headers = {'Content-Type': 'application/json'}
         
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=40) as client:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=self.ai_request_timeout) as client: # [MODIFIED]
             response = await client.post(api_url, json=payload, headers=headers)
             response.raise_for_status()
             res_json = response.json()
@@ -836,7 +843,7 @@ class GroupCreatorBot:
                 f"Use slang and emojis if it fits your personality."
             )
         
-        async def make_request_with_backoff(request_func, model_name, prompt_text, max_retries=4, initial_delay=2):
+        async def make_request_with_backoff(request_func, model_name, prompt_text, max_retries=1, initial_delay=2): # [MODIFIED]
             delay = initial_delay
             for attempt in range(max_retries):
                 try:
@@ -1408,18 +1415,18 @@ class GroupCreatorBot:
             await event.reply("❌ You are not authorized to use this command.")
             return
         
-        # [FIX] Ensure the admin's session is initialized to prevent KeyErrors
         self._ensure_session(event.sender_id)
         
         text = event.message.text
         
-        # Commands with arguments
         pre_approve_match = re.match(r"/pre_approve (\d+)", text)
         ban_match = re.match(r"/ban (\d+)", text)
         unban_match = re.match(r"/unban (\d+)", text)
         set_config_match = re.match(r"/set_config (\w+) (.*)", text, re.DOTALL)
         terminate_match = re.match(r"/terminate_worker (.*)", text)
         restart_match = re.match(r"/restart_worker (.*)", text)
+        set_user_limit_match = re.match(r"/set_user_limit (\d+) (\d+)", text) # [NEW]
+        broadcast_match = re.match(r"/broadcast (.+)", text, re.DOTALL) # [NEW]
 
         if pre_approve_match:
             await self._pre_approve_handler(event, int(pre_approve_match.group(1)))
@@ -1433,7 +1440,10 @@ class GroupCreatorBot:
             await self._terminate_worker_handler(event, terminate_match.group(1))
         elif restart_match:
             await self._restart_worker_handler(event, restart_match.group(1))
-        # Commands without arguments
+        elif set_user_limit_match: # [NEW]
+            await self._set_user_limit_handler(event, int(set_user_limit_match.group(1)), int(set_user_limit_match.group(2)))
+        elif broadcast_match: # [NEW]
+            await self._broadcast_command_handler(event, broadcast_match.group(1))
         elif text == "/list_users":
             await self._list_users_handler(event)
         elif text == "/list_workers":
@@ -1624,7 +1634,7 @@ class GroupCreatorBot:
             proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             client = None
             try:
-                device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+                device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
                 LOGGER.debug(f"Testing proxy: {proxy['addr']} with device: {device_params}")
                 client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
                 await client.connect()
@@ -1638,7 +1648,7 @@ class GroupCreatorBot:
         LOGGER.debug("--- DIRECT CONNECTION TEST ---")
         client = None
         try:
-            device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
+            device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
             LOGGER.debug(f"Testing direct connection with device: {device_params}")
             client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, timeout=self.proxy_timeout, **device_params)
             await client.connect()
@@ -1696,10 +1706,12 @@ class GroupCreatorBot:
         self.pending_users.clear()
         self.created_groups.clear()
         self.conversation_accounts.clear()
+        self.user_worker_limits.clear() # [NEW]
         self._save_user_keywords()
         self._save_pending_users()
         self._save_created_groups()
         self._save_conversation_accounts()
+        self._save_user_worker_limits() # [NEW]
         report.append(f"🗑️ **Deleted Data Files:** {deleted_files_count} files\n")
         LOGGER.info(f"Deleted {deleted_files_count} data files from {SESSIONS_DIR}.")
         folders_to_clean = ["selenium_sessions", "api_sessions", "telethon_sessions"]
@@ -1922,10 +1934,19 @@ class GroupCreatorBot:
             return None
 
     async def _start_process_handler(self, event: events.NewMessage.Event, account_name: str, from_admin=False) -> None:
-        if self.health_check_lock.locked() and event.sender_id != ADMIN_USER_ID:
+        user_id = event.sender_id
+        if self.health_check_lock.locked() and user_id != ADMIN_USER_ID:
             await event.reply(Config.MSG_MAINTENANCE_ACTIVE)
             return
-        user_id = event.sender_id
+
+        # [NEW] Check user-specific worker limit
+        user_limit = self.user_worker_limits.get(str(user_id), self.max_workers)
+        current_user_workers = sum(1 for key in self.active_workers if key.startswith(f"{user_id}:"))
+        
+        if current_user_workers >= user_limit:
+            await event.reply(f"❌ شما به حداکثر تعداد ورکر فعال خود ({user_limit}) رسیده‌اید. لطفاً منتظر بمانید تا یکی از عملیات‌ها تمام شود.")
+            return
+
         worker_key = f"{user_id}:{account_name}"
         if worker_key in self.active_workers:
             if not from_admin:
@@ -2943,62 +2964,44 @@ class GroupCreatorBot:
                 )
                 await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_END)
 
-    async def _get_ai_error_explanation(self, traceback_str: str) -> Optional[str]:
-        """Asks the AI to explain a Python traceback to the user."""
-        if not self.openrouter_api_key:
-            LOGGER.warning("OPENROUTER_API_KEY not set. Cannot generate AI error explanation.")
-            return None
-
-        prompt = (
-            "An error occurred in a Telegram bot. Analyze the following Python traceback. "
-            "Explain the most likely cause to a non-technical user in 2-3 simple sentences. "
-            "Write the explanation in clear, everyday Persian. Do not use technical jargon. "
-            "For example, instead of 'RPC error', say 'a communication problem with Telegram'. "
-            "Instead of 'index out of bounds', say 'the bot tried to find an item that does not exist'.\n\n"
-            f"**Traceback:**\n```\n{traceback_str}\n```"
-        )
-
-        headers = {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
-            "Content-Type": "application/json",
-        }
-        api_url = "https://openrouter.ai/api/v1/chat/completions"
-        
-        for model_name in self.openrouter_model_hierarchy:
-            LOGGER.info(f"Attempting AI error explanation with model: {model_name}")
-            data = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": prompt}]
-            }
-            try:
-                async with httpx.AsyncClient(timeout=40.0) as client:
-                    response = await client.post(api_url, json=data, headers=headers)
-                    response.raise_for_status()
-                    res_json = response.json()
-                    if res_json.get("choices") and res_json["choices"][0].get("message", {}).get("content"):
-                        return res_json["choices"][0]["message"]["content"].strip()
-            except Exception as e:
-                LOGGER.warning(f"Failed to get AI error explanation from model {model_name}: {e}")
-        
-        LOGGER.error("All AI models in the hierarchy failed for error explanation.")
-        return None
-
     async def _send_error_explanation(self, user_id: int, e: Exception):
-        """Logs an error and sends an AI-powered explanation to the user."""
+        """Logs an error and sends a simplified explanation to the user and a detailed one to the admin."""
         LOGGER.error(f"An error occurred for user {user_id}", exc_info=True)
         sentry_sdk.capture_exception(e)
 
         traceback_str = traceback.format_exc()
-        ai_explanation = await self._get_ai_error_explanation(traceback_str)
         
+        # [NEW] Simplified error mapping for users
         user_message = "❌ یک خطای پیش‌بینی نشده رخ داد. لطفاً دوباره تلاش کنید."
-        if ai_explanation:
-            user_message += f"\n\n{ai_explanation}"
-        
+        if isinstance(e, errors.FloodWaitError):
+            user_message = f"⏳ تلگرام از ما خواسته است که {e.seconds} ثانیه صبر کنیم. لطفاً بعد از این مدت دوباره تلاش کنید."
+        elif isinstance(e, (errors.UserDeactivatedBanError, errors.PhoneNumberBannedError)):
+            user_message = "🚨 متاسفانه این حساب توسط تلگرام مسدود یا حذف شده است و دیگر قابل استفاده نیست."
+        elif isinstance(e, asyncio.TimeoutError):
+            user_message = "⌛️ اتصال به سرورهای تلگرام بیش از حد طول کشید. لطفاً از اتصال اینترنت خود مطمئن شوید و دوباره تلاش کنید."
+        elif isinstance(e, errors.AuthKeyUnregisteredError):
+             user_message = "🔑 نشست (Session) این حساب منقضی شده است. لطفاً حساب را حذف کرده و دوباره اضافه کنید."
+
         try:
             await self.bot.send_message(user_id, user_message)
         except Exception as send_error:
             LOGGER.error(f"Failed to send error explanation message to user {user_id}: {send_error}")
+
+        # [NEW] Send full traceback to admin
+        try:
+            admin_error_report = (
+                f"**🚨 Error Report for User `{user_id}`**\n\n"
+                f"**Simplified Message:**\n{user_message}\n\n"
+                f"**Full Traceback:**\n```\n{traceback_str}\n```"
+            )
+            # Split the message if it's too long for Telegram
+            if len(admin_error_report) > 4096:
+                for i in range(0, len(admin_error_report), 4096):
+                    await self.bot.send_message(ADMIN_USER_ID, admin_error_report[i:i + 4096])
+            else:
+                await self.bot.send_message(ADMIN_USER_ID, admin_error_report)
+        except Exception as admin_send_error:
+            LOGGER.error(f"Failed to send full error traceback to admin: {admin_send_error}")
 
     async def _generate_ai_code_suggestion(self, prompt: str, current_code: str) -> Optional[Dict]:
         """Calls the OpenRouter API to get a code suggestion."""

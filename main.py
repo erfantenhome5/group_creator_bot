@@ -3000,7 +3000,7 @@ class GroupCreatorBot:
             self.bot.loop.create_task(self._daily_feature_suggestion())
             
             # [NEW] Start the group maintenance scheduler
-            self.bot.loop.create_task(self._group_maintenance_scheduler())
+           # self.bot.loop.create_task(self._group_maintenance_scheduler())
 
             # Automatically resume workers that were active before a restart.
             if self.active_workers_state:

@@ -632,7 +632,7 @@ class GroupCreatorBot:
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
 
         try:
-            proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy"
+            proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy (direct connection)"
             LOGGER.debug(f"Attempting login connection {proxy_info}")
             client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
             client.parse_mode = CustomMarkdown() # Apply custom parser
@@ -2249,6 +2249,11 @@ class GroupCreatorBot:
             return
         self.user_sessions[user_id]['phone'] = phone_number
         selected_proxy = self._get_available_proxy()
+        if selected_proxy:
+            LOGGER.info(f"Using proxy {selected_proxy['addr']}:{selected_proxy['port']} for login.")
+        else:
+            LOGGER.info("No available proxy from file. Attempting direct connection for login.")
+
         self.user_sessions[user_id]['login_proxy'] = selected_proxy
         user_client = None
         try:

@@ -32,7 +32,7 @@ from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             SendReactionRequest,
                                             SearchStickerSetsRequest)
 from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Message,
-                               PeerChannel, ReactionEmoji, ChannelParticipantsAdmins)
+                               PeerChannel, ReactionEmoji)
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
@@ -2999,9 +2999,6 @@ class GroupCreatorBot:
             # Start the background scheduler for AI feature suggestions.
             self.bot.loop.create_task(self._daily_feature_suggestion())
             
-            # [NEW] Start the group maintenance scheduler
-           # self.bot.loop.create_task(self._group_maintenance_scheduler())
-
             # Automatically resume workers that were active before a restart.
             if self.active_workers_state:
                 LOGGER.info(f"Found {len(self.active_workers_state)} workers to resume from previous session.")

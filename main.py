@@ -31,7 +31,8 @@ from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             ImportChatInviteRequest,
                                             SendReactionRequest,
                                             SearchStickerSetsRequest)
-from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Message,
+from telethon.tl.types import (ChannelParticipantCreator, ChannelParticipantsAdmins,
+                               InputStickerSetID, InputStickerSetShortName, Message,
                                PeerChannel, ReactionEmoji)
 
 # --- Basic Logging Setup ---
@@ -168,7 +169,7 @@ class Config:
     DAILY_MESSAGE_LIMIT_PER_GROUP = 20
     MESSAGE_SEND_DELAY_MIN = 1
     MESSAGE_SEND_DELAY_MAX = 5
-    GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 3600 # 1 hour
+    GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 604800 # [MODIFIED] 7 days
 
     # [NEW] Predefined fallback messages for when AI fails
     PREDEFINED_FALLBACK_MESSAGES = [
@@ -274,7 +275,10 @@ class Config:
     MSG_FORCE_CONV_STOPPED = "✅ مکالمه دستی برای حساب `{account_name}` متوقف شد."
     MSG_FORCE_CONV_NO_GROUPS = "ℹ️ هیچ گروهی برای فعال‌سازی مکالمه توسط حساب `{account_name}` یافت نشد."
     MSG_HEALTH_CHECK_STARTED = "🩺 بررسی سلامت گروه‌ها آغاز شد... این عملیات در پس‌زمینه انجام می‌شود و ممکن است زمان‌بر باشد. گزارش نهایی پس از اتمام ارسال خواهد شد."
-    MSG_HEALTH_CHECK_COMPLETE = "✅ بررسی سلامت گروه‌ها به پایان رسید.\n\n👥 **گروه‌های پاکسازی شده:** {cleaned_count}\n💬 **گروه‌هایی که پیام دریافت کردند:** {topped_up_count}\n\nبرای جزئیات بیشتر به لاگ‌ها مراجعه کنید."
+    MSG_HEALTH_CHECK_COMPLETE = "✅ بررسی سلامت گروه‌ها به پایان رسید.\n\n🔧 **گروه‌های تعمیر شده:** {healed_count}\n👥 **گروه‌های پاکسازی شده:** {cleaned_count}\n💬 **گروه‌هایی که پیام دریافت کردند:** {topped_up_count}\n\nبرای جزئیات بیشتر به لاگ‌ها مراجعه کنید."
+    MSG_MAINTENANCE_ACTIVE = "⏳ ربات در حال حاضر تحت عملیات بررسی و نگهداری است. لطفاً چند دقیقه دیگر دوباره امتحان کنید."
+    MSG_MAINTENANCE_BROADCAST_START = "🔧 **اطلاعیه:** ربات برای بررسی و نگهداری دوره‌ای موقتاً با محدودیت در دسترس خواهد بود. از صبر شما متشکریم."
+    MSG_MAINTENANCE_BROADCAST_END = "✅ **اطلاعیه:** عملیات نگهداری ربات به پایان رسید. تمام قابلیت‌ها اکنون در دسترس هستند."
 
 
 class SessionManager:
@@ -1256,6 +1260,9 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_ACCOUNT_MENU_HEADER, buttons=accounts_keyboard)
 
     async def _manage_accounts_handler(self, event: events.NewMessage.Event) -> None:
+        if self.health_check_lock.locked() and event.sender_id != ADMIN_USER_ID:
+            await event.reply(Config.MSG_MAINTENANCE_ACTIVE)
+            return
         await self._send_accounts_menu(event)
         raise events.StopPropagation
 
@@ -1265,10 +1272,10 @@ class GroupCreatorBot:
         active_dm_count = len(self.active_dm_chats)
         
         status_text = f"**📊 Server Status**\n\n"
+        status_text += f"**Health Check Active:** {'Yes' if self.health_check_lock.locked() else 'No'}\n"
         status_text += f"**Active Group Creators:** {active_count} / {self.max_workers}\n"
         status_text += f"**Active Manual Conversations:** {active_conv_count}\n"
         
-        # [MODIFIED] Only show DM chat status to the admin
         if event.sender_id == ADMIN_USER_ID:
             status_text += f"**Active Private DM Chats:** {active_dm_count}\n"
 
@@ -1319,6 +1326,9 @@ class GroupCreatorBot:
         await event.reply(prompt_message, buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _join_via_link_handler(self, event: events.NewMessage.Event) -> None:
+        if self.health_check_lock.locked() and event.sender_id != ADMIN_USER_ID:
+            await event.reply(Config.MSG_MAINTENANCE_ACTIVE)
+            return
         user_id = event.sender_id
         accounts = self.session_manager.get_user_accounts(user_id)
         if not accounts:
@@ -1331,6 +1341,9 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_PROMPT_JOIN_ACCOUNT, buttons=buttons)
 
     async def _export_links_handler(self, event: events.NewMessage.Event) -> None:
+        if self.health_check_lock.locked() and event.sender_id != ADMIN_USER_ID:
+            await event.reply(Config.MSG_MAINTENANCE_ACTIVE)
+            return
         user_id = event.sender_id
         accounts = self.session_manager.get_user_accounts(user_id)
         if not accounts:
@@ -1343,6 +1356,9 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_PROMPT_EXPORT_ACCOUNT, buttons=buttons)
 
     async def _force_conversation_handler(self, event: events.NewMessage.Event) -> None:
+        if self.health_check_lock.locked() and event.sender_id != ADMIN_USER_ID:
+            await event.reply(Config.MSG_MAINTENANCE_ACTIVE)
+            return
         user_id = event.sender_id
         accounts = self.session_manager.get_user_accounts(user_id)
         if not accounts:
@@ -1900,6 +1916,9 @@ class GroupCreatorBot:
             return None
 
     async def _start_process_handler(self, event: events.NewMessage.Event, account_name: str, from_admin=False) -> None:
+        if self.health_check_lock.locked() and event.sender_id != ADMIN_USER_ID:
+            await event.reply(Config.MSG_MAINTENANCE_ACTIVE)
+            return
         user_id = event.sender_id
         worker_key = f"{user_id}:{account_name}"
         if worker_key in self.active_workers:
@@ -2768,26 +2787,25 @@ class GroupCreatorBot:
             return
 
         async with self.health_check_lock:
+            if triggered_by.startswith("Admin"):
+                await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_START)
+
             LOGGER.info(f"--- Group Health Check Started (Trigger: {triggered_by}) ---")
             
-            groups_by_owner: Dict[str, List[Dict]] = {}
-            for group_id_str, data in self.created_groups.items():
-                owner_key = data.get("owner_worker_key")
-                if owner_key:
-                    groups_by_owner.setdefault(owner_key, []).append(data | {"group_id": int(group_id_str)})
-
+            healed_count = 0
             cleaned_count = 0
             topped_up_count = 0
+            
+            all_accounts = self.session_manager.get_all_accounts()
 
-            for owner_key, groups in groups_by_owner.items():
+            for owner_key, user_id in all_accounts.items():
                 owner_client = None
                 try:
                     user_id_str, account_name = owner_key.split(":", 1)
-                    user_id = int(user_id_str)
                     
                     session_str = self.session_manager.load_session_string(user_id, account_name)
                     if not session_str:
-                        LOGGER.warning(f"[Health Check] No session for owner {owner_key}, skipping their {len(groups)} groups.")
+                        LOGGER.warning(f"[Health Check] No session for owner {owner_key}, skipping their groups.")
                         continue
                     
                     proxy = self.account_proxies.get(owner_key)
@@ -2795,29 +2813,62 @@ class GroupCreatorBot:
                     if not owner_client:
                         LOGGER.error(f"[Health Check] Failed to connect as owner {owner_key}, skipping their groups.")
                         continue
+                    
+                    me = await owner_client.get_me()
+                    my_id = me.id
 
-                    LOGGER.info(f"[Health Check] Processing {len(groups)} groups for owner {owner_key}.")
-                    for group_data in groups:
-                        group_id = group_data["group_id"]
-                        
-                        # [FIX] Gracefully handle legacy group entries that don't have an owner_id
-                        if "owner_id" not in group_data:
-                            LOGGER.warning(f"[Health Check] Skipping group {group_id} because it's a legacy entry missing 'owner_id'.")
+                    LOGGER.info(f"[Health Check] Discovering and healing groups for owner {owner_key}.")
+                    async for dialog in owner_client.iter_dialogs():
+                        if not (dialog.is_group and dialog.entity.megagroup):
                             continue
+
+                        group_id = dialog.id
+                        group_id_str = str(dialog.id)
                         
-                        owner_id = group_data["owner_id"]
-                        
+                        is_known = group_id_str in self.created_groups
+                        title_matches = dialog.title.startswith("collage Semester ")
+
+                        if not (is_known or title_matches):
+                            continue
+
+                        # --- Group Discovery & Healing Logic ---
+                        if is_known and "owner_id" in self.created_groups[group_id_str]:
+                            owner_id = self.created_groups[group_id_str]["owner_id"]
+                        else:
+                            LOGGER.info(f"[Health Check] Group {group_id} is legacy or newly discovered. Finding creator...")
+                            creator_id = None
+                            try:
+                                async for p in owner_client.iter_participants(dialog.entity, filter=ChannelParticipantsAdmins):
+                                    if isinstance(p.participant, ChannelParticipantCreator):
+                                        creator_id = p.id
+                                        break
+                                if creator_id:
+                                    LOGGER.info(f"Found creator for group {group_id}: {creator_id}. Updating records.")
+                                    self.created_groups[group_id_str] = {
+                                        "owner_worker_key": owner_key,
+                                        "owner_id": creator_id,
+                                        "last_simulated": self.created_groups.get(group_id_str, {}).get("last_simulated", 0)
+                                    }
+                                    owner_id = creator_id
+                                    healed_count += 1
+                                    self._save_created_groups()
+                                else:
+                                    LOGGER.warning(f"Could not find a creator for group {group_id}. Skipping.")
+                                    continue
+                            except Exception as e:
+                                LOGGER.error(f"Error finding creator for group {group_id}: {e}")
+                                continue
+
+                        # --- Standard Health Check Logic ---
                         try:
-                            group_entity = await owner_client.get_entity(PeerChannel(group_id))
-                            
                             # 1. Member Cleanup Check
-                            participants = await owner_client.get_participants(group_entity, limit=200)
+                            participants = await owner_client.get_participants(dialog.entity, limit=200)
                             if len(participants) > 1:
                                 LOGGER.info(f"[Health Check] Group {group_id} has {len(participants)} members. Cleaning up...")
                                 for p in participants:
                                     if p.id != owner_id:
                                         try:
-                                            await owner_client.kick_participant(group_entity, p)
+                                            await owner_client.kick_participant(dialog.entity, p)
                                             LOGGER.info(f"Kicked member {p.id} from group {group_id}.")
                                             await asyncio.sleep(1) # Rate limit
                                         except Exception as e:
@@ -2825,7 +2876,7 @@ class GroupCreatorBot:
                                 cleaned_count += 1
 
                             # 2. Message Top-Up Check
-                            messages = await owner_client.get_messages(group_entity, limit=1)
+                            messages = await owner_client.get_messages(dialog.entity, limit=1)
                             total_messages = messages.total if messages else 0
                             
                             daily_msg_count = self._get_daily_count_for_group(group_id)
@@ -2835,7 +2886,6 @@ class GroupCreatorBot:
                                 messages_to_send = min(20 - total_messages, remaining_daily)
                                 LOGGER.info(f"[Health Check] Group {group_id} has {total_messages} messages. Topping up with {messages_to_send} more.")
                                 
-                                # --- Invite and Converse ---
                                 conv_clients_meta = []
                                 temp_clients = []
                                 try:
@@ -2844,12 +2894,11 @@ class GroupCreatorBot:
                                         LOGGER.warning(f"Not enough conv accounts for user {user_id} to top up group {group_id}.")
                                         continue
 
-                                    # Invite other accounts
-                                    invite_link_res = await owner_client(ExportChatInviteRequest(group_entity))
+                                    invite_link_res = await owner_client(ExportChatInviteRequest(dialog.entity))
                                     invite_hash = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', invite_link_res.link).group(1)
 
                                     for p_name in participant_names:
-                                        if p_name == account_name: continue # Don't invite the owner
+                                        if p_name == account_name: continue
                                         p_session = self.session_manager.load_session_string(user_id, p_name)
                                         p_proxy = self.account_proxies.get(f"{user_id}:{p_name}")
                                         p_client = await self._create_worker_client(p_session, p_proxy)
@@ -2870,11 +2919,12 @@ class GroupCreatorBot:
                                 finally:
                                     for tc in temp_clients:
                                         if tc.is_connected(): await tc.disconnect()
-                                # --- End Invite and Converse ---
                                 
                         except Exception as group_err:
                             LOGGER.error(f"[Health Check] Error processing group {group_id}: {group_err}")
 
+                except Exception as owner_err:
+                    LOGGER.error(f"[Health Check] Major error processing owner {owner_key}: {owner_err}")
                 finally:
                     if owner_client and owner_client.is_connected():
                         await owner_client.disconnect()
@@ -2883,8 +2933,9 @@ class GroupCreatorBot:
             if triggered_by.startswith("Admin"):
                 await self.bot.send_message(
                     ADMIN_USER_ID, 
-                    Config.MSG_HEALTH_CHECK_COMPLETE.format(cleaned_count=cleaned_count, topped_up_count=topped_up_count)
+                    Config.MSG_HEALTH_CHECK_COMPLETE.format(healed_count=healed_count, cleaned_count=cleaned_count, topped_up_count=topped_up_count)
                 )
+                await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_END)
 
     async def _get_ai_error_explanation(self, traceback_str: str) -> Optional[str]:
         """Asks the AI to explain a Python traceback to the user."""

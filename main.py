@@ -212,6 +212,8 @@ class Config:
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
+    BTN_GROUP_HEALTH_CHECK = "🩺 Group Health Check"
+
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -687,7 +689,7 @@ class GroupCreatorBot:
             raise
 
     def _build_main_menu(self) -> List[List[Button]]:
-        return [
+        buttons = [
             [Button.text(Config.BTN_MANAGE_ACCOUNTS), Button.text(Config.BTN_JOIN_VIA_LINK)],
             [Button.text(Config.BTN_EXPORT_LINKS)],
             [Button.text(Config.BTN_FORCE_CONVERSATION), Button.text(Config.BTN_STOP_FORCE_CONVERSATION)],
@@ -696,6 +698,9 @@ class GroupCreatorBot:
             [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)],
             [Button.text(Config.BTN_SETTINGS)]
         ]
+        if self.user_sessions.get(ADMIN_USER_ID): # A bit of a hack to check if it's the admin
+            buttons.append([Button.text(Config.BTN_GROUP_HEALTH_CHECK)])
+        return buttons
 
     def _build_accounts_menu(self, user_id: int) -> List[List[Button]]:
         accounts = self.session_manager.get_user_accounts(user_id)
@@ -1147,7 +1152,7 @@ class GroupCreatorBot:
             if user_client and user_client.is_connected():
                 await user_client.disconnect()
 
-    async def _run_conversation_task(self, user_id: int, group_id: int, num_messages: Optional[int] = None):
+    async def _run_conversation_task(self, user_id: int, group_id: int, owner_id: int, num_messages: Optional[int] = None):
         clients_with_meta = []
         clients_to_disconnect = []
         try:
@@ -1174,7 +1179,6 @@ class GroupCreatorBot:
             successful_clients_meta = [meta for i, meta in enumerate(clients_with_meta) if results[i]]
 
             if len(successful_clients_meta) >= 2:
-                owner_id = successful_clients_meta[0]['account_id'] # Assume first is owner for this context
                 await self._run_interactive_conversation(user_id, group_id, successful_clients_meta, num_messages=num_messages, owner_id=owner_id)
             else:
                 LOGGER.warning(f"[Conversation Task] Not enough clients could connect and cache the entity for group {group_id}.")
@@ -1419,6 +1423,8 @@ class GroupCreatorBot:
             await self._stop_dm_chat_handler(event)
         elif text == "/dm_message":
             await self._start_dm_message_handler(event)
+        elif text == "/group_health_check":
+            await self._group_health_check_handler(event)
         else:
             await event.reply("Unknown admin command.")
 
@@ -1783,6 +1789,7 @@ class GroupCreatorBot:
                 Config.BTN_EXPORT_LINKS: self._export_links_handler,
                 Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
                 Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
+                Config.BTN_GROUP_HEALTH_CHECK: self._group_health_check_handler,
             }
             
             # Admin settings buttons

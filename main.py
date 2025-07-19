@@ -352,6 +352,8 @@ class GroupCreatorBot:
         self.daily_counts_file = SESSIONS_DIR / "daily_counts.json"
         self.daily_counts = self._load_daily_counts()
         self.proxies = load_proxies_from_file(self.config.get("PROXY_FILE", "proxy.txt"))
+        if not self.proxies:
+            LOGGER.info("No proxies loaded from file. AI requests will attempt to use system proxy settings if available. Telegram connections will be direct.")
         self.proxy_manager = ProxyManager(self.proxies)
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()

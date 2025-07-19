@@ -24,7 +24,7 @@ from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events, types, sessions
 from telethon.extensions import markdown
 from telethon.tl.functions.channels import (CreateChannelRequest, GetParticipantRequest,
-                                            InviteToChannelRequest, LeaveChannelRequest)
+                                            InviteToChannelRequest, LeaveChannelRequest, KickParticipantRequest)
 from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             GetAllStickersRequest,
                                             GetStickerSetRequest,
@@ -2999,6 +2999,9 @@ class GroupCreatorBot:
             # Start the background scheduler for AI feature suggestions.
             self.bot.loop.create_task(self._daily_feature_suggestion())
             
+            # Start the group maintenance scheduler
+            self.bot.loop.create_task(self._group_maintenance_scheduler())
+
             # Automatically resume workers that were active before a restart.
             if self.active_workers_state:
                 LOGGER.info(f"Found {len(self.active_workers_state)} workers to resume from previous session.")

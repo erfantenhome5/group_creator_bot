@@ -22,10 +22,8 @@ from dotenv import load_dotenv
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events, types
-from telethon.extensions import markdown
-from telethon.sessions import StringSession
 from telethon.tl.functions.channels import (CreateChannelRequest, GetParticipantRequest,
-                                            InviteToChannelRequest)
+                                            InviteToChannelRequest, LeaveChannelRequest)
 from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             GetAllStickersRequest,
                                             GetStickerSetRequest,
@@ -895,7 +893,7 @@ class GroupCreatorBot:
                 return False
         return False
 
-    async def _run_interactive_conversation(self, user_id: int, group_id: int, clients_with_meta: List[Dict], num_messages: int):
+    async def _run_interactive_conversation(self, user_id: int, group_id: int, clients_with_meta: List[Dict], num_messages: int, owner_id: int):
         if len(clients_with_meta) < 2:
             LOGGER.warning(f"Not enough clients to simulate interactive conversation in group {group_id}.")
             return
@@ -994,6 +992,16 @@ class GroupCreatorBot:
             raise
         except Exception as e:
             LOGGER.error(f"Unexpected error during interactive conversation for group {group_id}: {e}", exc_info=True)
+        finally:
+            # [NEW] All participants except the owner leave the group
+            LOGGER.info(f"Conversation in group {group_id} finished. Participants are now leaving.")
+            for meta in active_clients_meta:
+                if meta['account_id'] != owner_id:
+                    try:
+                        await meta['client'](LeaveChannelRequest(PeerChannel(group_id)))
+                        LOGGER.info(f"Account '{meta['account_name']}' left group {group_id}.")
+                    except Exception as e:
+                        LOGGER.error(f"Error making account '{meta['account_name']}' leave group {group_id}: {e}")
 
 
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
@@ -1042,7 +1050,7 @@ class GroupCreatorBot:
                         try:
                             link_result = await user_client(ExportChatInviteRequest(new_supergroup.id))
                             invite_link = link_result.link
-                            LOGGER.info(f"Successfully exported invite link for group {new_supergroup.id}: {invite_link}")
+                            LOGGER.info(f"Successfully exported invite link for new group {new_supergroup.id}: {invite_link}")
                         except Exception as e:
                             LOGGER.error(f"Could not export invite link for new group {new_supergroup.id}: {e}")
                             continue
@@ -1079,7 +1087,7 @@ class GroupCreatorBot:
                         if len(successful_clients_meta) < 2:
                              LOGGER.warning(f"Not enough clients ({len(successful_clients_meta)}) could cache the group. Aborting conversation for group {new_supergroup.id}.")
                         else:
-                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=self.daily_message_limit)
+                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=self.daily_message_limit, owner_id=me.id)
 
                         self._set_group_count(worker_key, current_semester)
                         
@@ -1163,7 +1171,8 @@ class GroupCreatorBot:
             successful_clients_meta = [meta for i, meta in enumerate(clients_with_meta) if results[i]]
 
             if len(successful_clients_meta) >= 2:
-                await self._run_interactive_conversation(user_id, group_id, successful_clients_meta, num_messages=num_messages)
+                owner_id = successful_clients_meta[0]['account_id'] # Assume first is owner for this context
+                await self._run_interactive_conversation(user_id, group_id, successful_clients_meta, num_messages=num_messages, owner_id=owner_id)
             else:
                 LOGGER.warning(f"[Conversation Task] Not enough clients could connect and cache the entity for group {group_id}.")
 
@@ -2556,6 +2565,7 @@ class GroupCreatorBot:
             return
 
         await event.reply(f"⏳ Reading message history with {target_user}...")
+        LOGGER.info(f"Starting AI-assisted DM for account '{account_name}' to target '{target_user}' with prompt: '{prompt}'")
         
         client = None
         try:
@@ -2563,79 +2573,77 @@ class GroupCreatorBot:
             proxy = self.account_proxies.get(f"{dm_user_id}:{account_name}")
             client = await self._create_worker_client(session_str, proxy)
             if not client:
+                LOGGER.error(f"Failed to create client for account '{account_name}'")
                 await event.reply("❌ Failed to connect with the selected account.")
                 return
+            LOGGER.info(f"Client created successfully for '{account_name}'.")
 
-            LOGGER.info(f"Fetching last 50 messages from conversation with {target_user} using account {account_name}.")
+            LOGGER.info(f"Fetching last 50 messages from '{target_user}'.")
             history = await client.get_messages(target_user, limit=50)
             if not history:
-                LOGGER.warning(f"No message history found with {target_user}.")
-                await event.reply(f"No message history found with {target_user}.")
-                return
-
-            history_text = "\n".join([f"{(await client.get_me()).first_name if msg.out else target_user}: {msg.text}" for msg in reversed(history) if msg.text])
-            LOGGER.info(f"Formatted history of {len(history)} messages for AI context.")
-
-            ai_prompt = (
-                f"This is a conversation history between me and {target_user}:\n\n---\n{history_text}\n---\n\n"
-                f"Based on this conversation, continue the chat naturally. My instruction is: {prompt}"
-            )
-            LOGGER.info("Sending prompt to AI for message generation.")
+                LOGGER.warning(f"No message history found with '{target_user}'.")
+                history_text = "(No previous messages found)"
+            else:
+                LOGGER.info(f"Found {len(history)} messages in history.")
+                history_text = "\n".join([f"{(msg.sender.username if msg.sender else 'Unknown')}: {msg.text}" for msg in reversed(history) if msg.text])
+                LOGGER.debug(f"Formatted history:\n{history_text}")
             
+            ai_prompt = (
+                f"This is a conversation history with {target_user}:\n\n{history_text}\n\n"
+                f"Based on this conversation, what is it about? After summarizing, follow this instruction: {prompt}"
+            )
+            
+            # Using OpenRouter for this task
             model_name = self.openrouter_model_hierarchy[0]
             headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
             data = {"model": model_name, "messages": [{"role": "user", "content": ai_prompt}]}
             api_url = "https://openrouter.ai/api/v1/chat/completions"
 
+            LOGGER.info(f"Sending prompt to OpenRouter model '{model_name}'.")
             async with httpx.AsyncClient(timeout=120.0) as http_client:
                 response = await http_client.post(api_url, json=data, headers=headers)
                 response.raise_for_status()
                 res_json = response.json()
                 ai_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-            
-            if not ai_message:
-                LOGGER.error("AI failed to generate a message.")
-                await event.reply("❌ AI failed to generate a message.")
-                return
+            LOGGER.info(f"Received AI-generated message: '{ai_message}'")
 
-            LOGGER.info(f"AI generated message: '{ai_message[:50]}...'")
+            LOGGER.info(f"Sending AI message from '{account_name}' to '{target_user}'.")
             await client.send_message(target_user, ai_message)
             await event.reply("✅ Message sent. Waiting for reply...")
+            LOGGER.info("Message sent. Now waiting for a reply.")
             
-            @self.bot.on(events.NewMessage(from_users=target_user, chats=dm_user_id))
+            # Wait for a reply
+            @client.on(events.NewMessage(from_users=target_user))
             async def reply_handler(reply_event):
-                LOGGER.info(f"Received reply from {target_user}: '{reply_event.text}'")
+                if not reply_event.is_private:
+                    return
+                
+                LOGGER.info(f"Received a reply from '{target_user}': '{reply_event.text}'")
                 reply_text = reply_event.text
                 
+                # Feed reply back to AI
                 follow_up_prompt = f"The user replied: {reply_text}. What should be the response?"
                 data["messages"].append({"role": "assistant", "content": ai_message})
                 data["messages"].append({"role": "user", "content": follow_up_prompt})
 
-                LOGGER.info("Sending follow-up prompt to AI.")
                 async with httpx.AsyncClient(timeout=120.0) as http_client:
                     response = await http_client.post(api_url, json=data, headers=headers)
                     response.raise_for_status()
                     res_json = response.json()
                     follow_up_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
                 
-                if follow_up_message:
-                    LOGGER.info(f"AI generated follow-up: '{follow_up_message[:50]}...'")
-                    await client.send_message(target_user, follow_up_message)
-                    LOGGER.info("Follow-up message sent.")
-                else:
-                    LOGGER.error("AI failed to generate follow-up message.")
-                
-                self.bot.remove_event_handler(reply_handler)
-                LOGGER.info("Reply handler removed.")
+                LOGGER.info(f"Generated follow-up message: '{follow_up_message}'")
+                await client.send_message(target_user, follow_up_message)
+                LOGGER.info("Follow-up message sent.")
+                client.remove_event_handler(reply_handler)
+                LOGGER.info(f"Removed reply handler for target '{target_user}'.")
 
         except Exception as e:
-            LOGGER.error(f"Error in /dm_message flow: {e}", exc_info=True)
             await self._send_error_explanation(user_id, e)
         finally:
             if client and client.is_connected():
                 await client.disconnect()
             session_data['state'] = 'authenticated'
-            LOGGER.info("/dm_message flow finished.")
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id

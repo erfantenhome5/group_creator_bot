@@ -923,8 +923,8 @@ class GroupCreatorBot:
         active_clients_meta = list(clients_with_meta)
         ai_failed_for_this_group = False # [NEW] Flag to track AI failure per group
         
-        # Assign a random persona to each participant for this conversation session
-        personas = random.sample(Config.PERSONAS, k=len(active_clients_meta))
+        # [MODIFIED] Use random.choices to prevent crashing if not enough unique personas
+        personas = random.choices(Config.PERSONAS, k=len(active_clients_meta))
         for i, meta in enumerate(active_clients_meta):
             meta['persona'] = personas[i]
             LOGGER.info(f"Assigned persona '{personas[i]}' to account '{meta['account_name']}' for conversation in group {group_id}.")
@@ -1745,6 +1745,17 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_BROWSER_RUNNING)
         await asyncio.sleep(2)
         await self._initiate_login_flow(event)
+    
+    # [NEW] Admin command handlers
+    async def _set_user_limit_handler(self, event: events.NewMessage.Event, user_id: int, limit: int):
+        self.user_worker_limits[str(user_id)] = limit
+        self._save_user_worker_limits()
+        await event.reply(f"✅ Worker limit for user `{user_id}` has been set to `{limit}`.")
+
+    async def _broadcast_command_handler(self, event: events.NewMessage.Event, message: str):
+        await event.reply(f"📢 Broadcasting the following message to all {len(self.known_users)} users:\n\n{message}")
+        await self._broadcast_message(message)
+        await event.reply("✅ Broadcast complete.")
 
     async def _message_router(self, event: events.NewMessage.Event) -> None:
         if not isinstance(getattr(event, 'message', None), Message) or not event.message.text:

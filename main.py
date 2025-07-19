@@ -21,7 +21,8 @@ from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.types import Event, Hint
-from telethon import Button, TelegramClient, errors, events, types
+from telethon import Button, TelegramClient, errors, events, types, sessions
+from telethon.extensions import markdown
 from telethon.tl.functions.channels import (CreateChannelRequest, GetParticipantRequest,
                                             InviteToChannelRequest, LeaveChannelRequest)
 from telethon.tl.functions.messages import (ExportChatInviteRequest,
@@ -627,7 +628,7 @@ class GroupCreatorBot:
                 LOGGER.error(f"Error sending message to {user_id}: {e}")
 
     async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
-        session = StringSession()
+        session = sessions.StringSession()
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
 
         try:
@@ -642,7 +643,7 @@ class GroupCreatorBot:
             return None
 
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
-        session = StringSession(session_string)
+        session = sessions.StringSession(session_string)
         device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
 
         client = TelegramClient(
@@ -1582,7 +1583,7 @@ class GroupCreatorBot:
             try:
                 device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
                 LOGGER.debug(f"Testing proxy: {proxy['addr']} with device: {device_params}")
-                client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
+                client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
                 await client.connect()
                 if client.is_connected():
                     LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
@@ -1596,7 +1597,7 @@ class GroupCreatorBot:
         try:
             device_params = random.choice([{'device_model': 'iPhone 14 Pro Max', 'system_version': '17.5.1'}, {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'}])
             LOGGER.debug(f"Testing direct connection with device: {device_params}")
-            client = TelegramClient(StringSession(), API_ID, API_HASH, timeout=self.proxy_timeout, **device_params)
+            client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, timeout=self.proxy_timeout, **device_params)
             await client.connect()
             if client.is_connected():
                 LOGGER.info("  ✅ SUCCESS: Direct Connection")

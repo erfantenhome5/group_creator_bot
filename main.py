@@ -24,7 +24,7 @@ from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events, types, sessions
 from telethon.extensions import markdown
 from telethon.tl.functions.channels import (CreateChannelRequest, GetParticipantRequest,
-                                            InviteToChannelRequest, LeaveChannelRequest, kick_participant)
+                                            InviteToChannelRequest, LeaveChannelRequest, EditBannedRequest)
 from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             GetAllStickersRequest,
                                             GetStickerSetRequest,
@@ -32,7 +32,7 @@ from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             SendReactionRequest,
                                             SearchStickerSetsRequest)
 from telethon.tl.types import (InputStickerSetID, InputStickerSetShortName, Message,
-                               PeerChannel, ReactionEmoji)
+                               PeerChannel, ReactionEmoji, ChannelParticipantsKicked, ChatBannedRights)
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
@@ -168,7 +168,7 @@ class Config:
     DAILY_MESSAGE_LIMIT_PER_GROUP = 20
     MESSAGE_SEND_DELAY_MIN = 1
     MESSAGE_SEND_DELAY_MAX = 5
-    GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 3600 # 1 hour
+    MAINTENANCE_SCHEDULE_HOURS = 1 # Run maintenance every hour
 
     # [NEW] Predefined fallback messages for when AI fails
     PREDEFINED_FALLBACK_MESSAGES = [
@@ -213,7 +213,6 @@ class Config:
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
-    BTN_MANUAL_HEALTH_CHECK = "🩺 بررسی سلامت گروه‌ها" # [NEW] Admin button
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -243,9 +242,7 @@ class Config:
         f"**{BTN_SET_CONVERSATION_ACCOUNTS}**\n"
         "حساب‌هایی که باید در گروه‌های جدید به گفتگو بپردازند را مشخص کنید.\n\n"
         f"**{BTN_SERVER_STATUS}**\n"
-        "این گزینه اطلاعات لحظه‌ای درباره وضعیت ربات را نمایش می‌دهد.\n\n"
-        f"**{BTN_MANUAL_HEALTH_CHECK} (Admin Only)**\n"
-        "این گزینه یک بررسی کامل و فوری روی تمام گروه‌های ساخته شده انجام می‌دهد تا از سلامت آنها اطمینان حاصل شود."
+        "این گزینه اطلاعات لحظه‌ای درباره وضعیت ربات را نمایش می‌دهد."
     )
     MSG_PROMPT_MASTER_PASSWORD = "🔑 لطفاً برای دسترسی به ربات، رمز عبور اصلی را وارد کنید:"
     MSG_INCORRECT_MASTER_PASSWORD = "❌ رمز عبور اشتباه است. لطفاً دوباره تلاش کنید."
@@ -273,8 +270,6 @@ class Config:
     MSG_FORCE_CONV_STARTED = "✅ فعال‌سازی مکالمه در {count} گروه متعلق به `{account_name}` آغاز شد."
     MSG_FORCE_CONV_STOPPED = "✅ مکالمه دستی برای حساب `{account_name}` متوقف شد."
     MSG_FORCE_CONV_NO_GROUPS = "ℹ️ هیچ گروهی برای فعال‌سازی مکالمه توسط حساب `{account_name}` یافت نشد."
-    MSG_HEALTH_CHECK_STARTED = "🩺 بررسی سلامت گروه‌ها آغاز شد... این عملیات در پس‌زمینه انجام می‌شود و ممکن است زمان‌بر باشد. گزارش نهایی پس از اتمام ارسال خواهد شد."
-    MSG_HEALTH_CHECK_COMPLETE = "✅ بررسی سلامت گروه‌ها به پایان رسید.\n\n👥 **گروه‌های پاکسازی شده:** {cleaned_count}\n💬 **گروه‌هایی که پیام دریافت کردند:** {topped_up_count}\n\nبرای جزئیات بیشتر به لاگ‌ها مراجعه کنید."
 
 
 class SessionManager:
@@ -347,7 +342,6 @@ class GroupCreatorBot:
         self.active_conversations: Dict[str, asyncio.Task] = {}
         self.active_dm_chats: Dict[str, asyncio.Task] = {}
         self.suggested_code: Optional[str] = None
-        self.health_check_lock = asyncio.Lock() # [NEW] Lock for health checks
         
         self.config_file = SESSIONS_DIR / "config.json"
         self.config = self._load_json_file(self.config_file, {})
@@ -399,7 +393,6 @@ class GroupCreatorBot:
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
         self.gemini_api_key = self.config.get("GEMINI_API_KEY", GEMINI_API_KEY)
-        self.health_check_interval = self.config.get("GROUP_HEALTH_CHECK_INTERVAL_SECONDS", Config.GROUP_HEALTH_CHECK_INTERVAL_SECONDS)
         
         # [MODIFIED] AI Model Configuration
         self.gemini_model_hierarchy = self.config.get("GEMINI_MODEL_HIERARCHY", [
@@ -905,12 +898,16 @@ class GroupCreatorBot:
         return False
 
     async def _run_interactive_conversation(self, user_id: int, group_id: int, clients_with_meta: List[Dict], num_messages: int, owner_id: int):
+        """
+        Runs a conversation simulation in a group.
+        [MODIFIED] After the conversation, all participants except the owner will leave.
+        """
         if len(clients_with_meta) < 2:
             LOGGER.warning(f"Not enough clients to simulate interactive conversation in group {group_id}.")
             return
 
         active_clients_meta = list(clients_with_meta)
-        ai_failed_for_this_group = False # [NEW] Flag to track AI failure per group
+        ai_failed_for_this_group = False # Flag to track AI failure per group
         
         # Assign a random persona to each participant for this conversation session
         personas = random.sample(Config.PERSONAS, k=len(active_clients_meta))
@@ -1004,7 +1001,7 @@ class GroupCreatorBot:
         except Exception as e:
             LOGGER.error(f"Unexpected error during interactive conversation for group {group_id}: {e}", exc_info=True)
         finally:
-            # [MODIFIED] All participants except the owner leave the group
+            # [NEW] All participants except the owner leave the group
             LOGGER.info(f"Conversation in group {group_id} finished. Participants are now leaving.")
             for meta in active_clients_meta:
                 if meta['account_id'] != owner_id:
@@ -1026,10 +1023,6 @@ class GroupCreatorBot:
                 start_time = datetime.now()
                 progress_message = await self.bot.send_message(user_id, f"🚀 Starting group creation for `{account_name}`...")
 
-                me = await user_client.get_me()
-                owner_id = me.id # [NEW] Store the owner's ID
-                u_account_name = me.first_name or me.username or f"ID:{owner_id}"
-
                 participant_clients_meta = []
                 participant_names = self.conversation_accounts.get(str(user_id), [])
                 other_participant_names = [name for name in participant_names if name != account_name]
@@ -1041,11 +1034,13 @@ class GroupCreatorBot:
                     client = await self._create_worker_client(session_str, proxy)
                     if client:
                         temp_clients.append(client)
-                        p_me = await client.get_me()
-                        p_account_name = p_me.first_name or p_me.username or f"ID:{p_me.id}"
-                        participant_clients_meta.append({'client': client, 'user_id': user_id, 'account_id': p_me.id, 'account_name': p_account_name})
+                        me = await client.get_me()
+                        p_account_name = me.first_name or me.username or f"ID:{me.id}"
+                        participant_clients_meta.append({'client': client, 'user_id': user_id, 'account_id': me.id, 'account_name': p_account_name})
 
-                all_clients_meta = [{'client': user_client, 'user_id': user_id, 'account_id': owner_id, 'account_name': u_account_name}] + participant_clients_meta
+                me = await user_client.get_me()
+                u_account_name = me.first_name or me.username or f"ID:{me.id}"
+                all_clients_meta = [{'client': user_client, 'user_id': user_id, 'account_id': me.id, 'account_name': u_account_name}] + participant_clients_meta
 
                 for i in range(self.groups_to_create):
                     try:
@@ -1057,10 +1052,10 @@ class GroupCreatorBot:
                         new_supergroup = create_result.chats[0]
                         LOGGER.info(f"Successfully created supergroup '{new_supergroup.title}' (ID: {new_supergroup.id}).")
                         
-                        # [MODIFIED] Store owner ID and worker key
+                        # [MODIFIED] Store the owner's actual Telegram ID
                         self.created_groups[str(new_supergroup.id)] = {
                             "owner_worker_key": worker_key, 
-                            "owner_id": owner_id,
+                            "owner_id": me.id, 
                             "last_simulated": 0
                         }
                         self._save_created_groups()
@@ -1106,7 +1101,7 @@ class GroupCreatorBot:
                         if len(successful_clients_meta) < 2:
                              LOGGER.warning(f"Not enough clients ({len(successful_clients_meta)}) could cache the group. Aborting conversation for group {new_supergroup.id}.")
                         else:
-                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=self.daily_message_limit, owner_id=owner_id)
+                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=self.daily_message_limit, owner_id=me.id)
 
                         self._set_group_count(worker_key, current_semester)
                         
@@ -1167,12 +1162,6 @@ class GroupCreatorBot:
         clients_with_meta = []
         clients_to_disconnect = []
         try:
-            group_data = self.created_groups.get(str(group_id))
-            if not group_data or "owner_id" not in group_data:
-                LOGGER.error(f"[Conversation Task] Cannot run for group {group_id}, owner_id is missing.")
-                return
-            owner_id = group_data["owner_id"]
-
             participant_names = self.conversation_accounts.get(str(user_id), [])
             if len(participant_names) < 2:
                 LOGGER.warning(f"[Conversation Task] Not enough accounts for user {user_id} to simulate.")
@@ -1189,10 +1178,18 @@ class GroupCreatorBot:
                     p_account_name = me.first_name or me.username or f"ID:{me.id}"
                     clients_with_meta.append({'client': client, 'user_id': user_id, 'account_id': me.id, 'account_name': p_account_name})
 
+            # [FIX] Ensure all clients know about the group before starting the conversation
             ensure_tasks = [self._ensure_entity_cached(meta['client'], group_id, meta['account_name']) for meta in clients_with_meta]
             results = await asyncio.gather(*ensure_tasks)
             
             successful_clients_meta = [meta for i, meta in enumerate(clients_with_meta) if results[i]]
+            
+            # Determine owner_id for the conversation
+            group_data = self.created_groups.get(str(group_id))
+            owner_id = group_data.get('owner_id') if group_data else None
+            if not owner_id:
+                LOGGER.error(f"[Conversation Task] Could not determine owner for group {group_id}. Aborting.")
+                return
 
             if len(successful_clients_meta) >= 2:
                 await self._run_interactive_conversation(user_id, group_id, successful_clients_meta, num_messages=num_messages, owner_id=owner_id)
@@ -1372,7 +1369,6 @@ class GroupCreatorBot:
             return
         
         buttons = [
-            [Button.text(Config.BTN_MANUAL_HEALTH_CHECK)], # [NEW]
             [Button.text("Set AI Model Hierarchy")],
             [Button.text("Set Worker Limit"), Button.text("Set Group Count")],
             [Button.text("Set Sleep Times"), Button.text("Set Daily Msg Limit")],
@@ -1804,7 +1800,6 @@ class GroupCreatorBot:
                 Config.BTN_EXPORT_LINKS: self._export_links_handler,
                 Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
                 Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
-                Config.BTN_MANUAL_HEALTH_CHECK: self._manual_health_check_handler, # [NEW]
             }
             
             # Admin settings buttons
@@ -2741,144 +2736,63 @@ class GroupCreatorBot:
                 else:
                     await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
 
-    # --- [NEW & REFACTORED] Group Health Maintenance ---
-    async def _group_maintenance_scheduler_task(self):
-        """Background task that periodically runs the group health check."""
+    async def _daily_conversation_scheduler(self):
+        """
+        This background task periodically checks created groups and starts 
+        conversations in them to maintain activity.
+        """
         while True:
-            await asyncio.sleep(self.health_check_interval)
-            LOGGER.info("[Scheduler] Running periodic group health check...")
-            await self.run_group_health_check(triggered_by="Scheduler")
-
-    async def _manual_health_check_handler(self, event: events.NewMessage.Event):
-        """Handles the admin's manual request to run a health check."""
-        if event.sender_id != ADMIN_USER_ID:
-            return
-        
-        await event.reply(Config.MSG_HEALTH_CHECK_STARTED)
-        # Run the check in the background to not block the bot
-        asyncio.create_task(self.run_group_health_check(triggered_by=f"Admin ({event.sender_id})"))
-
-    async def run_group_health_check(self, triggered_by: str):
-        """
-        The core logic for the group health check. Can be called by the scheduler or manually.
-        It checks all groups for member count and message count, and takes action if needed.
-        """
-        if self.health_check_lock.locked():
-            LOGGER.warning(f"Health check triggered by {triggered_by} but another check is already in progress. Skipping.")
-            return
-
-        async with self.health_check_lock:
-            LOGGER.info(f"--- Group Health Check Started (Trigger: {triggered_by}) ---")
+            # Check for groups to revive once per hour
+            await asyncio.sleep(3600) 
+            LOGGER.info("[Scheduler] Running daily conversation scheduler...")
+            now = datetime.utcnow().timestamp()
             
-            groups_by_owner: Dict[str, List[Dict]] = {}
+            groups_to_revive = []
             for group_id_str, data in self.created_groups.items():
-                owner_key = data.get("owner_worker_key")
-                if owner_key:
-                    groups_by_owner.setdefault(owner_key, []).append(data | {"group_id": int(group_id_str)})
+                group_id = int(group_id_str)
+                last_simulated = data.get("last_simulated", 0)
+                
+                # Check if it has been more than 23 hours and daily limit is not reached
+                if (now - last_simulated > 82800) and (self._get_daily_count_for_group(group_id) < self.daily_message_limit):
+                    groups_to_revive.append((group_id, data))
 
-            cleaned_count = 0
-            topped_up_count = 0
+            if not groups_to_revive:
+                LOGGER.info("[Scheduler] No groups need reviving at this time.")
+                continue
 
-            for owner_key, groups in groups_by_owner.items():
-                owner_client = None
+            LOGGER.info(f"[Scheduler] Found {len(groups_to_revive)} groups to revive. Processing sequentially to avoid rate limits.")
+            
+            # [FIX] Process groups one by one with a delay to avoid connection flooding.
+            for group_id, data in groups_to_revive:
                 try:
+                    owner_key = data.get("owner_worker_key")
+                    if not owner_key:
+                        continue
+                    
                     user_id_str, account_name = owner_key.split(":", 1)
                     user_id = int(user_id_str)
                     
-                    session_str = self.session_manager.load_session_string(user_id, account_name)
-                    if not session_str:
-                        LOGGER.warning(f"[Health Check] No session for owner {owner_key}, skipping their {len(groups)} groups.")
+                    if not self.conversation_accounts.get(str(user_id)):
+                        LOGGER.warning(f"[Scheduler] Cannot start conversation for owner {owner_key}, no conversation accounts configured.")
                         continue
-                    
-                    proxy = self.account_proxies.get(owner_key)
-                    owner_client = await self._create_worker_client(session_str, proxy)
-                    if not owner_client:
-                        LOGGER.error(f"[Health Check] Failed to connect as owner {owner_key}, skipping their groups.")
-                        continue
-
-                    LOGGER.info(f"[Health Check] Processing {len(groups)} groups for owner {owner_key}.")
-                    for group_data in groups:
-                        group_id = group_data["group_id"]
-                        owner_id = group_data["owner_id"]
                         
-                        try:
-                            group_entity = await owner_client.get_entity(PeerChannel(group_id))
-                            
-                            # 1. Member Cleanup Check
-                            participants = await owner_client.get_participants(group_entity, limit=200)
-                            if len(participants) > 1:
-                                LOGGER.info(f"[Health Check] Group {group_id} has {len(participants)} members. Cleaning up...")
-                                for p in participants:
-                                    if p.id != owner_id:
-                                        try:
-                                            await owner_client(kick_participant(group_entity, p))
-                                            LOGGER.info(f"Kicked member {p.id} from group {group_id}.")
-                                            await asyncio.sleep(1) # Rate limit
-                                        except Exception as e:
-                                            LOGGER.error(f"Failed to kick {p.id} from {group_id}: {e}")
-                                cleaned_count += 1
+                    if owner_key in self.active_conversations:
+                        LOGGER.info(f"[Scheduler] Manual conversation already active for {owner_key}, skipping scheduled one.")
+                        continue
+                        
+                    LOGGER.info(f"[Scheduler] Starting scheduled conversation task for group {group_id} (owner: {owner_key}).")
+                    
+                    # Run the task for this single group and wait for it to complete
+                    # This is simpler and more robust than creating background tasks in a loop
+                    await self._run_conversation_task(user_id, group_id, num_messages=random.randint(5, 15))
+                    
+                    # Wait for a random interval before starting the next one
+                    delay = random.uniform(60, 180) # 1-3 minutes
+                    LOGGER.info(f"[Scheduler] Waiting for {delay:.2f} seconds before next group.")
+                    await asyncio.sleep(delay)
 
-                            # 2. Message Top-Up Check
-                            messages = await owner_client.get_messages(group_entity, limit=1)
-                            total_messages = messages.total if messages else 0
-                            
-                            daily_msg_count = self._get_daily_count_for_group(group_id)
-                            remaining_daily = self.daily_message_limit - daily_msg_count
-
-                            if total_messages < 20 and remaining_daily > 0:
-                                messages_to_send = min(20 - total_messages, remaining_daily)
-                                LOGGER.info(f"[Health Check] Group {group_id} has {total_messages} messages. Topping up with {messages_to_send} more.")
-                                
-                                # --- Invite and Converse ---
-                                conv_clients_meta = []
-                                temp_clients = []
-                                try:
-                                    participant_names = self.conversation_accounts.get(str(user_id), [])
-                                    if len(participant_names) < 2:
-                                        LOGGER.warning(f"Not enough conv accounts for user {user_id} to top up group {group_id}.")
-                                        continue
-
-                                    # Invite other accounts
-                                    invite_link_res = await owner_client(ExportChatInviteRequest(group_entity))
-                                    invite_hash = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', invite_link_res.link).group(1)
-
-                                    for p_name in participant_names:
-                                        if p_name == account_name: continue # Don't invite the owner
-                                        p_session = self.session_manager.load_session_string(user_id, p_name)
-                                        p_proxy = self.account_proxies.get(f"{user_id}:{p_name}")
-                                        p_client = await self._create_worker_client(p_session, p_proxy)
-                                        if p_client:
-                                            temp_clients.append(p_client)
-                                            await p_client(ImportChatInviteRequest(invite_hash))
-                                            p_me = await p_client.get_me()
-                                            conv_clients_meta.append({'client': p_client, 'user_id': user_id, 'account_id': p_me.id, 'account_name': p_name})
-                                    
-                                    all_clients_meta = [{'client': owner_client, 'user_id': user_id, 'account_id': owner_id, 'account_name': account_name}] + conv_clients_meta
-
-                                    if len(all_clients_meta) >= 2:
-                                        await self._run_interactive_conversation(user_id, group_id, all_clients_meta, num_messages=messages_to_send, owner_id=owner_id)
-                                        topped_up_count += 1
-                                    else:
-                                        LOGGER.warning(f"Could not gather enough clients to top up group {group_id}.")
-
-                                finally:
-                                    for tc in temp_clients:
-                                        if tc.is_connected(): await tc.disconnect()
-                                # --- End Invite and Converse ---
-                                
-                        except Exception as group_err:
-                            LOGGER.error(f"[Health Check] Error processing group {group_id}: {group_err}")
-
-                finally:
-                    if owner_client and owner_client.is_connected():
-                        await owner_client.disconnect()
-            
-            LOGGER.info(f"--- Group Health Check Finished (Trigger: {triggered_by}) ---")
-            if triggered_by.startswith("Admin"):
-                await self.bot.send_message(
-                    ADMIN_USER_ID, 
-                    Config.MSG_HEALTH_CHECK_COMPLETE.format(cleaned_count=cleaned_count, topped_up_count=topped_up_count)
-                )
+                except Exception as e:
+                    LOGGER.error(f"[Scheduler] Failed to process group {group_id}: {e}", exc_info=True)
 
     async def _get_ai_error_explanation(self, traceback_str: str) -> Optional[str]:
         """Asks the AI to explain a Python traceback to the user."""
@@ -3074,6 +2988,133 @@ class GroupCreatorBot:
             await asyncio.sleep(86400) # Run once a day
             LOGGER.info("[Scheduler] Running daily AI feature suggestion task...")
             await self._trigger_ai_suggestion()
+            
+    # [NEW] Group Maintenance Scheduler
+    async def _group_maintenance_scheduler(self):
+        """
+        Periodically checks all bot-created groups to enforce health rules:
+        1. Member Cleanup: Removes all members except the owner.
+        2. Message Top-Up: Adds messages if the count is below 20.
+        """
+        while True:
+            # Wait for the configured interval before starting a new maintenance cycle.
+            sleep_duration = Config.MAINTENANCE_SCHEDULE_HOURS * 3600
+            LOGGER.info(f"[Maintenance] Scheduler is sleeping for {Config.MAINTENANCE_SCHEDULE_HOURS} hour(s).")
+            await asyncio.sleep(sleep_duration)
+            LOGGER.info("[Maintenance] Starting group maintenance cycle...")
+
+            # Group all managed groups by their owner to process them in batches.
+            # This is more efficient as it minimizes client creation/destruction.
+            groups_by_owner = {}
+            for group_id, data in self.created_groups.items():
+                owner_key = data.get('owner_worker_key')
+                if owner_key:
+                    groups_by_owner.setdefault(owner_key, []).append(int(group_id))
+
+            # Process each owner's groups.
+            for owner_key, group_ids in groups_by_owner.items():
+                owner_client = None
+                try:
+                    user_id_str, account_name = owner_key.split(":", 1)
+                    user_id = int(user_id_str)
+                    
+                    # Create a client for the owner account.
+                    session_str = self.session_manager.load_session_string(user_id, account_name)
+                    if not session_str:
+                        LOGGER.warning(f"[Maintenance] No session for owner '{owner_key}'. Skipping their {len(group_ids)} groups.")
+                        continue
+                    
+                    proxy = self.account_proxies.get(owner_key)
+                    owner_client = await self._create_worker_client(session_str, proxy)
+                    if not owner_client:
+                        LOGGER.error(f"[Maintenance] Failed to create client for owner '{owner_key}'.")
+                        continue
+                    
+                    LOGGER.info(f"[Maintenance] Processing {len(group_ids)} groups for owner '{owner_key}'.")
+
+                    # Iterate through each group owned by this account.
+                    for group_id in group_ids:
+                        try:
+                            group_entity = await owner_client.get_entity(PeerChannel(group_id))
+                            owner_id = self.created_groups[str(group_id)].get('owner_id')
+                            if not owner_id:
+                                LOGGER.warning(f"[Maintenance] Owner ID not found for group {group_id}. Cannot perform cleanup.")
+                                continue
+
+                            # --- 1. Member Cleanup ---
+                            participants = await owner_client.get_participants(group_entity)
+                            if len(participants) > 1:
+                                LOGGER.info(f"[Maintenance] Group {group_id} has {len(participants)} members. Cleaning up...")
+                                for p in participants:
+                                    if p.id != owner_id:
+                                        try:
+                                            # Use EditBannedRequest to kick a user.
+                                            await owner_client(EditBannedRequest(group_entity, p.id, ChatBannedRights(until_date=None, view_messages=True)))
+                                            LOGGER.info(f"[Maintenance] Kicked user {p.id} from group {group_id}.")
+                                            await asyncio.sleep(random.uniform(1, 3)) # Rate limit prevention
+                                        except Exception as kick_error:
+                                            LOGGER.error(f"[Maintenance] Failed to kick {p.id} from group {group_id}: {kick_error}")
+                            
+                            # --- 2. Message Top-Up ---
+                            messages = await owner_client.get_messages(group_entity, limit=0)
+                            total_messages = messages.total
+                            
+                            remaining_daily = self.daily_message_limit - self._get_daily_count_for_group(group_id)
+                            
+                            if total_messages < 20 and remaining_daily > 0:
+                                messages_to_send = min(20 - total_messages, remaining_daily)
+                                LOGGER.info(f"[Maintenance] Group {group_id} has {total_messages} messages. Topping up with {messages_to_send} more.")
+                                
+                                # This part requires inviting other accounts, simulating, and then leaving.
+                                # It's complex, so we'll reuse the _run_conversation_task logic.
+                                # We need to create clients for conversation accounts.
+                                conv_clients_meta = []
+                                temp_clients = []
+                                try:
+                                    conv_account_names = [name for name in self.conversation_accounts.get(str(user_id), []) if name != account_name]
+                                    if not conv_account_names:
+                                        LOGGER.warning(f"[Maintenance] No other conversation accounts set for user {user_id} to top-up group {group_id}.")
+                                        continue
+                                    
+                                    # Invite accounts
+                                    invite_link_res = await owner_client(ExportChatInviteRequest(group_entity))
+                                    invite_hash = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', invite_link_res.link).group(1)
+
+                                    for conv_acc_name in conv_account_names:
+                                        conv_session_str = self.session_manager.load_session_string(user_id, conv_acc_name)
+                                        if not conv_session_str: continue
+                                        
+                                        conv_proxy = self.account_proxies.get(f"{user_id}:{conv_acc_name}")
+                                        conv_client = await self._create_worker_client(conv_session_str, conv_proxy)
+                                        if conv_client:
+                                            temp_clients.append(conv_client)
+                                            await conv_client(ImportChatInviteRequest(invite_hash))
+                                            me = await conv_client.get_me()
+                                            conv_clients_meta.append({'client': conv_client, 'user_id': user_id, 'account_id': me.id, 'account_name': me.first_name or me.username})
+                                    
+                                    await asyncio.sleep(5) # Give time for joins to process
+
+                                    # Run conversation
+                                    all_participants_meta = [{'client': owner_client, 'user_id': user_id, 'account_id': owner_id, 'account_name': account_name}] + conv_clients_meta
+                                    await self._run_interactive_conversation(user_id, group_id, all_participants_meta, num_messages=messages_to_send, owner_id=owner_id)
+
+                                finally:
+                                    # Disconnect temporary conversation clients
+                                    for client in temp_clients:
+                                        if client.is_connected(): await client.disconnect()
+
+                        except Exception as group_proc_error:
+                            LOGGER.error(f"[Maintenance] Error processing group {group_id}: {group_proc_error}", exc_info=True)
+                
+                except Exception as owner_proc_error:
+                    LOGGER.error(f"[Maintenance] Error processing owner {owner_key}: {owner_proc_error}", exc_info=True)
+                finally:
+                    # Disconnect the owner's client after processing all their groups.
+                    if owner_client and owner_client.is_connected():
+                        await owner_client.disconnect()
+                        LOGGER.info(f"[Maintenance] Disconnected client for owner '{owner_key}'.")
+            
+            LOGGER.info("[Maintenance] Group maintenance cycle finished.")
 
     def register_handlers(self) -> None:
         self.bot.add_event_handler(self._start_handler, events.NewMessage(pattern='/start'))
@@ -3089,8 +3130,11 @@ class GroupCreatorBot:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service started successfully.")
 
-            # [NEW] Start the background scheduler for group health maintenance.
-            self.bot.loop.create_task(self._group_maintenance_scheduler_task())
+            # Start the background scheduler for automatic conversations.
+            self.bot.loop.create_task(self._daily_conversation_scheduler())
+            
+            # [NEW] Start the group maintenance scheduler.
+            self.bot.loop.create_task(self._group_maintenance_scheduler())
             
             # Start the background scheduler for AI feature suggestions.
             self.bot.loop.create_task(self._daily_feature_suggestion())

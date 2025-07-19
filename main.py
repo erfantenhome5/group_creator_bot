@@ -212,7 +212,7 @@ class Config:
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
-    BTN_GROUP_HEALTH_CHECK = "🩺 Group Health Check"
+    BTN_GROUP_HEALTH_CHECK = "🩺 بررسی سلامت گروه‌ها"
 
 
     # --- Messages (All in Persian) ---

@@ -24,7 +24,7 @@ from sentry_sdk.types import Event, Hint
 from telethon import Button, TelegramClient, errors, events, types, sessions
 from telethon.extensions import markdown
 from telethon.tl.functions.channels import (CreateChannelRequest, GetParticipantRequest,
-                                            InviteToChannelRequest, LeaveChannelRequest )
+                                            InviteToChannelRequest, LeaveChannelRequest)
 from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             GetAllStickersRequest,
                                             GetStickerSetRequest,

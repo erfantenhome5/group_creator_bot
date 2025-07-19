@@ -2799,6 +2799,12 @@ class GroupCreatorBot:
                     LOGGER.info(f"[Health Check] Processing {len(groups)} groups for owner {owner_key}.")
                     for group_data in groups:
                         group_id = group_data["group_id"]
+                        
+                        # [FIX] Gracefully handle legacy group entries that don't have an owner_id
+                        if "owner_id" not in group_data:
+                            LOGGER.warning(f"[Health Check] Skipping group {group_id} because it's a legacy entry missing 'owner_id'.")
+                            continue
+                        
                         owner_id = group_data["owner_id"]
                         
                         try:

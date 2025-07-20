@@ -236,7 +236,8 @@ class Config:
         "این ربات به شما اجازه می‌دهد تا با چندین حساب تلگرام به صورت همزمان گروه‌های جدید بسازید.\n\n"
         "**دستورات ادمین:**\n"
         "- `/broadcast [message]`: ارسال پیام همگانی به تمام کاربران.\n"
-        "- `/set_user_limit [user_id] [limit]`: تنظیم محدودیت ورکر برای یک کاربر.\n\n"
+        "- `/set_user_limit [user_id] [limit]`: تنظیم محدودیت ورکر برای یک کاربر.\n"
+        "- `/export_all_links`: دریافت فایل متنی حاوی لینک تمام گروه‌های ساخته شده.\n\n"
         f"**{BTN_MANAGE_ACCOUNTS}**\n"
         "در این بخش می‌توانید حساب‌های خود را مدیریت کنید:\n"
         f"  - `{BTN_ADD_ACCOUNT}`: یک شماره تلفن جدید با روش API اضافه کنید.\n"
@@ -923,7 +924,7 @@ class GroupCreatorBot:
         active_clients_meta = list(clients_with_meta)
         ai_failed_for_this_group = False # [NEW] Flag to track AI failure per group
         
-        # [MODIFIED] Use random.choices to prevent crashing if not enough unique personas
+        # [FIX] Use random.choices to allow reusing personas if there are more participants than personas
         personas = random.choices(Config.PERSONAS, k=len(active_clients_meta))
         for i, meta in enumerate(active_clients_meta):
             meta['persona'] = personas[i]
@@ -1450,6 +1451,8 @@ class GroupCreatorBot:
             await self._list_workers_handler(event)
         elif text == "/list_groups":
             await self._list_groups_handler(event)
+        elif text == "/export_all_links": # [NEW]
+            await self._export_all_links_handler(event)
         elif text == "/list_conv_accounts":
             await self._list_conv_accounts_handler(event)
         elif text == "/view_config":
@@ -1745,17 +1748,6 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_BROWSER_RUNNING)
         await asyncio.sleep(2)
         await self._initiate_login_flow(event)
-    
-    # [NEW] Admin command handlers
-    async def _set_user_limit_handler(self, event: events.NewMessage.Event, user_id: int, limit: int):
-        self.user_worker_limits[str(user_id)] = limit
-        self._save_user_worker_limits()
-        await event.reply(f"✅ Worker limit for user `{user_id}` has been set to `{limit}`.")
-
-    async def _broadcast_command_handler(self, event: events.NewMessage.Event, message: str):
-        await event.reply(f"📢 Broadcasting the following message to all {len(self.known_users)} users:\n\n{message}")
-        await self._broadcast_message(message)
-        await event.reply("✅ Broadcast complete.")
 
     async def _message_router(self, event: events.NewMessage.Event) -> None:
         if not isinstance(getattr(event, 'message', None), Message) or not event.message.text:

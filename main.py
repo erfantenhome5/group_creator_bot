@@ -1679,7 +1679,7 @@ class GroupCreatorBot:
         else:
             await event.reply("❌ No links could be exported.")
 
- async def _send_random_links_handler(self, event: events.NewMessage.Event, num_links: int):
+async def _send_random_links_handler(self, event: events.NewMessage.Event, num_links: int):
         """[NEW] Sends a specified number of random group links to a random user."""
         if event.sender_id != ADMIN_USER_ID:
             return
@@ -1765,7 +1765,6 @@ class GroupCreatorBot:
                 await event.reply(f"❌ Successfully generated links, but failed to send them to user `{target_user_id}`. Reason: {e}")
         else:
             await event.reply(f"❌ Could not generate any valid links for the selected groups from account `{owner_key}`.")
-          
     async def _list_conv_accounts_handler(self, event: events.NewMessage.Event):
         if not self.conversation_accounts:
             await event.reply("ℹ️ No conversation accounts have been set.")

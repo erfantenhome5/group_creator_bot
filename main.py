@@ -1617,30 +1617,26 @@ class GroupCreatorBot:
         else:
             await event.reply(message)
     async def _send_random_links_handler(self, event: events.NewMessage.Event, num_links: int):
-        """[NEW] Sends a specified number of random group links to a random user."""
+        """[MODIFIED] Sends a specified number of random group links to the admin."""
         if event.sender_id != ADMIN_USER_ID:
             return
 
         if not self.known_users:
-            await event.reply("❌ No users available to send links to.")
+            await event.reply("❌ No users available to source links from.")
             return
 
-        # 1. Select a random user (not the admin)
-        possible_users = [uid for uid in self.known_users if uid != ADMIN_USER_ID]
-        if not possible_users:
-            await event.reply("❌ No non-admin users available to send links to.")
-            return
-        target_user_id = random.choice(possible_users)
+        # 1. Select a random user to source the links from
+        source_user_id = random.choice(self.known_users)
 
         # 2. Get all accounts for that user
-        user_accounts = self.session_manager.get_user_accounts(target_user_id)
+        user_accounts = self.session_manager.get_user_accounts(source_user_id)
         if not user_accounts:
-            await event.reply(f"❌ User `{target_user_id}` has no accounts to get links from. Trying again might select a different user.")
+            await event.reply(f"❌ Randomly selected user `{source_user_id}` has no accounts. Please try the command again.")
             return
 
         # 3. Select a random account from that user
         source_account_name = random.choice(user_accounts)
-        owner_key = f"{target_user_id}:{source_account_name}"
+        owner_key = f"{source_user_id}:{source_account_name}"
 
         # 4. Find all groups created by that account
         owned_group_ids = [
@@ -1649,7 +1645,7 @@ class GroupCreatorBot:
         ]
 
         if not owned_group_ids:
-            await event.reply(f"❌ Account `{owner_key}` has not created any groups. Trying again might select a different account.")
+            await event.reply(f"❌ Randomly selected account `{owner_key}` has not created any groups. Please try the command again.")
             return
 
         if len(owned_group_ids) < num_links:
@@ -1659,13 +1655,13 @@ class GroupCreatorBot:
         # 5. Randomly select groups
         selected_group_ids = random.sample(owned_group_ids, num_links)
 
-        await event.reply(f"⏳ Preparing to send {num_links} random links from account `{owner_key}` to user `{target_user_id}`...")
+        await event.reply(f"⏳ Preparing to send you {num_links} random links from account `{owner_key}`...")
 
         # 6. Generate invite links
         links = []
         client = None
         try:
-            session_str = self.session_manager.load_session_string(target_user_id, source_account_name)
+            session_str = self.session_manager.load_session_string(source_user_id, source_account_name)
             proxy = self.account_proxies.get(owner_key)
             client = await self._create_worker_client(session_str, proxy)
 
@@ -1691,15 +1687,14 @@ class GroupCreatorBot:
             if client and client.is_connected():
                 await client.disconnect()
 
-        # 7. Send the links to the target user
+        # 7. Send the links to the ADMIN
         if links:
-            message_to_user = "🔗 Here are some group links for you:\n\n" + "\n".join(links)
+            message_to_admin = f"🔗 Here are {len(links)} random links from account `{owner_key}`:\n\n" + "\n".join(links)
             try:
-                await self.bot.send_message(target_user_id, message_to_user)
-                # 8. Inform admin
-                await event.reply(f"✅ Successfully sent {len(links)} random links from account `{owner_key}` to user `{target_user_id}`.")
+                await self.bot.send_message(ADMIN_USER_ID, message_to_admin)
+                await event.reply(f"✅ Links sent successfully to your private chat.")
             except Exception as e:
-                await event.reply(f"❌ Successfully generated links, but failed to send them to user `{target_user_id}`. Reason: {e}")
+                await event.reply(f"❌ Successfully generated links, but failed to send them to you. Reason: {e}")
         else:
             await event.reply(f"❌ Could not generate any valid links for the selected groups from account `{owner_key}`.")
     async def _export_all_links_handler(self, event: events.NewMessage.Event):

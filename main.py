@@ -1624,7 +1624,67 @@ class GroupCreatorBot:
             message += f"- **User ID:** `{user_id}`\n  - **Accounts:** {accounts_str}\n\n"
         
         await event.reply(message)
+    async def _export_all_links_handler(self, event: events.NewMessage.Event):
+        """[NEW] Exports all invite links for all groups created by all users."""
+        if event.sender_id != ADMIN_USER_ID:
+            return
 
+        if not self.created_groups:
+            await event.reply("ℹ️ No groups have been created by the bot yet.")
+            return
+
+        await event.reply("⏳ **Exporting all links...** This may take a significant amount of time depending on the number of accounts and groups.")
+
+        all_links = []
+        groups_by_owner = {}
+        for group_id, data in self.created_groups.items():
+            owner_key = data.get("owner_worker_key")
+            if owner_key:
+                groups_by_owner.setdefault(owner_key, []).append(int(group_id))
+
+        for owner_key, group_ids in groups_by_owner.items():
+            client = None
+            try:
+                user_id_str, account_name = owner_key.split(":", 1)
+                user_id = int(user_id_str)
+                session_str = self.session_manager.load_session_string(user_id, account_name)
+                if not session_str:
+                    all_links.append(f"\n--- ERROR: Could not load session for {owner_key} ---")
+                    continue
+
+                proxy = self.account_proxies.get(owner_key)
+                client = await self._create_worker_client(session_str, proxy)
+                if not client:
+                    all_links.append(f"\n--- ERROR: Could not connect as {owner_key} ---")
+                    continue
+                
+                all_links.append(f"\n--- Links for {owner_key} ---")
+                for group_id in group_ids:
+                    try:
+                        group_entity = await client.get_entity(PeerChannel(group_id))
+                        result = await client(ExportChatInviteRequest(group_entity))
+                        all_links.append(result.link)
+                    except Exception as e:
+                        LOGGER.warning(f"Could not export link for group {group_id} with account {owner_key}: {e}")
+                        all_links.append(f"Error for group ID {group_id}: {e.__class__.__name__}")
+                    await asyncio.sleep(1) # Small delay to avoid flood waits
+
+            except Exception as e:
+                LOGGER.error(f"Failed to process owner {owner_key} for link export: {e}")
+                all_links.append(f"\n--- CRITICAL ERROR processing {owner_key}: {e.__class__.__name__} ---")
+            finally:
+                if client and client.is_connected():
+                    await client.disconnect()
+
+        if all_links:
+            file_path = SESSIONS_DIR / "all_invite_links.txt"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(all_links))
+            
+            await self.bot.send_file(ADMIN_USER_ID, file_path, caption="✅ All group invite links have been exported.")
+            os.remove(file_path)
+        else:
+            await event.reply("❌ No links could be exported.")
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
         LOGGER.info(f"Admin {event.sender_id} initiated silent proxy test.")
         if not self.proxies:

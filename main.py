@@ -1618,7 +1618,7 @@ class GroupCreatorBot:
             await event.reply(message)
 
     async def _export_all_links_handler(self, event: events.NewMessage.Event):
-        """[NEW] Exports all invite links for all groups created by all users."""
+      
         if event.sender_id != ADMIN_USER_ID:
             return
 
@@ -1680,7 +1680,7 @@ class GroupCreatorBot:
             await event.reply("❌ No links could be exported.")
 
   async def _send_random_links_handler(self, event: events.NewMessage.Event, num_links: int):
-        """[NEW] Sends a specified number of random group links to a random user."""
+    
         if event.sender_id != ADMIN_USER_ID:
             return
 

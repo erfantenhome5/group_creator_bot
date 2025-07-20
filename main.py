@@ -3004,10 +3004,6 @@ class GroupCreatorBot:
                                             p_me = await p_client.get_me()
                                             conv_clients_meta.append({'client': p_client, 'user_id': user_id, 'account_id': p_me.id, 'account_name': p_name})
                                     
-                                    all_clients_meta = [{'client': owner_client, 'user_id': user_id, 'account_id': owner_id, 'account_nam
-
-
-                                    
                                     all_clients_meta = [{'client': owner_client, 'user_id': user_id, 'account_id': owner_id, 'account_name': account_name}] + conv_clients_meta
 
                                     if len(all_clients_meta) >= 2:

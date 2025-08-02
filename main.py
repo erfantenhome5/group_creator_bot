@@ -648,6 +648,22 @@ class GroupCreatorBot:
             except Exception as e:
                 LOGGER.error(f"Error sending message to {user_id}: {e}")
 
+
+    # PASTE THE NEW FUNCTION HERE
+    async def _set_user_limit_handler(self, event: events.NewMessage.Event, user_id: int, limit: int):
+        """[NEW] Sets the concurrent worker limit for a specific user."""
+        if event.sender_id != ADMIN_USER_ID:
+            return
+        
+        if limit <= 0:
+            await event.reply("❌ Limit must be a positive number.")
+            return
+
+        self.user_worker_limits[str(user_id)] = limit
+        self._save_user_worker_limits()
+        await event.reply(f"✅ Worker limit for user `{user_id}` has been set to `{limit}`.")
+      
+
     async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         session = sessions.StringSession()
         device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
@@ -1481,20 +1497,6 @@ class GroupCreatorBot:
             await self._start_dm_message_handler(event)
         else:
             await event.reply("Unknown admin command.")
-
-
-      async def _set_user_limit_handler(self, event: events.NewMessage.Event, user_id: int, limit: int):
-        """[NEW] Sets the concurrent worker limit for a specific user."""
-        if event.sender_id != ADMIN_USER_ID:
-            return
-        
-        if limit <= 0:
-            await event.reply("❌ Limit must be a positive number.")
-            return
-
-        self.user_worker_limits[str(user_id)] = limit
-        self._save_user_worker_limits()
-        await event.reply(f"✅ Worker limit for user `{user_id}` has been set to `{limit}`.")
         
     async def _pre_approve_handler(self, event: events.NewMessage.Event, user_id_to_approve: int):
         if user_id_to_approve not in self.known_users:

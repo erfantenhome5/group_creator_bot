@@ -1114,8 +1114,20 @@ class GroupCreatorBot:
             async with self.worker_semaphore:
                 LOGGER.info(f"Worker for {worker_key} started.")
                 
+                # [NEW] Calculate and send initial time estimate
+                avg_sleep_per_group = (self.min_sleep_seconds + self.max_sleep_seconds) / 2
+                buffer_for_api_calls = 20  # Estimated seconds for API calls, invites, and conversation per group
+                total_estimated_seconds = (avg_sleep_per_group + buffer_for_api_calls) * self.groups_to_create
+                eta_str = self._format_time_delta(total_estimated_seconds)
+                
+                initial_message = (
+                    f"🚀 شروع عملیات ساخت گروه برای حساب `{account_name}`...\n\n"
+                    f"⏳ **زمان تخمینی برای ساخت {self.groups_to_create} گروه:** حدودا **{eta_str}**."
+                )
+                progress_message = await self.bot.send_message(user_id, initial_message)
+                
                 start_time = datetime.now()
-                progress_message = await self.bot.send_message(user_id, f"🚀 Starting group creation for `{account_name}`...")
+                me = await user_client.get_me()
 
                 me = await user_client.get_me()
                 owner_id = me.id # [NEW] Store the owner's ID

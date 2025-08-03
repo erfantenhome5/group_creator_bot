@@ -369,7 +369,8 @@ class GroupCreatorBot:
         self.active_dm_chats: Dict[str, asyncio.Task] = {}
         self.suggested_code: Optional[str] = None
         self.health_check_lock = asyncio.Lock() # [NEW] Lock for health checks
-        
+        self.gemini_api_keys = deque() # ADD THIS LINE
+
         self.config_file = SESSIONS_DIR / "config.json"
         self.config = self._load_json_file(self.config_file, {})
         self.update_config_from_file()
@@ -421,7 +422,12 @@ class GroupCreatorBot:
         self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
-        self.gemini_api_key = self.config.get("GEMINI_API_KEY", GEMINI_API_KEY)
+            # ADD THESE LINES
+    gemini_keys_str = self.config.get("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEYS"))
+    if gemini_keys_str:
+        self.gemini_api_keys = deque([key.strip() for key in gemini_keys_str.split(',') if key.strip()])
+    else:
+        self.gemini_api_keys = deque()
         self.health_check_interval = self.config.get("GROUP_HEALTH_CHECK_INTERVAL_SECONDS", Config.GROUP_HEALTH_CHECK_INTERVAL_SECONDS)
         self.ai_request_timeout = self.config.get("AI_REQUEST_TIMEOUT", Config.AI_REQUEST_TIMEOUT)
         
@@ -808,15 +814,15 @@ class GroupCreatorBot:
         documents = self.sticker_sets.get(pack_name_to_use)
         return random.choice(documents) if documents else None
 
-    async def _execute_gemini_request(self, model_name: str, prompt: str, proxy_info: Optional[Dict]) -> Optional[List[str]]:
+    async def _execute_gemini_request(self, api_key: str, model_name: str, prompt: str, proxy_info: Optional[Dict]) -> Optional[List[str]]:
         """A unified function to execute an AI request against the Gemini API."""
         proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
         
-        if not self.gemini_api_key: return None
+        if not api_key: return None
         
         api_model_name = model_name.replace("-latest", "").replace("-preview-0617", "")
         
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model_name}:generateContent?key={self.gemini_api_key}"
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model_name}:generateContent?key={api_key}"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         headers = {'Content-Type': 'application/json'}
         
@@ -839,6 +845,56 @@ class GroupCreatorBot:
         if ai_is_down:
             LOGGER.info("AI is marked as down for this session, using predefined fallback.")
             return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
+
+        if not self.gemini_api_keys:
+            LOGGER.warning("No Gemini API keys are set. Using predefined fallback.")
+            return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
+
+        keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
+        
+        if previous_message:
+            prompt = (
+                f"You are a person in a group chat. Your personality is: '{persona}'. "
+                f"Someone else just said: '{previous_message}'. "
+                f"Write a short, casual, and natural-sounding reply in Persian. "
+                f"Keep it to one or two sentences. Use slang and emojis if it fits your personality."
+            )
+        else:
+            prompt = (
+                f"You are a person starting a conversation in a group chat. Your personality is: '{persona}'. "
+                f"Start a conversation about one of these topics: {', '.join(keywords)}. "
+                f"Write a short, casual, and engaging opening message in Persian (one or two sentences). "
+                f"Use slang and emojis if it fits your personality."
+            )
+        
+        for model in self.gemini_model_hierarchy:
+            LOGGER.info(f"Attempting AI generation with model: {model}")
+            
+            # Loop through available API keys, giving each one a chance
+            for _ in range(len(self.gemini_api_keys)):
+                current_key = self.gemini_api_keys[0] # Get the current key at the front
+                try:
+                    proxy_info = await self.proxy_manager.get_proxy()
+                    result = await self._execute_gemini_request(current_key, model, prompt, proxy_info)
+                    if result:
+                        return result # Success!
+                except httpx.HTTPStatusError as e:
+                    # If rate limited or key is bad, rotate to the next key and try again
+                    if e.response.status_code in [429, 403]: 
+                        LOGGER.warning(f"Gemini API key ending in '...{current_key[-4:]}' failed with status {e.response.status_code}. Rotating to next key.")
+                        self.gemini_api_keys.rotate(-1) # Move the failed key to the end of the list
+                        await asyncio.sleep(1) # Small delay before retrying with the next key
+                    else:
+                        LOGGER.error(f"HTTP error for {model} with key '...{current_key[-4:]}': {e}", exc_info=True)
+                        break # Unrecoverable error for this model, try the next model
+                except Exception as e:
+                    LOGGER.error(f"Request failed for {model} with key '...{current_key[-4:]}': {e}", exc_info=True)
+                    break # Unrecoverable error for this model, try the next model
+            
+            LOGGER.warning(f"All API keys failed for model {model}. Trying next model in hierarchy.")
+
+        LOGGER.error("All AI models and all API keys in the hierarchy failed. Using a predefined fallback message.")
+        return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
 
         if not self.gemini_api_key:
             LOGGER.warning("No Gemini API key is set. Using predefined fallback.")

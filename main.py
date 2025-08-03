@@ -422,14 +422,15 @@ class GroupCreatorBot:
         self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
         self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
-            # ADD THESE LINES
-    gemini_keys_str = self.config.get("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEYS"))
-    if gemini_keys_str:
-        self.gemini_api_keys = deque([key.strip() for key in gemini_keys_str.split(',') if key.strip()])
-    else:
-        self.gemini_api_keys = deque()
         self.health_check_interval = self.config.get("GROUP_HEALTH_CHECK_INTERVAL_SECONDS", Config.GROUP_HEALTH_CHECK_INTERVAL_SECONDS)
         self.ai_request_timeout = self.config.get("AI_REQUEST_TIMEOUT", Config.AI_REQUEST_TIMEOUT)
+
+        # [FIX] Correctly load and parse the list of Gemini API keys
+        gemini_keys_str = self.config.get("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEYS"))
+        if gemini_keys_str:
+            self.gemini_api_keys = deque([key.strip() for key in gemini_keys_str.split(',') if key.strip()])
+        else:
+            self.gemini_api_keys = deque()
         
         self.gemini_model_hierarchy = self.config.get("GEMINI_MODEL_HIERARCHY", [
             "gemini-2.5-pro",

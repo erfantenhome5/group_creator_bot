@@ -170,7 +170,7 @@ class Config:
     MESSAGE_SEND_DELAY_MIN = 1
     MESSAGE_SEND_DELAY_MAX = 5
     GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 604800 # 7 days
-    AI_REQUEST_TIMEOUT = 10 # [NEW]
+    AI_REQUEST_TIMEOUT = 30 # [MODIFIED]
 
     # [NEW] Predefined fallback messages for when AI fails
     PREDEFINED_FALLBACK_MESSAGES = [
@@ -432,10 +432,11 @@ class GroupCreatorBot:
         else:
             self.gemini_api_keys = deque()
         
+
+
         self.gemini_model_hierarchy = self.config.get("GEMINI_MODEL_HIERARCHY", [
             "gemini-2.5-pro",
             "gemini-2.5-flash",
-            "gemini-2.5-flash-lite-preview-0617",
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
             "gemini-1.5-flash"
@@ -1188,7 +1189,7 @@ class GroupCreatorBot:
                                     try:
                                         await p_client(ImportChatInviteRequest(invite_hash))
                                         LOGGER.info(f"Account '{p_name}' successfully joined group {new_supergroup.id} via link.")
-                                        await asyncio.sleep(random.uniform(5, 10)) # Delay to allow server processing
+                                        await asyncio.sleep(random.uniform(45, 120)) # [MODIFIED] Longer delay to avoid flood waits
                                     except Exception as e:
                                         LOGGER.warning(f"Account '{p_name}' failed to join group {new_supergroup.id} via link: {e}")
                             else:

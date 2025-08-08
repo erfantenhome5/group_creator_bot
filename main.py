@@ -227,6 +227,7 @@ class Config:
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
     BTN_MANUAL_HEALTH_CHECK = "🩺 بررسی سلامت گروه‌ها" # [NEW] Admin button
+    BTN_MESSAGE_ALL_GROUPS = "💬 پیام دار کردن همه گروه ها"
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -296,7 +297,8 @@ class Config:
     MSG_MAINTENANCE_ACTIVE = "⏳ ربات در حال حاضر تحت عملیات بررسی و نگهداری است. لطفاً چند دقیقه دیگر دوباره امتحان کنید."
     MSG_MAINTENANCE_BROADCAST_START = "🔧 **اطلاعیه:** ربات برای بررسی و نگهداری دوره‌ای موقتاً با محدودیت در دسترس خواهد بود. از صبر شما متشکریم."
     MSG_MAINTENANCE_BROADCAST_END = "✅ **اطلاعیه:** عملیات نگهداری ربات به پایان رسید. تمام قابلیت‌ها اکنون در دسترس هستند."
-
+    MSG_MESSAGE_ALL_GROUPS_STARTED = "✅ عملیات ارسال پیام به تمام گروه‌ها آغاز شد. این فرآیند در پس‌زمینه اجرا می‌شود و ممکن است بسیار زمان‌بر باشد."
+    MSG_MESSAGE_ALL_GROUPS_COMPLETE = "🏁 عملیات ارسال پیام به تمام گروه‌ها به پایان رسید.\n\n👥 **اکانت‌های پردازش شده:** {accounts_processed}\n💬 **مجموع پیام‌های ارسال شده:** {total_messages_sent}"
 
 class SessionManager:
     """Manages encrypted user session files."""
@@ -370,7 +372,7 @@ class GroupCreatorBot:
         self.suggested_code: Optional[str] = None
         self.health_check_lock = asyncio.Lock() # [NEW] Lock for health checks
         self.gemini_api_keys = deque() # ADD THIS LINE
-
+        self.message_all_lock = asyncio.Lock() # ADD THIS LINE
         self.config_file = SESSIONS_DIR / "config.json"
         self.config = self._load_json_file(self.config_file, {})
         self.update_config_from_file()
@@ -1490,6 +1492,7 @@ class GroupCreatorBot:
         
         buttons = [
             [Button.text(Config.BTN_MANUAL_HEALTH_CHECK)], # [NEW]
+            [Button.text(Config.BTN_MESSAGE_ALL_GROUPS)], # ADD THIS LINE
             [Button.text("Set AI Model Hierarchy")],
             [Button.text("Set Worker Limit"), Button.text("Set Group Count")],
             [Button.text("Set Sleep Times"), Button.text("Set Daily Msg Limit")],
@@ -2074,6 +2077,8 @@ class GroupCreatorBot:
                 Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
                 Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
                 Config.BTN_MANUAL_HEALTH_CHECK: self._manual_health_check_handler, # [NEW]
+                Config.BTN_MESSAGE_ALL_GROUPS: self._message_all_groups_handler, # ADD THIS LINE
+
             }
             
             # Admin settings buttons
@@ -3198,7 +3203,78 @@ class GroupCreatorBot:
                     Config.MSG_HEALTH_CHECK_COMPLETE.format(healed_count=healed_count, cleaned_count=cleaned_count, topped_up_count=topped_up_count)
                 )
                 await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_END)
+    async def _message_all_groups_handler(self, event: events.NewMessage.Event):
+        """Handles the admin's request to message all groups."""
+        if event.sender_id != ADMIN_USER_ID:
+            return
+        
+        await event.reply(Config.MSG_MESSAGE_ALL_GROUPS_STARTED)
+        # Run the task in the background to not block the bot
+        asyncio.create_task(self.run_message_all_groups())
 
+    async def run_message_all_groups(self):
+        """The core logic for sending messages to all groups for all accounts."""
+        if self.message_all_lock.locked():
+            LOGGER.warning("Message all groups task triggered but another is already in progress. Skipping.")
+            await self.bot.send_message(ADMIN_USER_ID, "⚠️ عملیات ارسال پیام همگانی از قبل در حال اجرا است.")
+            return
+
+        async with self.message_all_lock:
+            LOGGER.info("--- Messaging All Groups Task Started ---")
+            
+            accounts_processed = 0
+            total_messages_sent = 0
+            
+            all_accounts = self.session_manager.get_all_accounts()
+
+            for owner_key, user_id in all_accounts.items():
+                client = None
+                try:
+                    user_id_str, account_name = owner_key.split(":", 1)
+                    
+                    session_str = self.session_manager.load_session_string(user_id, account_name)
+                    if not session_str:
+                        LOGGER.warning(f"[Message All] No session for account {owner_key}, skipping.")
+                        continue
+                    
+                    proxy = self.account_proxies.get(owner_key)
+                    client = await self._create_worker_client(session_str, proxy)
+                    if not client:
+                        LOGGER.error(f"[Message All] Failed to connect as account {owner_key}, skipping.")
+                        continue
+
+                    LOGGER.info(f"[Message All] Processing groups for account {owner_key}.")
+                    async for dialog in client.iter_dialogs():
+                        if dialog.is_group:
+                            try:
+                                for _ in range(10):
+                                    message_text = random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)
+                                    await client.send_message(dialog.id, message_text)
+                                    total_messages_sent += 1
+                                    # Use a longer, more random delay between messages to appear human
+                                    await asyncio.sleep(random.uniform(10, 25))
+                            except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError):
+                                LOGGER.warning(f"[Message All] Account {owner_key} cannot send messages in group {dialog.id}. Skipping.")
+                                break # Move to the next group
+                            except Exception as e:
+                                LOGGER.error(f"[Message All] Error sending message to group {dialog.id} with account {owner_key}: {e}")
+                    
+                    accounts_processed += 1
+
+                except Exception as e:
+                    LOGGER.error(f"[Message All] Major error processing account {owner_key}: {e}")
+                finally:
+                    if client and client.is_connected():
+                        await client.disconnect()
+
+            LOGGER.info("--- Messaging All Groups Task Finished ---")
+            await self.bot.send_message(
+                ADMIN_USER_ID, 
+                Config.MSG_MESSAGE_ALL_GROUPS_COMPLETE.format(
+                    accounts_processed=accounts_processed, 
+                    total_messages_sent=total_messages_sent
+                )
+            )
     async def _send_error_explanation(self, user_id: int, e: Exception):
         """Logs an error and sends a simplified explanation to the user and a detailed one to the admin."""
         LOGGER.error(f"An error occurred for user {user_id}", exc_info=True)

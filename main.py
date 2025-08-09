@@ -3213,13 +3213,15 @@ class GroupCreatorBot:
         asyncio.create_task(self.run_message_all_groups())
 
     async def run_message_all_groups(self):
-        """The core logic for sending messages to all groups for all accounts."""
-        if self.message_all_lock.locked():
+        """[MODIFIED] The core logic for sending messages to all groups for all accounts, now faster and with a global lock."""
+        if self.health_check_lock.locked():
             LOGGER.warning("Message all groups task triggered but another is already in progress. Skipping.")
-            await self.bot.send_message(ADMIN_USER_ID, "⚠️ عملیات ارسال پیام همگانی از قبل در حال اجرا است.")
+            await self.bot.send_message(ADMIN_USER_ID, "⚠️ یک عملیات تعمیر و نگهداری دیگر (مانند بررسی سلامت) از قبل در حال اجرا است.")
             return
 
-        async with self.message_all_lock:
+        # [NEW] Lock the bot for all non-admin users
+        async with self.health_check_lock:
+            await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_START)
             LOGGER.info("--- Messaging All Groups Task Started ---")
             
             accounts_processed = 0
@@ -3254,8 +3256,8 @@ class GroupCreatorBot:
                                     await client.send_message(dialog.id, message_text)
                                     total_messages_sent += 1
                                     LOGGER.info(f"[Message All] >> Sent message {i + 1}/10 to group '{dialog.title}' from {owner_key}.")
-                                    # Use a longer, more random delay between messages to appear human
-                                    await asyncio.sleep(random.uniform(10, 25))
+                                    # [MODIFIED] Faster delay
+                                    await asyncio.sleep(1)
                             except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError):
                                 LOGGER.warning(f"[Message All] Account {owner_key} cannot send messages in group '{dialog.title}'. Skipping.")
                                 break # Move to the next group
@@ -3263,7 +3265,6 @@ class GroupCreatorBot:
                                 LOGGER.error(f"[Message All] Error sending message to group '{dialog.title}' with account {owner_key}: {e}")
                     
                     accounts_processed += 1
-                    # [NEW] Send a progress update to the admin every 5 accounts
                     if accounts_processed % 5 == 0 and accounts_processed < total_accounts:
                         await self.bot.send_message(
                             ADMIN_USER_ID,
@@ -3284,6 +3285,8 @@ class GroupCreatorBot:
                     total_messages_sent=total_messages_sent
                 )
             )
+            await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_END)
+
           
     async def _send_error_explanation(self, user_id: int, e: Exception):
         """Logs an error and sends a simplified explanation to the user and a detailed one to the admin."""

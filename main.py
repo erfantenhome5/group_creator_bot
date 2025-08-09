@@ -3226,6 +3226,7 @@ class GroupCreatorBot:
             total_messages_sent = 0
             
             all_accounts = self.session_manager.get_all_accounts()
+            total_accounts = len(all_accounts)
 
             for owner_key, user_id in all_accounts.items():
                 client = None
@@ -3243,23 +3244,31 @@ class GroupCreatorBot:
                         LOGGER.error(f"[Message All] Failed to connect as account {owner_key}, skipping.")
                         continue
 
-                    LOGGER.info(f"[Message All] Processing groups for account {owner_key}.")
+                    LOGGER.info(f"[Message All] Processing groups for account {owner_key} ({accounts_processed + 1}/{total_accounts}).")
                     async for dialog in client.iter_dialogs():
                         if dialog.is_group:
+                            LOGGER.info(f"[Message All] Found group '{dialog.title}' (ID: {dialog.id}) for account {owner_key}.")
                             try:
-                                for _ in range(10):
+                                for i in range(10):
                                     message_text = random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)
                                     await client.send_message(dialog.id, message_text)
                                     total_messages_sent += 1
+                                    LOGGER.info(f"[Message All] >> Sent message {i + 1}/10 to group '{dialog.title}' from {owner_key}.")
                                     # Use a longer, more random delay between messages to appear human
                                     await asyncio.sleep(random.uniform(10, 25))
                             except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError):
-                                LOGGER.warning(f"[Message All] Account {owner_key} cannot send messages in group {dialog.id}. Skipping.")
+                                LOGGER.warning(f"[Message All] Account {owner_key} cannot send messages in group '{dialog.title}'. Skipping.")
                                 break # Move to the next group
                             except Exception as e:
-                                LOGGER.error(f"[Message All] Error sending message to group {dialog.id} with account {owner_key}: {e}")
+                                LOGGER.error(f"[Message All] Error sending message to group '{dialog.title}' with account {owner_key}: {e}")
                     
                     accounts_processed += 1
+                    # [NEW] Send a progress update to the admin every 5 accounts
+                    if accounts_processed % 5 == 0 and accounts_processed < total_accounts:
+                        await self.bot.send_message(
+                            ADMIN_USER_ID,
+                            f"🔄 **گزارش پیشرفت:**\n\n- **اکانت‌های پردازش شده:** {accounts_processed} از {total_accounts}\n- **مجموع پیام‌های ارسال شده:** {total_messages_sent}"
+                        )
 
                 except Exception as e:
                     LOGGER.error(f"[Message All] Major error processing account {owner_key}: {e}")
@@ -3275,6 +3284,7 @@ class GroupCreatorBot:
                     total_messages_sent=total_messages_sent
                 )
             )
+          
     async def _send_error_explanation(self, user_id: int, e: Exception):
         """Logs an error and sends a simplified explanation to the user and a detailed one to the admin."""
         LOGGER.error(f"An error occurred for user {user_id}", exc_info=True)

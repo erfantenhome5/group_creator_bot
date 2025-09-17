@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional
 import sys
 import time
 
-import httpx
 import sentry_sdk
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
@@ -29,11 +28,10 @@ from telethon.tl.functions.messages import (ExportChatInviteRequest,
                                             GetAllStickersRequest,
                                             GetStickerSetRequest,
                                             ImportChatInviteRequest,
-                                            SendReactionRequest,
                                             SearchStickerSetsRequest)
 from telethon.tl.types import (ChannelParticipantCreator, ChannelParticipantsAdmins,
                                InputStickerSetID, InputStickerSetShortName, Message,
-                               PeerChannel, ReactionEmoji)
+                               PeerChannel)
 
 # --- Basic Logging Setup ---
 logging.basicConfig(
@@ -54,9 +52,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", OPENROUTER_API_KEY) # Use OpenRouter key as fallback for Gemini
-
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY, ADMIN_USER_ID]):
     raise ValueError("Missing required environment variables. Ensure API_ID, API_HASH, BOT_TOKEN, ENCRYPTION_KEY, and ADMIN_USER_ID are set.")
@@ -113,54 +108,11 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
         LOGGER.warning(f"Proxy file '{proxy_file_path}' not found.")
     return proxy_list
 
-# --- Proxy Manager for Global Rate Limiting ---
-class ProxyManager:
-    """
-    Manages proxy selection and enforces a global rate limit (RPM).
-    Note: This manager primarily handles Requests Per Minute (RPM). While it helps
-    mitigate other limits like Tokens Per Minute/Day (TPM/TPD) by spacing out
-    requests, it does not explicitly track token counts or daily quotas.
-    """
-    RATE_LIMIT = 480  # requests (kept slightly below 500 for safety)
-    TIME_WINDOW = 60  # seconds
-
-    def __init__(self, proxies: List[Dict]):
-        self._proxies = proxies
-        self._request_timestamps = deque()
-        self._lock = asyncio.Lock()
-
-    async def get_proxy(self) -> Optional[Dict]:
-        """
-        Returns a proxy while respecting the global rate limit.
-        Waits if the rate limit has been exceeded.
-        """
-        if not self._proxies:
-            return None
-
-        async with self._lock:
-            now = time.monotonic()
-            
-            # Remove timestamps older than the time window
-            while self._request_timestamps and self._request_timestamps[0] <= now - self.TIME_WINDOW:
-                self._request_timestamps.popleft()
-
-            # If we've hit the rate limit, wait for the oldest request to expire
-            if len(self._request_timestamps) >= self.RATE_LIMIT:
-                oldest_request_time = self._request_timestamps[0]
-                wait_time = oldest_request_time - (now - self.TIME_WINDOW)
-                if wait_time > 0:
-                    LOGGER.warning(f"Global proxy rate limit hit. Waiting for {wait_time:.2f} seconds.")
-                    await asyncio.sleep(wait_time)
-            
-            # Add new timestamp and return a random proxy
-            self._request_timestamps.append(time.monotonic())
-            return random.choice(self._proxies)
-
 # --- Centralized Configuration ---
 class Config:
     """Holds all configurable values and UI strings for the bot."""
     # Bot Settings
-    MAX_CONCURRENT_WORKERS = 5
+    MAX_CONCURRENT_WORKERS = 50 # [MODIFIED] Increased worker limit
     GROUPS_TO_CREATE = 50
     MIN_SLEEP_SECONDS = 144
     MAX_SLEEP_SECONDS = 288
@@ -170,10 +122,9 @@ class Config:
     MESSAGE_SEND_DELAY_MIN = 1
     MESSAGE_SEND_DELAY_MAX = 5
     GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 604800 # 7 days
-    AI_REQUEST_TIMEOUT = 30 # [MODIFIED]
 
-    # [NEW] Predefined fallback messages for when AI fails
-    PREDEFINED_FALLBACK_MESSAGES = [
+    # [MODIFIED] Renamed from PREDEFINED_FALLBACK_MESSAGES to be the source of random messages
+    RANDOM_MESSAGES = [
         "سلام دوستان!",
         "چه خبر؟",
         "کسی اینجا هست؟",
@@ -183,21 +134,15 @@ class Config:
         "موافقم.",
         "جالبه.",
         "چه روز خوبی!",
-        "امیدوارم همگی خوب باشید."
+        "امیدوارم همگی خوب باشید.",
+        "کسی نظری نداره؟",
+        "من برگشتم.",
+        "موضوع بحث چیه؟",
+        "خیلی جالبه!",
+        "بعدا صحبت می کنیم.",
     ]
 
-    # [NEW] Personas for more human-like conversations
-    PERSONAS = [
-        "یک فرد بسیار مشتاق و با انگیزه که همیشه در مورد موفقیت و اهداف صحبت می کند.",
-        "یک فرد شوخ طبع و بامزه که سعی می کند با جوک و داستان های خنده دار دیگران را بخنداند.",
-        "یک فرد کنجکاو و اهل فن که به تکنولوژی و گجت های جدید علاقه دارد.",
-        "یک فرد آرام و متفکر که سوالات عمیق می پرسد و به دنبال معنای زندگی است.",
-        "یک فرد عملگرا و واقع بین که همیشه به دنبال راه حل های عملی برای مشکلات است.",
-        "یک هنرمند خلاق که در مورد هنر، موسیقی و زیبایی صحبت می کند.",
-        "یک ورزشکار پرانرژی که در مورد تناسب اندام و سبک زندگی سالم صحبت می کند."
-    ]
-    
-    # [NEW & EXPANDED] User agents for more diverse client representation
+    # [EXPANDED] User agents for more diverse client representation
     USER_AGENTS = [
         {'device_model': 'iPhone 15 Pro Max', 'system_version': '17.5.1'},
         {'device_model': 'Samsung Galaxy S24 Ultra', 'system_version': 'SDK 34'},
@@ -219,14 +164,13 @@ class Config:
     BTN_START_PREFIX = "🟢 شروع برای"
     BTN_STOP_PREFIX = "⏹️ توقف برای"
     BTN_DELETE_PREFIX = "🗑️ حذف"
-    BTN_SET_KEYWORDS = "📝 تنظیم کلمات کلیدی AI"
     BTN_SET_STICKERS = "🎨 تنظیم استیکرها"
     BTN_SET_CONVERSATION_ACCOUNTS = "🗣️ تنظیم حساب‌های گفتگو"
     BTN_JOIN_VIA_LINK = "🔗 عضویت با لینک"
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
-    BTN_MANUAL_HEALTH_CHECK = "🩺 بررسی سلامت گروه‌ها" # [NEW] Admin button
+    BTN_MANUAL_HEALTH_CHECK = "🩺 بررسی سلامت گروه‌ها"
     BTN_MESSAGE_ALL_GROUPS = "💬 پیام دار کردن همه گروه ها"
 
     # --- Messages (All in Persian) ---
@@ -255,8 +199,6 @@ class Config:
         "مکالمه را به صورت دستی در تمام گروه‌های ساخته شده توسط یک حساب خاص فعال کنید.\n\n"
         f"**{BTN_STOP_FORCE_CONVERSATION}**\n"
         "یک مکالمه دستی در حال اجرا را متوقف کنید.\n\n"
-        f"**{BTN_SET_KEYWORDS}**\n"
-        "کلمات کلیدی مورد نظر خود را برای تولید محتوای هوش مصنوعی تنظیم کنید.\n\n"
         f"**{BTN_SET_STICKERS}**\n"
         "بسته‌های استیکر مورد علاقه خود را برای استفاده در گفتگوها تنظیم کنید.\n\n"
         f"**{BTN_SET_CONVERSATION_ACCOUNTS}**\n"
@@ -269,8 +211,6 @@ class Config:
     MSG_PROMPT_MASTER_PASSWORD = "🔑 لطفاً برای دسترسی به ربات، رمز عبور اصلی را وارد کنید:"
     MSG_INCORRECT_MASTER_PASSWORD = "❌ رمز عبور اشتباه است. لطفاً دوباره تلاش کنید."
     MSG_BROWSER_RUNNING = "⏳ در حال آماده‌سازی مرورگر امن... این کار ممکن است چند لحظه طول بکشد."
-    MSG_PROMPT_KEYWORDS = "📝 لطفاً کلمات کلیدی مورد نظر خود را برای تولید محتوای هوش مصنوعی وارد کنید. کلمات را با کاما (,) از هم جدا کنید.\n\nمثال: موفقیت, بازاریابی, ارز دیجیتال, فروش آنلاین"
-    MSG_KEYWORDS_SET = "✅ کلمات کلیدی شما با موفقیت ذخیره شد."
     MSG_PROMPT_STICKERS = "🎨 لطفاً نام کوتاه یک یا چند بسته استیکر را وارد کنید. نام‌ها را با کاما (,) از هم جدا کنید.\n\nمثال: AnimatedStickers, Cats"
     MSG_STICKERS_SET = "✅ بسته‌های استیکر شما با موفقیت ذخیره شد."
     MSG_PROMPT_CONVERSATION_ACCOUNTS = "🗣️ لطفاً نام مستعار حساب‌هایی که می‌خواهید در گفتگوها شرکت کنند را وارد کنید. نام‌ها را با کاما (,) از هم جدا کنید.\n\nاین حساب‌ها در گروه‌های جدید ساخته شده با یکدیگر گفتگو خواهند کرد. برای غیرفعال کردن این ویژگی، این بخش را خالی بگذارید."
@@ -370,23 +310,20 @@ class GroupCreatorBot:
         self.active_conversations: Dict[str, asyncio.Task] = {}
         self.active_dm_chats: Dict[str, asyncio.Task] = {}
         self.suggested_code: Optional[str] = None
-        self.health_check_lock = asyncio.Lock() # [NEW] Lock for health checks
-        self.gemini_api_keys = deque() # ADD THIS LINE
-        self.message_all_lock = asyncio.Lock() # ADD THIS LINE
+        self.health_check_lock = asyncio.Lock()
+        self.message_all_lock = asyncio.Lock()
         self.config_file = SESSIONS_DIR / "config.json"
         self.config = self._load_json_file(self.config_file, {})
         self.update_config_from_file()
 
-        self.worker_semaphore = asyncio.Semaphore(self.config.get("MAX_CONCURRENT_WORKERS", 5))
+        self.worker_semaphore = asyncio.Semaphore(self.config.get("MAX_CONCURRENT_WORKERS", 50))
         
         self.counts_file = SESSIONS_DIR / "group_counts.json"
         self.group_counts = self._load_group_counts()
         self.daily_counts_file = SESSIONS_DIR / "daily_counts.json"
         self.daily_counts = self._load_daily_counts()
         self.proxies = load_proxies_from_file(self.config.get("PROXY_FILE", "proxy.txt"))
-        if not self.proxies:
-            LOGGER.info("No proxies loaded from file. AI requests will attempt to use system proxy settings if available. Telegram connections will be direct.")
-        self.proxy_manager = ProxyManager(self.proxies)
+        
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
         self.known_users_file = SESSIONS_DIR / "known_users.json"
@@ -399,14 +336,12 @@ class GroupCreatorBot:
         self.created_groups = self._load_created_groups()
         self.active_workers_file = SESSIONS_DIR / "active_workers.json"
         self.active_workers_state = self._load_active_workers_state()
-        self.keywords_file = SESSIONS_DIR / "keywords.json"
-        self.user_keywords = self._load_user_keywords()
         self.user_sticker_packs_file = SESSIONS_DIR / "user_sticker_packs.json"
         self.user_sticker_packs = self._load_user_sticker_packs()
         self.conversation_accounts_file = SESSIONS_DIR / "conversation_accounts.json"
         self.conversation_accounts = self._load_conversation_accounts()
-        self.user_worker_limits_file = SESSIONS_DIR / "user_worker_limits.json" # [NEW]
-        self.user_worker_limits = self._load_user_worker_limits() # [NEW]
+        self.user_worker_limits_file = SESSIONS_DIR / "user_worker_limits.json"
+        self.user_worker_limits = self._load_user_worker_limits()
         self.sticker_sets: Dict[str, Any] = {}
         try:
             fernet = Fernet(ENCRYPTION_KEY.encode())
@@ -423,33 +358,7 @@ class GroupCreatorBot:
         self.proxy_timeout = self.config.get("PROXY_TIMEOUT", Config.PROXY_TIMEOUT)
         self.daily_message_limit = self.config.get("DAILY_MESSAGE_LIMIT_PER_GROUP", Config.DAILY_MESSAGE_LIMIT_PER_GROUP)
         self.master_password_hash = self.config.get("MASTER_PASSWORD_HASH", os.getenv("MASTER_PASSWORD_HASH"))
-        self.openrouter_api_key = self.config.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
         self.health_check_interval = self.config.get("GROUP_HEALTH_CHECK_INTERVAL_SECONDS", Config.GROUP_HEALTH_CHECK_INTERVAL_SECONDS)
-        self.ai_request_timeout = self.config.get("AI_REQUEST_TIMEOUT", Config.AI_REQUEST_TIMEOUT)
-
-        # [FIX] Correctly load and parse the list of Gemini API keys
-        gemini_keys_str = self.config.get("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEYS"))
-        if gemini_keys_str:
-            self.gemini_api_keys = deque([key.strip() for key in gemini_keys_str.split(',') if key.strip()])
-        else:
-            self.gemini_api_keys = deque()
-        
-
-
-        self.gemini_model_hierarchy = self.config.get("GEMINI_MODEL_HIERARCHY", [
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-1.5-flash"
-        ])
-        
-        self.openrouter_model_hierarchy = self.config.get("OPENROUTER_MODEL_HIERARCHY", [
-            "moonshotai/kimi-k2:free",
-            "openrouter/auto"
-        ])
-
-        self.custom_prompt = self.config.get("CUSTOM_PROMPT", None)
 
     async def _initialize_sentry(self):
         """Initializes Sentry for error reporting, tracing, and logging."""
@@ -488,7 +397,7 @@ class GroupCreatorBot:
             "before_send": before_send_hook,
         }
         
-        sentry_proxy = await self.proxy_manager.get_proxy()
+        sentry_proxy = random.choice(self.proxies) if self.proxies else None
         if sentry_proxy:
             proxy_url = f"http://{sentry_proxy['addr']}:{sentry_proxy['port']}"
             sentry_options["http_proxy"] = proxy_url
@@ -587,12 +496,6 @@ class GroupCreatorBot:
         self.daily_counts["groups"][group_id_str] = count + 1
         self._save_json_file(self.daily_counts, self.daily_counts_file)
 
-    def _load_user_keywords(self) -> Dict[str, List[str]]:
-        return self._load_json_file(self.keywords_file, {})
-
-    def _save_user_keywords(self) -> None:
-        self._save_json_file(self.user_keywords, self.keywords_file)
-
     def _load_user_sticker_packs(self) -> Dict[str, List[str]]:
         return self._load_json_file(self.user_sticker_packs_file, {})
 
@@ -623,10 +526,10 @@ class GroupCreatorBot:
     def _save_created_groups(self) -> None:
         self._save_json_file(self.created_groups, self.created_groups_file)
 
-    def _load_user_worker_limits(self) -> Dict[str, int]: # [NEW]
+    def _load_user_worker_limits(self) -> Dict[str, int]:
         return self._load_json_file(self.user_worker_limits_file, {})
 
-    def _save_user_worker_limits(self) -> None: # [NEW]
+    def _save_user_worker_limits(self) -> None:
         self._save_json_file(self.user_worker_limits, self.user_worker_limits_file)
 
     def _get_group_count(self, worker_key: str) -> int:
@@ -658,10 +561,8 @@ class GroupCreatorBot:
             except Exception as e:
                 LOGGER.error(f"Error sending message to {user_id}: {e}")
 
-
-    # PASTE THE NEW FUNCTION HERE
     async def _set_user_limit_handler(self, event: events.NewMessage.Event, user_id: int, limit: int):
-        """[NEW] Sets the concurrent worker limit for a specific user."""
+        """Sets the concurrent worker limit for a specific user."""
         if event.sender_id != ADMIN_USER_ID:
             return
         
@@ -676,13 +577,13 @@ class GroupCreatorBot:
 
     async def _create_login_client(self, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         session = sessions.StringSession()
-        device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
+        device_params = random.choice(Config.USER_AGENTS)
 
         try:
             proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy (direct connection)"
             LOGGER.debug(f"Attempting login connection {proxy_info}")
             client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
-            client.parse_mode = CustomMarkdown() # Apply custom parser
+            client.parse_mode = CustomMarkdown()
             await client.connect()
             return client
         except Exception as e:
@@ -691,13 +592,13 @@ class GroupCreatorBot:
 
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         session = sessions.StringSession(session_string)
-        device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
+        device_params = random.choice(Config.USER_AGENTS)
 
         client = TelegramClient(
             session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout,
             device_model=device_params['device_model'], system_version=device_params['system_version']
         )
-        client.parse_mode = CustomMarkdown() # Apply custom parser
+        client.parse_mode = CustomMarkdown()
 
         try:
             proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy"
@@ -738,8 +639,7 @@ class GroupCreatorBot:
             [Button.text(Config.BTN_MANAGE_ACCOUNTS), Button.text(Config.BTN_JOIN_VIA_LINK)],
             [Button.text(Config.BTN_EXPORT_LINKS)],
             [Button.text(Config.BTN_FORCE_CONVERSATION), Button.text(Config.BTN_STOP_FORCE_CONVERSATION)],
-            [Button.text(Config.BTN_SET_KEYWORDS), Button.text(Config.BTN_SET_CONVERSATION_ACCOUNTS)],
-            [Button.text(Config.BTN_SET_STICKERS)],
+            [Button.text(Config.BTN_SET_STICKERS), Button.text(Config.BTN_SET_CONVERSATION_ACCOUNTS)],
             [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)],
             [Button.text(Config.BTN_SETTINGS)]
         ]
@@ -818,154 +718,15 @@ class GroupCreatorBot:
         documents = self.sticker_sets.get(pack_name_to_use)
         return random.choice(documents) if documents else None
 
-    async def _execute_gemini_request(self, api_key: str, model_name: str, prompt: str, proxy_info: Optional[Dict]) -> Optional[List[str]]:
-        """A unified function to execute an AI request against the Gemini API."""
-        proxy_url = f"http://{proxy_info['addr']}:{proxy_info['port']}" if proxy_info else None
-        
-        if not api_key: return None
-        
-        api_model_name = model_name.replace("-latest", "").replace("-preview-0617", "")
-        
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model_name}:generateContent?key={api_key}"
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        headers = {'Content-Type': 'application/json'}
-        
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=self.ai_request_timeout) as client: # [MODIFIED]
-            response = await client.post(api_url, json=payload, headers=headers)
-            response.raise_for_status()
-            res_json = response.json()
-            if res_json.get("candidates") and res_json["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text"):
-                message = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                LOGGER.info(f"Successfully generated message from Gemini model: {model_name}.")
-                return [message.strip()]
-        
-        return None
-
-    async def _generate_persian_messages(self, user_id: int, persona: str, previous_message: Optional[str] = None, ai_is_down: bool = False) -> List[str]:
-        """
-        Generates a message using a specific persona, optionally replying to a previous message.
-        If ai_is_down is True, it will immediately return a predefined message.
-        """
-        if ai_is_down:
-            LOGGER.info("AI is marked as down for this session, using predefined fallback.")
-            return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-
-        if not self.gemini_api_keys:
-            LOGGER.warning("No Gemini API keys are set. Using predefined fallback.")
-            return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-
-        keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
-        
-        if previous_message:
-            prompt = (
-                f"You are a person in a group chat. Your personality is: '{persona}'. "
-                f"Someone else just said: '{previous_message}'. "
-                f"Write a short, casual, and natural-sounding reply in Persian. "
-                f"Keep it to one or two sentences. Use slang and emojis if it fits your personality."
-            )
-        else:
-            prompt = (
-                f"You are a person starting a conversation in a group chat. Your personality is: '{persona}'. "
-                f"Start a conversation about one of these topics: {', '.join(keywords)}. "
-                f"Write a short, casual, and engaging opening message in Persian (one or two sentences). "
-                f"Use slang and emojis if it fits your personality."
-            )
-        
-        for model in self.gemini_model_hierarchy:
-            LOGGER.info(f"Attempting AI generation with model: {model}")
-            
-            # Loop through available API keys, giving each one a chance
-            for _ in range(len(self.gemini_api_keys)):
-                current_key = self.gemini_api_keys[0] # Get the current key at the front
-                try:
-                    proxy_info = await self.proxy_manager.get_proxy()
-                    result = await self._execute_gemini_request(current_key, model, prompt, proxy_info)
-                    if result:
-                        return result # Success!
-                except httpx.HTTPStatusError as e:
-                    # If rate limited or key is bad, rotate to the next key and try again
-                    if e.response.status_code in [429, 403]: 
-                        LOGGER.warning(f"Gemini API key ending in '...{current_key[-4:]}' failed with status {e.response.status_code}. Rotating to next key.")
-                        self.gemini_api_keys.rotate(-1) # Move the failed key to the end of the list
-                        await asyncio.sleep(1) # Small delay before retrying with the next key
-                    else:
-                        LOGGER.error(f"HTTP error for {model} with key '...{current_key[-4:]}': {e}", exc_info=True)
-                        break # Unrecoverable error for this model, try the next model
-                except Exception as e:
-                    LOGGER.error(f"Request failed for {model} with key '...{current_key[-4:]}': {e}", exc_info=True)
-                    break # Unrecoverable error for this model, try the next model
-            
-            LOGGER.warning(f"All API keys failed for model {model}. Trying next model in hierarchy.")
-
-        LOGGER.error("All AI models and all API keys in the hierarchy failed. Using a predefined fallback message.")
-        return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-
-        if not self.gemini_api_key:
-            LOGGER.warning("No Gemini API key is set. Using predefined fallback.")
-            return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-
-        keywords = self.user_keywords.get(str(user_id), ["موفقیت", "انگیزه", "رشد"])
-        
-        if previous_message:
-            prompt = (
-                f"You are a person in a group chat. Your personality is: '{persona}'. "
-                f"Someone else just said: '{previous_message}'. "
-                f"Write a short, casual, and natural-sounding reply in Persian. "
-                f"Keep it to one or two sentences. Use slang and emojis if it fits your personality."
-            )
-        else:
-            prompt = (
-                f"You are a person starting a conversation in a group chat. Your personality is: '{persona}'. "
-                f"Start a conversation about one of these topics: {', '.join(keywords)}. "
-                f"Write a short, casual, and engaging opening message in Persian (one or two sentences). "
-                f"Use slang and emojis if it fits your personality."
-            )
-        
-        async def make_request_with_backoff(request_func, model_name, prompt_text, max_retries=1, initial_delay=2): # [MODIFIED]
-            delay = initial_delay
-            for attempt in range(max_retries):
-                try:
-                    proxy_info = await self.proxy_manager.get_proxy()
-                    result = await request_func(model_name, prompt_text, proxy_info)
-                    if result:
-                        return result
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 429:
-                        LOGGER.warning(f"Rate limit hit for {model_name} on attempt {attempt + 1}. Retrying in {delay} seconds with a new proxy.")
-                        await asyncio.sleep(delay)
-                        delay *= 2
-                    else:
-                        LOGGER.error(f"HTTP error for {model_name}: {e}", exc_info=True)
-                        return None
-                except Exception as e:
-                    LOGGER.error(f"Request failed for {model_name}: {e}", exc_info=True)
-                    return None
-            LOGGER.error(f"AI request for {model_name} failed after {max_retries} retries.")
-            return None
-
-        # Iterate through the model hierarchy
-        for model in self.gemini_model_hierarchy:
-            LOGGER.info(f"Attempting AI generation with model: {model}")
-            result = await make_request_with_backoff(self._execute_gemini_request, model, prompt)
-            if result:
-                return result
-            LOGGER.warning(f"Model {model} failed. Trying next model in hierarchy.")
-
-        LOGGER.error("All AI models in the hierarchy failed. Using a predefined fallback message.")
-        return [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-
     async def _ensure_entity_cached(self, client: TelegramClient, group_id: int, account_name: str, retries: int = 5, delay: int = 1) -> bool:
-        """[FIXED] Ensures the client has cached the group entity and is a participant."""
+        """Ensures the client has cached the group entity and is a participant."""
         for attempt in range(retries):
             try:
-                # Check connection before making calls
                 if not client.is_connected():
                     await client.connect()
 
-                # Step 1: Resolve the entity. This is a high-level call.
                 group_entity = await client.get_entity(PeerChannel(group_id))
                 
-                # Step 2: Verify participation.
                 me = await client.get_me()
                 await client(GetParticipantRequest(channel=group_entity, participant=me))
                 
@@ -979,10 +740,9 @@ class GroupCreatorBot:
                     LOGGER.error(f"Account '{account_name}' failed to confirm participation in group {group_id} after {retries} retries.")
                     return False
             except ValueError as e:
-                # This can happen if the entity isn't in the dialogs list yet.
                 LOGGER.warning(f"Attempt {attempt + 1}/{retries}: Account '{account_name}' could not find entity for group {group_id}. Retrying in {delay}s. Error: {e}")
                 if attempt < retries - 1:
-                    await client.get_dialogs(limit=1) # Force update dialogs
+                    await client.get_dialogs(limit=1)
                     await asyncio.sleep(delay)
                 else:
                      LOGGER.error(f"Account '{account_name}' failed to cache entity for group {group_id} after {retries} retries.")
@@ -993,134 +753,39 @@ class GroupCreatorBot:
                 return False
         return False
 
-    async def _run_interactive_conversation(self, user_id: int, group_id: int, clients_with_meta: List[Dict], num_messages: int, owner_id: int, use_predefined_messages: bool = False):
-        if len(clients_with_meta) < 2:
-            LOGGER.warning(f"Not enough clients to simulate interactive conversation in group {group_id}.")
-            return
-
-        active_clients_meta = list(clients_with_meta)
-        ai_failed_for_this_group = False # [NEW] Flag to track AI failure per group
-        
-        # [FIX] Use random.choices to allow reusing personas if there are more participants than personas
-        personas = random.choices(Config.PERSONAS, k=len(active_clients_meta))
-        for i, meta in enumerate(active_clients_meta):
-            meta['persona'] = personas[i]
-            LOGGER.info(f"Assigned persona '{personas[i]}' to account '{meta['account_name']}' for conversation in group {group_id}.")
-
+    async def _send_initial_random_messages(self, client: TelegramClient, group_id: int):
+        """[NEW] Sends 10 predefined random messages to a newly created group."""
         try:
-            # 1. Kick-off message
-            if self._get_daily_count_for_group(group_id) >= self.daily_message_limit:
-                LOGGER.info(f"Daily message limit for group {group_id} reached. Skipping conversation.")
-                return
-
-            starter_info = random.choice(active_clients_meta)
-            starter_client = starter_info['client']
-            starter_name = starter_info['account_name']
-            starter_persona = starter_info['persona']
-
-            if use_predefined_messages:
-                initial_messages = [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-            else:
-                initial_messages = await self._generate_persian_messages(user_id, persona=starter_persona)
-                if not initial_messages or initial_messages[0] in Config.PREDEFINED_FALLBACK_MESSAGES:
-                    ai_failed_for_this_group = True
-                    LOGGER.warning(f"Initial AI generation failed for group {group_id}. Switching to predefined messages.")
-                    if not initial_messages: # Ensure we have a message if AI returned empty
-                        initial_messages = [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-
-            initial_message_text = self._prepare_spoiler_text(initial_messages[0])
-            
-            last_message = await starter_client.send_message(PeerChannel(group_id), initial_message_text)
-            self._increment_daily_count_for_group(group_id)
-            LOGGER.info(f"Account '{starter_name}' (Persona: {starter_persona}) started conversation in group {group_id}.")
-            
-            messages_sent_this_session = 1
-            await asyncio.sleep(random.uniform(Config.MESSAGE_SEND_DELAY_MIN, Config.MESSAGE_SEND_DELAY_MAX))
-
-            # 2. Main reply loop
-            while self._get_daily_count_for_group(group_id) < self.daily_message_limit and messages_sent_this_session < num_messages:
-                last_sender_id = last_message.sender_id
-
-                possible_repliers = [m for m in active_clients_meta if m.get('account_id') != last_sender_id]
-                if not possible_repliers:
-                    LOGGER.info("No other bot available to reply. Ending conversation.")
+            LOGGER.info(f"Sending 10 random messages to new group {group_id}.")
+            for i in range(10):
+                if self._get_daily_count_for_group(group_id) >= self.daily_message_limit:
+                    LOGGER.info(f"Daily message limit reached for group {group_id}. Stopping initial messages.")
                     break
-
-                replier_info = random.choice(possible_repliers)
-                replier_client = replier_info['client']
-                replier_name = replier_info['account_name']
-                replier_user_id = replier_info['user_id']
-                replier_persona = replier_info['persona']
-
-                # Decide whether to send a sticker or text
-                if random.random() < 0.15: # 15% chance to send a sticker
-                    sticker = await self._get_random_sticker(replier_client, replier_user_id)
-                    if sticker:
-                        last_message = await replier_client.send_file(PeerChannel(group_id), sticker, reply_to=last_message.id)
-                        self._increment_daily_count_for_group(group_id)
-                        messages_sent_this_session += 1
-                        LOGGER.info(f"Account '{replier_name}' sent a sticker in group {group_id}.")
-                        await asyncio.sleep(random.uniform(Config.MESSAGE_SEND_DELAY_MIN, Config.MESSAGE_SEND_DELAY_MAX))
-                        continue
                 
-                if use_predefined_messages:
-                    reply_messages = [random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)]
-                else:
-                    prompt_text = last_message.raw_text or "یک پاسخ جالب بده"
-                    reply_messages = await self._generate_persian_messages(user_id, persona=replier_persona, previous_message=prompt_text, ai_is_down=ai_failed_for_this_group)
-                
-                if not reply_messages:
-                    LOGGER.warning(f"Could not generate any reply for '{replier_name}'.")
-                    continue
-                
-                # If AI failed this time, set the flag for future messages in this group
-                if not use_predefined_messages and reply_messages[0] in Config.PREDEFINED_FALLBACK_MESSAGES:
-                    if not ai_failed_for_this_group:
-                        LOGGER.warning(f"AI generation failed mid-conversation for group {group_id}. Switching to predefined messages for the rest of this session.")
-                        ai_failed_for_this_group = True
-
-                reply_text = self._prepare_spoiler_text(reply_messages[0])
-                
-                last_message = await replier_client.send_message(PeerChannel(group_id), reply_text, reply_to=last_message.id)
+                message_text = random.choice(Config.RANDOM_MESSAGES)
+                await client.send_message(PeerChannel(group_id), message_text)
                 self._increment_daily_count_for_group(group_id)
-                messages_sent_this_session += 1
-                LOGGER.info(f"Account '{replier_name}' (Persona: {replier_persona}) replied in group {group_id}.")
+                LOGGER.info(f"Sent initial message {i + 1}/10 to group {group_id}.")
                 await asyncio.sleep(random.uniform(Config.MESSAGE_SEND_DELAY_MIN, Config.MESSAGE_SEND_DELAY_MAX))
 
             self.created_groups[str(group_id)]["last_simulated"] = datetime.utcnow().timestamp()
             self._save_created_groups()
-            LOGGER.info(f"Updated 'last_simulated' timestamp for group {group_id}.")
-
+            LOGGER.info(f"Finished sending initial messages and updated 'last_simulated' for group {group_id}.")
         except (ValueError, errors.rpcerrorlist.ChannelInvalidError) as e:
-            LOGGER.error(f"Conversation failed in group {group_id} due to an entity/channel error: {e}")
-        except asyncio.CancelledError:
-            LOGGER.info(f"Interactive conversation for group {group_id} was cancelled.")
-            raise
+            LOGGER.error(f"Sending initial messages failed in group {group_id} due to channel error: {e}")
         except Exception as e:
-            LOGGER.error(f"Unexpected error during interactive conversation for group {group_id}: {e}", exc_info=True)
-        finally:
-            # [MODIFIED] All participants except the owner leave the group
-            LOGGER.info(f"Conversation in group {group_id} finished. Participants are now leaving.")
-            for meta in active_clients_meta:
-                if meta['account_id'] != owner_id:
-                    try:
-                        await meta['client'](LeaveChannelRequest(PeerChannel(group_id)))
-                        LOGGER.info(f"Account '{meta['account_name']}' left group {group_id}.")
-                    except Exception as e:
-                        LOGGER.error(f"Error making account '{meta['account_name']}' leave group {group_id}: {e}")
-
+            LOGGER.error(f"Unexpected error during initial message sending for group {group_id}: {e}", exc_info=True)
+            sentry_sdk.capture_exception(e)
 
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
         worker_key = f"{user_id}:{account_name}"
-        temp_clients = []
         progress_message = None
         try:
             async with self.worker_semaphore:
                 LOGGER.info(f"Worker for {worker_key} started.")
                 
-                # [NEW] Calculate and send initial time estimate
                 avg_sleep_per_group = (self.min_sleep_seconds + self.max_sleep_seconds) / 2
-                buffer_for_api_calls = 20  # Estimated seconds for API calls, invites, and conversation per group
+                buffer_for_api_calls = 20
                 total_estimated_seconds = (avg_sleep_per_group + buffer_for_api_calls) * self.groups_to_create
                 eta_str = self._format_time_delta(total_estimated_seconds)
                 
@@ -1132,27 +797,7 @@ class GroupCreatorBot:
                 
                 start_time = datetime.now()
                 me = await user_client.get_me()
-
-                me = await user_client.get_me()
-                owner_id = me.id # [NEW] Store the owner's ID
-                u_account_name = me.first_name or me.username or f"ID:{owner_id}"
-
-                participant_clients_meta = []
-                participant_names = self.conversation_accounts.get(str(user_id), [])
-                other_participant_names = [name for name in participant_names if name != account_name]
-
-                for name in other_participant_names:
-                    session_str = self.session_manager.load_session_string(user_id, name)
-                    if not session_str: continue
-                    proxy = self.account_proxies.get(f"{user_id}:{name}")
-                    client = await self._create_worker_client(session_str, proxy)
-                    if client:
-                        temp_clients.append(client)
-                        p_me = await client.get_me()
-                        p_account_name = p_me.first_name or p_me.username or f"ID:{p_me.id}"
-                        participant_clients_meta.append({'client': client, 'user_id': user_id, 'account_id': p_me.id, 'account_name': p_account_name})
-
-                all_clients_meta = [{'client': user_client, 'user_id': user_id, 'account_id': owner_id, 'account_name': u_account_name}] + participant_clients_meta
+                owner_id = me.id
 
                 for i in range(self.groups_to_create):
                     try:
@@ -1164,7 +809,6 @@ class GroupCreatorBot:
                         new_supergroup = create_result.chats[0]
                         LOGGER.info(f"Successfully created supergroup '{new_supergroup.title}' (ID: {new_supergroup.id}).")
                         
-                        # [MODIFIED] Store owner ID and worker key
                         self.created_groups[str(new_supergroup.id)] = {
                             "owner_worker_key": worker_key, 
                             "owner_id": owner_id,
@@ -1172,48 +816,8 @@ class GroupCreatorBot:
                         }
                         self._save_created_groups()
 
-                        invite_link = None
-                        try:
-                            link_result = await user_client(ExportChatInviteRequest(new_supergroup.id))
-                            invite_link = link_result.link
-                            LOGGER.info(f"Successfully exported invite link for new group {new_supergroup.id}: {invite_link}")
-                        except Exception as e:
-                            LOGGER.error(f"Could not export invite link for new group {new_supergroup.id}: {e}")
-                            continue
-
-                        if invite_link:
-                            match = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', invite_link)
-                            if match:
-                                invite_hash = match.group(1)
-                                for p_meta in participant_clients_meta:
-                                    p_client = p_meta['client']
-                                    p_name = p_meta['account_name']
-                                    try:
-                                        await p_client(ImportChatInviteRequest(invite_hash))
-                                        LOGGER.info(f"Account '{p_name}' successfully joined group {new_supergroup.id} via link.")
-                                        await asyncio.sleep(random.uniform(45, 120)) # [MODIFIED] Longer delay to avoid flood waits
-                                    except Exception as e:
-                                        LOGGER.warning(f"Account '{p_name}' failed to join group {new_supergroup.id} via link: {e}")
-                            else:
-                                LOGGER.error(f"Could not extract hash from invite link: {invite_link}")
-                                continue
-
-                        successful_clients_meta = []
-                        ensure_tasks = [self._ensure_entity_cached(meta['client'], new_supergroup.id, meta['account_name']) for meta in all_clients_meta]
-                        results = await asyncio.gather(*ensure_tasks)
-
-                        for idx, meta in enumerate(all_clients_meta):
-                            if results[idx]:
-                                successful_clients_meta.append(meta)
-                            else:
-                                LOGGER.warning(f"Account '{meta['account_name']}' failed to cache group entity and will not participate.")
-                                if meta['client'] in temp_clients and meta['client'].is_connected():
-                                    await meta['client'].disconnect()
-
-                        if len(successful_clients_meta) < 2:
-                             LOGGER.warning(f"Not enough clients ({len(successful_clients_meta)}) could cache the group. Aborting conversation for group {new_supergroup.id}.")
-                        else:
-                            await self._run_interactive_conversation(user_id, new_supergroup.id, successful_clients_meta, num_messages=self.daily_message_limit, owner_id=owner_id)
+                        # [MODIFIED] Send 10 random messages instead of starting an AI conversation
+                        await self._send_initial_random_messages(user_client, new_supergroup.id)
 
                         self._set_group_count(worker_key, current_semester)
                         
@@ -1250,27 +854,25 @@ class GroupCreatorBot:
                             try:
                                 await progress_message.edit("❌ عملیات با خطا مواجه شد. لطفا گزارش ارسال شده را بررسی کنید.")
                             except Exception:
-                                pass # Ignore if we can't edit the message
+                                pass
                         break
-                else: # This block runs if the for loop completes without a break
+                else:
                     if progress_message: await progress_message.edit(f"✅ [{account_name}] Finished creating {self.groups_to_create} groups.")
 
         except asyncio.CancelledError:
             LOGGER.info(f"Task for {worker_key} was cancelled.")
             if progress_message: await progress_message.edit(f"⏹️ Operation for `{account_name}` stopped.")
         finally:
-            LOGGER.info(f"Worker for {worker_key} finished. Disconnecting clients.")
+            LOGGER.info(f"Worker for {worker_key} finished. Disconnecting client.")
             if worker_key in self.active_workers:
                 del self.active_workers[worker_key]
                 self.active_workers_state.pop(worker_key, None)
                 self._save_active_workers_state()
-            for client in temp_clients:
-                if client.is_connected():
-                    await client.disconnect()
             if user_client and user_client.is_connected():
                 await user_client.disconnect()
 
     async def _run_conversation_task(self, user_id: int, group_id: int, num_messages: Optional[int] = None):
+        """ This task is used for manual conversation triggers, not group creation. It will use random messages. """
         clients_with_meta = []
         clients_to_disconnect = []
         try:
@@ -1281,30 +883,31 @@ class GroupCreatorBot:
             owner_id = group_data["owner_id"]
 
             participant_names = self.conversation_accounts.get(str(user_id), [])
-            if len(participant_names) < 2:
+            if len(participant_names) < 1: # Only need at least one to send messages
                 LOGGER.warning(f"[Conversation Task] Not enough accounts for user {user_id} to simulate.")
                 return
 
-            for acc_name in participant_names:
-                session_str = self.session_manager.load_session_string(user_id, acc_name)
-                if not session_str: continue
-                proxy = self.account_proxies.get(f"{user_id}:{acc_name}")
-                client = await self._create_worker_client(session_str, proxy)
-                if client:
-                    clients_to_disconnect.append(client)
-                    me = await client.get_me()
-                    p_account_name = me.first_name or me.username or f"ID:{me.id}"
-                    clients_with_meta.append({'client': client, 'user_id': user_id, 'account_id': me.id, 'account_name': p_account_name})
-
-            ensure_tasks = [self._ensure_entity_cached(meta['client'], group_id, meta['account_name']) for meta in clients_with_meta]
-            results = await asyncio.gather(*ensure_tasks)
+            # Connect with the first available participant
+            first_participant_name = participant_names[0]
+            session_str = self.session_manager.load_session_string(user_id, first_participant_name)
+            if not session_str: return
             
-            successful_clients_meta = [meta for i, meta in enumerate(clients_with_meta) if results[i]]
-
-            if len(successful_clients_meta) >= 2:
-                await self._run_interactive_conversation(user_id, group_id, successful_clients_meta, num_messages=num_messages, owner_id=owner_id)
-            else:
-                LOGGER.warning(f"[Conversation Task] Not enough clients could connect and cache the entity for group {group_id}.")
+            proxy = self.account_proxies.get(f"{user_id}:{first_participant_name}")
+            client = await self._create_worker_client(session_str, proxy)
+            if not client: return
+            clients_to_disconnect.append(client)
+            
+            # Send N random messages
+            messages_to_send = num_messages or self.daily_message_limit
+            LOGGER.info(f"Manually sending {messages_to_send} random messages to group {group_id}.")
+            for _ in range(messages_to_send):
+                if self._get_daily_count_for_group(group_id) >= self.daily_message_limit:
+                    LOGGER.info(f"Daily limit reached for group {group_id} during manual conversation.")
+                    break
+                message = random.choice(Config.RANDOM_MESSAGES)
+                await client.send_message(PeerChannel(group_id), message)
+                self._increment_daily_count_for_group(group_id)
+                await asyncio.sleep(random.uniform(Config.MESSAGE_SEND_DELAY_MIN, Config.MESSAGE_SEND_DELAY_MAX))
 
         except asyncio.CancelledError:
             LOGGER.info(f"[Conversation Task] for group {group_id} was cancelled.")
@@ -1407,11 +1010,6 @@ class GroupCreatorBot:
         await event.reply(Config.MSG_HELP_TEXT, buttons=self._build_main_menu())
         raise events.StopPropagation
 
-    async def _set_keywords_handler(self, event: events.NewMessage.Event) -> None:
-        user_id = event.sender_id
-        self.user_sessions[user_id]['state'] = 'awaiting_keywords'
-        await event.reply(Config.MSG_PROMPT_KEYWORDS, buttons=[[Button.text(Config.BTN_BACK)]])
-
     async def _set_stickers_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         self.user_sessions[user_id]['state'] = 'awaiting_sticker_packs'
@@ -1491,9 +1089,8 @@ class GroupCreatorBot:
             return
         
         buttons = [
-            [Button.text(Config.BTN_MANUAL_HEALTH_CHECK)], # [NEW]
-            [Button.text(Config.BTN_MESSAGE_ALL_GROUPS)], # ADD THIS LINE
-            [Button.text("Set AI Model Hierarchy")],
+            [Button.text(Config.BTN_MANUAL_HEALTH_CHECK)],
+            [Button.text(Config.BTN_MESSAGE_ALL_GROUPS)],
             [Button.text("Set Worker Limit"), Button.text("Set Group Count")],
             [Button.text("Set Sleep Times"), Button.text("Set Daily Msg Limit")],
             [Button.text("Set Proxy Timeout"), Button.text("Set Master Password")],
@@ -1516,9 +1113,9 @@ class GroupCreatorBot:
         set_config_match = re.match(r"/set_config (\w+) (.*)", text, re.DOTALL)
         terminate_match = re.match(r"/terminate_worker (.*)", text)
         restart_match = re.match(r"/restart_worker (.*)", text)
-        set_user_limit_match = re.match(r"/set_user_limit (\d+) (\d+)", text) # [NEW]
-        broadcast_match = re.match(r"/broadcast (.+)", text, re.DOTALL) # [NEW]
-        send_random_links_match = re.match(r"/send_random_links (\d+)", text) # [NEW]
+        set_user_limit_match = re.match(r"/set_user_limit (\d+) (\d+)", text)
+        broadcast_match = re.match(r"/broadcast (.+)", text, re.DOTALL)
+        send_random_links_match = re.match(r"/send_random_links (\d+)", text)
 
         if pre_approve_match:
             await self._pre_approve_handler(event, int(pre_approve_match.group(1)))
@@ -1556,12 +1153,8 @@ class GroupCreatorBot:
             await self._clean_sessions_handler(event)
         elif text == "/test_sentry":
             await self._test_sentry_handler(event)
-        elif text == "/force_refine":
-            await self._force_refine_handler(event)
         elif text == "/test_self_healing":
             await self._test_self_healing_handler(event)
-        elif text == "/test_ai_generation":
-            await self._test_ai_generation_handler(event)
         elif text == "/dm_chat":
             await self._start_dm_chat_handler(event)
         elif text == "/stop_dm_chat":
@@ -1615,22 +1208,17 @@ class GroupCreatorBot:
     async def _set_config_handler(self, event: events.NewMessage.Event, key: str, value: str):
         key = key.upper()
         
-        # Handle list input for AI_MODEL_HIERARCHY
-        if key == "AI_MODEL_HIERARCHY":
-            value = [model.strip() for model in value.split(',')]
-        else:
-            # Try to convert to number if possible for other keys
-            try:
-                if '.' in value:
-                    value = float(value)
-                else:
-                    value = int(value)
-            except ValueError:
-                pass # Keep as string
+        try:
+            if '.' in value:
+                value = float(value)
+            else:
+                value = int(value)
+        except ValueError:
+            pass
         
         self.config[key] = value
         self._save_json_file(self.config, self.config_file)
-        self.update_config_from_file() # Reload config into memory
+        self.update_config_from_file()
         
         if key == "MAX_CONCURRENT_WORKERS":
             self.worker_semaphore = asyncio.Semaphore(self.max_workers)
@@ -1650,7 +1238,7 @@ class GroupCreatorBot:
             try:
                 await task
             except asyncio.CancelledError:
-                pass # Expected
+                pass
             await event.reply(f"✅ Worker `{worker_key}` has been terminated.")
         else:
             await event.reply(f"❌ No active worker found with key `{worker_key}`.")
@@ -1659,7 +1247,7 @@ class GroupCreatorBot:
         if worker_key in self.active_workers:
             await event.reply(f"🔄 Restarting worker `{worker_key}`...")
             await self._terminate_worker_handler(event, worker_key)
-            await asyncio.sleep(2) # Give it a moment to fully stop
+            await asyncio.sleep(2)
             
             try:
                 user_id_str, account_name = worker_key.split(":", 1)
@@ -1705,8 +1293,8 @@ class GroupCreatorBot:
                 await event.reply("Failed to send the list as a file due to an error.")
         else:
             await event.reply(message)
+
     async def _send_random_links_handler(self, event: events.NewMessage.Event, num_links: int):
-        """[MODIFIED] Sends a specified number of random group links to the admin."""
         if event.sender_id != ADMIN_USER_ID:
             return
 
@@ -1714,20 +1302,15 @@ class GroupCreatorBot:
             await event.reply("❌ No users available to source links from.")
             return
 
-        # 1. Select a random user to source the links from
         source_user_id = random.choice(self.known_users)
-
-        # 2. Get all accounts for that user
         user_accounts = self.session_manager.get_user_accounts(source_user_id)
         if not user_accounts:
             await event.reply(f"❌ Randomly selected user `{source_user_id}` has no accounts. Please try the command again.")
             return
 
-        # 3. Select a random account from that user
         source_account_name = random.choice(user_accounts)
         owner_key = f"{source_user_id}:{source_account_name}"
 
-        # 4. Find all groups created by that account
         owned_group_ids = [
             int(gid) for gid, data in self.created_groups.items()
             if data.get("owner_worker_key") == owner_key
@@ -1741,12 +1324,9 @@ class GroupCreatorBot:
             await event.reply(f"⚠️ Account `{owner_key}` only has {len(owned_group_ids)} groups, but you requested {num_links}. Sending all available links.")
             num_links = len(owned_group_ids)
 
-        # 5. Randomly select groups
         selected_group_ids = random.sample(owned_group_ids, num_links)
-
         await event.reply(f"⏳ Preparing to send you {num_links} random links from account `{owner_key}`...")
 
-        # 6. Generate invite links
         links = []
         client = None
         try:
@@ -1766,7 +1346,7 @@ class GroupCreatorBot:
                 except Exception as e:
                     LOGGER.warning(f"Could not export link for group {group_id} for random send: {e}")
                     links.append(f"Error exporting link for group ID {group_id}")
-                await asyncio.sleep(1) # Rate limiting
+                await asyncio.sleep(1)
 
         except Exception as e:
             await self._send_error_explanation(ADMIN_USER_ID, e)
@@ -1776,7 +1356,6 @@ class GroupCreatorBot:
             if client and client.is_connected():
                 await client.disconnect()
 
-        # 7. Send the links to the ADMIN
         if links:
             message_to_admin = f"🔗 Here are {len(links)} random links from account `{owner_key}`:\n\n" + "\n".join(links)
             try:
@@ -1786,8 +1365,8 @@ class GroupCreatorBot:
                 await event.reply(f"❌ Successfully generated links, but failed to send them to you. Reason: {e}")
         else:
             await event.reply(f"❌ Could not generate any valid links for the selected groups from account `{owner_key}`.")
+
     async def _export_all_links_handler(self, event: events.NewMessage.Event):
-        """[NEW] Exports all invite links for all groups created by all users."""
         if event.sender_id != ADMIN_USER_ID:
             return
 
@@ -1829,7 +1408,7 @@ class GroupCreatorBot:
                     except Exception as e:
                         LOGGER.warning(f"Could not export link for group {group_id} with account {owner_key}: {e}")
                         all_links.append(f"Error for group ID {group_id}: {e.__class__.__name__}")
-                    await asyncio.sleep(1) # Small delay to avoid flood waits
+                    await asyncio.sleep(1)
 
             except Exception as e:
                 LOGGER.error(f"Failed to process owner {owner_key} for link export: {e}")
@@ -1872,7 +1451,7 @@ class GroupCreatorBot:
             proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             client = None
             try:
-                device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
+                device_params = random.choice(Config.USER_AGENTS)
                 LOGGER.debug(f"Testing proxy: {proxy['addr']} with device: {device_params}")
                 client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
                 await client.connect()
@@ -1886,7 +1465,7 @@ class GroupCreatorBot:
         LOGGER.debug("--- DIRECT CONNECTION TEST ---")
         client = None
         try:
-            device_params = random.choice(Config.USER_AGENTS) # [MODIFIED]
+            device_params = random.choice(Config.USER_AGENTS)
             LOGGER.debug(f"Testing direct connection with device: {device_params}")
             client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, timeout=self.proxy_timeout, **device_params)
             await client.connect()
@@ -1940,16 +1519,14 @@ class GroupCreatorBot:
         self.group_counts.clear()
         self.account_proxies.clear()
         self.known_users.clear()
-        self.user_keywords.clear()
         self.pending_users.clear()
         self.created_groups.clear()
         self.conversation_accounts.clear()
-        self.user_worker_limits.clear() # [NEW]
-        self._save_user_keywords()
+        self.user_worker_limits.clear()
         self._save_pending_users()
         self._save_created_groups()
         self._save_conversation_accounts()
-        self._save_user_worker_limits() # [NEW]
+        self._save_user_worker_limits()
         report.append(f"🗑️ **Deleted Data Files:** {deleted_files_count} files\n")
         LOGGER.info(f"Deleted {deleted_files_count} data files from {SESSIONS_DIR}.")
         folders_to_clean = ["selenium_sessions", "api_sessions", "telethon_sessions"]
@@ -1999,7 +1576,6 @@ class GroupCreatorBot:
             if text.startswith('/'):
                 if user_id == ADMIN_USER_ID:
                     await self._admin_command_handler(event)
-                # Allow non-admins to use /start
                 elif text == '/start':
                     await self._start_handler(event)
                 else:
@@ -2016,9 +1592,7 @@ class GroupCreatorBot:
             session = self.user_sessions.get(user_id, {})
             state = session.get('state')
 
-            # --- State Handling ---
             state_handlers = {
-                'awaiting_keywords': self._handle_keywords_input,
                 'awaiting_sticker_packs': self._handle_sticker_packs_input,
                 'awaiting_conv_accounts': self._handle_conv_accounts_input,
                 'awaiting_join_account_selection': self._handle_join_account_selection,
@@ -2060,7 +1634,6 @@ class GroupCreatorBot:
                 await self._start_handler(event)
                 return
 
-            # --- Authenticated Text/Button Handling ---
             button_handlers = {
                 Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
                 Config.BTN_HELP: self._help_handler,
@@ -2069,29 +1642,25 @@ class GroupCreatorBot:
                 Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
                 Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
                 Config.BTN_SERVER_STATUS: self._server_status_handler,
-                Config.BTN_SET_KEYWORDS: self._set_keywords_handler,
                 Config.BTN_SET_STICKERS: self._set_stickers_handler,
                 Config.BTN_SET_CONVERSATION_ACCOUNTS: self._set_conv_accs_handler,
                 Config.BTN_JOIN_VIA_LINK: self._join_via_link_handler,
                 Config.BTN_EXPORT_LINKS: self._export_links_handler,
                 Config.BTN_FORCE_CONVERSATION: self._force_conversation_handler,
                 Config.BTN_STOP_FORCE_CONVERSATION: self._stop_force_conversation_handler,
-                Config.BTN_MANUAL_HEALTH_CHECK: self._manual_health_check_handler, # [NEW]
-                Config.BTN_MESSAGE_ALL_GROUPS: self._message_all_groups_handler, # ADD THIS LINE
-
+                Config.BTN_MANUAL_HEALTH_CHECK: self._manual_health_check_handler,
+                Config.BTN_MESSAGE_ALL_GROUPS: self._message_all_groups_handler,
             }
             
-            # Admin settings buttons
             if user_id == ADMIN_USER_ID:
                 admin_settings_map = {
-                    "Set AI Model Hierarchy": "AI_MODEL_HIERARCHY",
                     "Set Worker Limit": "MAX_CONCURRENT_WORKERS",
                     "Set Group Count": "GROUPS_TO_CREATE", 
                     "Set Sleep Times": "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS",
                     "Set Daily Msg Limit": "DAILY_MESSAGE_LIMIT_PER_GROUP", 
                     "Set Proxy Timeout": "PROXY_TIMEOUT",
                     "Set Master Password": "MASTER_PASSWORD_HASH",
-                    "View Config": "VIEW_CONFIG" # Special case
+                    "View Config": "VIEW_CONFIG"
                 }
                 if text in admin_settings_map:
                     await self._handle_admin_setting_button(event, admin_settings_map[text])
@@ -2118,10 +1687,8 @@ class GroupCreatorBot:
                 return
         
         except events.StopPropagation:
-            # [FIX] This is not a real error. Re-raise it so Telethon can handle it.
             raise
         except Exception as e:
-            # Global error handler for the message router
             LOGGER.error(f"An error occurred for user {user_id}", exc_info=True)
             await self._send_error_explanation(user_id, e)
 
@@ -2149,7 +1716,7 @@ class GroupCreatorBot:
                 self.active_workers_state[worker_key] = {"user_id": user_id, "account_name": account_name}
                 self._save_active_workers_state()
                 LOGGER.info(f"Successfully started worker task for {worker_key}.")
-                return user_client # Return client so the caller knows not to disconnect it
+                return user_client
             else:
                 LOGGER.warning(f"Session for '{account_name}' has expired. Deleting.")
                 self.session_manager.delete_session_file(user_id, account_name)
@@ -2179,7 +1746,6 @@ class GroupCreatorBot:
             await event.reply(Config.MSG_MAINTENANCE_ACTIVE)
             return
 
-        # [NEW] Check user-specific worker limit
         user_limit = self.user_worker_limits.get(str(user_id), self.max_workers)
         current_user_workers = sum(1 for key in self.active_workers if key.startswith(f"{user_id}:"))
         
@@ -2258,19 +1824,6 @@ class GroupCreatorBot:
             await event.reply(Config.MSG_INCORRECT_MASTER_PASSWORD)
         raise events.StopPropagation
 
-    async def _handle_keywords_input(self, event: events.NewMessage.Event) -> None:
-        user_id = str(event.sender_id)
-        keywords_text = event.message.text.strip()
-        if keywords_text:
-            keywords = [kw.strip() for kw in keywords_text.split(',')]
-            self.user_keywords[user_id] = keywords
-            self._save_user_keywords()
-            await event.reply(Config.MSG_KEYWORDS_SET, buttons=self._build_main_menu())
-        else:
-            await event.reply("❌ ورودی نامعتبر است. لطفاً حداقل یک کلمه کلیدی وارد کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
-        self.user_sessions[event.sender_id]['state'] = 'authenticated'
-        raise events.StopPropagation
-
     async def _handle_sticker_packs_input(self, event: events.NewMessage.Event) -> None:
         user_id = str(event.sender_id)
         packs_text = event.message.text.strip()
@@ -2280,7 +1833,6 @@ class GroupCreatorBot:
             self._save_user_sticker_packs()
             await event.reply(Config.MSG_STICKERS_SET, buttons=self._build_main_menu())
         else:
-            # Allow clearing the list
             self.user_sticker_packs[user_id] = []
             self._save_user_sticker_packs()
             await event.reply("✅ لیست استیکرهای شما پاک شد.", buttons=self._build_main_menu())
@@ -2328,7 +1880,6 @@ class GroupCreatorBot:
     async def _handle_join_link_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         text = event.message.text.strip()
-        # Split by newlines or commas and filter out empty strings
         links = [link.strip() for link in re.split(r'[\n,]+', text) if link.strip()]
 
         if not links:
@@ -2377,7 +1928,6 @@ class GroupCreatorBot:
                     fail_details_list.append(f"- `{link}` ({e.__class__.__name__})")
                     LOGGER.warning(f"Account '{account_name}' failed to join {link}: {e}")
 
-                # Add a delay to avoid getting limited by Telegram
                 if i < len(links) - 1:
                     await asyncio.sleep(random.uniform(5, 15))
 
@@ -2398,10 +1948,6 @@ class GroupCreatorBot:
             self.user_sessions[user_id]['state'] = 'authenticated'
 
     async def _process_export_link_request(self, event: events.NewMessage.Event) -> None:
-        """
-        Handles the logic for exporting group invite links for a selected account.
-        This method was renamed from _handle_export_account_selection for clarity.
-        """
         user_id = event.sender_id
         account_name = event.message.text.strip()
 
@@ -2432,14 +1978,11 @@ class GroupCreatorBot:
                 await event.reply(f"❌ اتصال به حساب `{account_name}` ناموفق بود.", buttons=self._build_main_menu())
                 return
 
-            # Ensure dialogs are updated to cache group entities
-            await client.get_dialogs(limit=100)  # Fetch dialogs to populate entity cache
+            await client.get_dialogs(limit=100)
 
             for group_id in owned_group_ids:
                 try:
-                    # Resolve the group entity
                     group_entity = await client.get_entity(PeerChannel(group_id))
-                    # Export the invite link using the resolved entity
                     result = await client(ExportChatInviteRequest(group_entity))
                     links.append(result.link)
                     LOGGER.info(f"Successfully exported link for group {group_id}: {result.link}")
@@ -2456,7 +1999,7 @@ class GroupCreatorBot:
                     f.write("\n".join(links))
 
                 await self.bot.send_file(user_id, file_path, caption=Config.MSG_EXPORT_SUCCESS)
-                os.remove(file_path)  # Clean up the file after sending
+                os.remove(file_path)
             else:
                 await event.reply(Config.MSG_EXPORT_FAIL.format(account_name=account_name))
 
@@ -2521,7 +2064,6 @@ class GroupCreatorBot:
             except asyncio.CancelledError:
                 LOGGER.info(f"Force conversation task for {worker_key} was cancelled.")
             finally:
-                # Clean up the task from the dictionary once it's done or cancelled
                 if worker_key in self.active_conversations:
                     del self.active_conversations[worker_key]
                     LOGGER.info(f"Force conversation task for {worker_key} finished and cleaned up.")
@@ -2631,17 +2173,13 @@ class GroupCreatorBot:
         await self.on_login_success(event, user_client)
 
     async def _handle_admin_setting_button(self, event: events.NewMessage.Event, config_key: str):
-        """Handles clicks on the admin settings buttons."""
         user_id = event.sender_id
 
         if config_key == "VIEW_CONFIG":
             await self._view_config_handler(event)
             return
         
-        if config_key == "AI_MODEL_HIERARCHY":
-            current_hierarchy = ", ".join(self.gemini_model_hierarchy)
-            prompt_message = f"Please enter the new AI model hierarchy, separated by commas.\n**Current:**\n`{current_hierarchy}`"
-        elif config_key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
+        if config_key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
              prompt_message = f"Please enter the new min and max sleep times, separated by a comma (e.g., `300,900`).\nCurrent: `{self.min_sleep_seconds},{self.max_sleep_seconds}`"
         elif config_key == "MASTER_PASSWORD_HASH":
              prompt_message = f"Please enter the new **plain text** master password. It will be hashed automatically before saving."
@@ -2654,7 +2192,6 @@ class GroupCreatorBot:
         await event.reply(prompt_message, buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_config_value_input(self, event: events.NewMessage.Event):
-        """Processes the value entered by the admin for a config setting."""
         user_id = event.sender_id
         session = self.user_sessions.get(user_id, {})
         key = session.get('config_key_to_set')
@@ -2665,11 +2202,7 @@ class GroupCreatorBot:
             session['state'] = 'authenticated'
             return
 
-        if key == "AI_MODEL_HIERARCHY":
-            value = [model.strip() for model in value_str.split(',')]
-            self.config[key] = value
-            await event.reply(f"✅ AI Model Hierarchy has been updated.")
-        elif key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
+        if key == "MIN_SLEEP_SECONDS,MAX_SLEEP_SECONDS":
             try:
                 min_val, max_val = map(int, value_str.split(','))
                 self.config["MIN_SLEEP_SECONDS"] = min_val
@@ -2683,14 +2216,13 @@ class GroupCreatorBot:
             self.config[key] = hashed_value
             await event.reply(f"✅ `{key}` has been updated.")
         else:
-            # Try to convert to number if possible
             try:
                 if '.' in value_str:
                     value = float(value_str)
                 else:
                     value = int(value_str)
             except ValueError:
-                value = value_str # Keep as string
+                value = value_str
             
             self.config[key] = value
             await event.reply(f"✅ Config key `{key}` has been set to `{value}`.")
@@ -2704,9 +2236,7 @@ class GroupCreatorBot:
         session.pop('config_key_to_set', None)
         await self._settings_handler(event)
 
-    # --- [FIXED] DM Chat Handlers ---
     async def _start_dm_chat_handler(self, event: events.NewMessage.Event):
-        """Starts the process of setting up a DM chat simulation."""
         user_id = event.sender_id
         if user_id != ADMIN_USER_ID:
             return
@@ -2714,20 +2244,17 @@ class GroupCreatorBot:
         await event.reply("👤 Please enter the **User ID** or **username** of the target you want to start a DM chat with.", buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_dm_target_id(self, event: events.NewMessage.Event):
-        """Handles receiving the target user ID for the DM chat."""
         user_id = event.sender_id
         target_id = event.text.strip()
         
-        # Simple validation: if it's a number, it's a user ID. Otherwise, it's a username.
         try:
             target_entity = int(target_id)
         except ValueError:
-            target_entity = target_id.lstrip('@') # Allow with or without @
+            target_entity = target_id.lstrip('@')
 
         self.user_sessions[user_id]['dm_target'] = target_entity
         self.user_sessions[user_id]['state'] = 'awaiting_dm_account_selection'
         
-        # [MODIFIED] Allow admin to use any account from any user
         all_accounts = self.session_manager.get_all_accounts()
         if not all_accounts:
             await event.reply("❌ No accounts from any user are connected to the bot.")
@@ -2739,7 +2266,6 @@ class GroupCreatorBot:
         await event.reply("🤖 Please select the account that will initiate the DM chat (format is `UserID:AccountName`).", buttons=buttons)
 
     async def _handle_dm_account_selection(self, event: events.NewMessage.Event):
-        """Handles selecting the account to use for the DM."""
         user_id = event.sender_id
         full_account_key = event.text.strip()
         all_accounts = self.session_manager.get_all_accounts()
@@ -2763,12 +2289,10 @@ class GroupCreatorBot:
         await event.reply("✍️ Please provide the initial message to send to the target user.", buttons=[[Button.text(Config.BTN_BACK)]])
 
     async def _handle_dm_initial_prompt(self, event: events.NewMessage.Event):
-        """Handles the initial message and starts the DM task."""
         user_id = event.sender_id
         initial_message = event.text.strip()
         session_data = self.user_sessions.get(user_id, {})
         
-        # [MODIFIED] Use the stored dm_user_id and dm_account_name
         account_name = session_data.get('dm_account_name')
         dm_user_id = session_data.get('dm_user_id')
         target_entity = session_data.get('dm_target')
@@ -2799,167 +2323,33 @@ class GroupCreatorBot:
             if client and client.is_connected():
                 await client.disconnect()
             
-            # Clean up DM state
             session_data.pop('dm_target', None)
             session_data.pop('dm_account_name', None)
             session_data.pop('dm_user_id', None)
             session_data['state'] = 'authenticated'
 
-    # These are placeholders for the other DM states that were in the original router but not implemented
     async def _handle_dm_persona(self, event: events.NewMessage.Event):
-        await event.reply("This part of the DM feature is not yet implemented.")
+        await event.reply("This feature is not available.")
         self.user_sessions[event.sender_id]['state'] = 'authenticated'
 
     async def _handle_dm_sticker_packs(self, event: events.NewMessage.Event):
-        await event.reply("This part of the DM feature is not yet implemented.")
+        await event.reply("This feature is not available.")
         self.user_sessions[event.sender_id]['state'] = 'authenticated'
 
     async def _stop_dm_chat_handler(self, event: events.NewMessage.Event):
-        await event.reply("DM chat stopping functionality is not yet implemented.")
+        await event.reply("DM chat stopping functionality is not available.")
 
-    # --- [NEW] AI-assisted DM message handlers ---
     async def _start_dm_message_handler(self, event: events.NewMessage.Event):
-        """Starts the AI-assisted DM message workflow."""
-        user_id = event.sender_id
-        if user_id != ADMIN_USER_ID:
-            return
-        
-        self.user_sessions[user_id]['state'] = 'awaiting_dm_message_account_selection'
-        
-        all_accounts = self.session_manager.get_all_accounts()
-        if not all_accounts:
-            await event.reply("❌ No accounts are connected to the bot.")
-            self.user_sessions[user_id]['state'] = 'authenticated'
-            return
-
-        buttons = [[Button.text(full_account_key)] for full_account_key in all_accounts.keys()]
-        buttons.append([Button.text(Config.BTN_BACK)])
-        await event.reply("🤖 Please select the account to send the message from (format is `UserID:AccountName`).", buttons=buttons)
+        await event.reply("This feature is not available.")
 
     async def _handle_dm_message_account_selection(self, event: events.NewMessage.Event):
-        user_id = event.sender_id
-        full_account_key = event.text.strip()
-        all_accounts = self.session_manager.get_all_accounts()
-
-        if full_account_key not in all_accounts:
-            await event.reply("❌ Invalid account selected. Please use the buttons.")
-            return
-        
-        try:
-            dm_user_id_str, dm_account_name = full_account_key.split(":", 1)
-            dm_user_id = int(dm_user_id_str)
-        except ValueError:
-            await event.reply("❌ Invalid account format selected. Please try again.")
-            self.user_sessions[user_id]['state'] = 'authenticated'
-            await self._start_handler(event)
-            return
-
-        self.user_sessions[user_id]['dm_user_id'] = dm_user_id
-        self.user_sessions[user_id]['dm_account_name'] = dm_account_name
-        self.user_sessions[user_id]['state'] = 'awaiting_dm_message_target_user'
-        await event.reply("👤 Please enter the target username.", buttons=[[Button.text(Config.BTN_BACK)]])
+        await event.reply("This feature is not available.")
 
     async def _handle_dm_message_target_user(self, event: events.NewMessage.Event):
-        user_id = event.sender_id
-        target_user = event.text.strip()
-        self.user_sessions[user_id]['dm_target'] = target_user
-        self.user_sessions[user_id]['state'] = 'awaiting_dm_message_prompt'
-        await event.reply("✍️ Please provide the prompt for the AI.", buttons=[[Button.text(Config.BTN_BACK)]])
+        await event.reply("This feature is not available.")
 
     async def _handle_dm_message_prompt(self, event: events.NewMessage.Event):
-        user_id = event.sender_id
-        prompt = event.text.strip()
-        session_data = self.user_sessions.get(user_id, {})
-        
-        account_name = session_data.get('dm_account_name')
-        dm_user_id = session_data.get('dm_user_id')
-        target_user = session_data.get('dm_target')
-
-        if not all([account_name, dm_user_id, target_user, prompt]):
-            await event.reply("❌ An internal error occurred. Please start over.")
-            self.user_sessions[user_id]['state'] = 'authenticated'
-            return
-
-        await event.reply(f"⏳ Reading message history with {target_user}...")
-        LOGGER.info(f"Starting AI-assisted DM for account '{account_name}' to target '{target_user}' with prompt: '{prompt}'")
-        
-        client = None
-        try:
-            session_str = self.session_manager.load_session_string(dm_user_id, account_name)
-            proxy = self.account_proxies.get(f"{dm_user_id}:{account_name}")
-            client = await self._create_worker_client(session_str, proxy)
-            if not client:
-                LOGGER.error(f"Failed to create client for account '{account_name}'")
-                await event.reply("❌ Failed to connect with the selected account.")
-                return
-            LOGGER.info(f"Client created successfully for '{account_name}'.")
-
-            LOGGER.info(f"Fetching last 50 messages from '{target_user}'.")
-            history = await client.get_messages(target_user, limit=50)
-            if not history:
-                LOGGER.warning(f"No message history found with '{target_user}'.")
-                history_text = "(No previous messages found)"
-            else:
-                LOGGER.info(f"Found {len(history)} messages in history.")
-                history_text = "\n".join([f"{(msg.sender.username if msg.sender else 'Unknown')}: {msg.text}" for msg in reversed(history) if msg.text])
-                LOGGER.debug(f"Formatted history:\n{history_text}")
-            
-            ai_prompt = (
-                f"This is a conversation history with {target_user}:\n\n{history_text}\n\n"
-                f"Based on this conversation, what is it about? After summarizing, follow this instruction: {prompt}"
-            )
-            
-            # Using OpenRouter for this task
-            model_name = self.openrouter_model_hierarchy[0]
-            headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-            data = {"model": model_name, "messages": [{"role": "user", "content": ai_prompt}]}
-            api_url = "https://openrouter.ai/api/v1/chat/completions"
-
-            LOGGER.info(f"Sending prompt to OpenRouter model '{model_name}'.")
-            async with httpx.AsyncClient(timeout=120.0) as http_client:
-                response = await http_client.post(api_url, json=data, headers=headers)
-                response.raise_for_status()
-                res_json = response.json()
-                ai_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-            LOGGER.info(f"Received AI-generated message: '{ai_message}'")
-
-            LOGGER.info(f"Sending AI message from '{account_name}' to '{target_user}'.")
-            await client.send_message(target_user, ai_message)
-            await event.reply("✅ Message sent. Waiting for reply...")
-            LOGGER.info("Message sent. Now waiting for a reply.")
-            
-            # Wait for a reply
-            @client.on(events.NewMessage(from_users=target_user))
-            async def reply_handler(reply_event):
-                if not reply_event.is_private:
-                    return
-                
-                LOGGER.info(f"Received a reply from '{target_user}': '{reply_event.text}'")
-                reply_text = reply_event.text
-                
-                # Feed reply back to AI
-                follow_up_prompt = f"The user replied: {reply_text}. What should be the response?"
-                data["messages"].append({"role": "assistant", "content": ai_message})
-                data["messages"].append({"role": "user", "content": follow_up_prompt})
-
-                async with httpx.AsyncClient(timeout=120.0) as http_client:
-                    response = await http_client.post(api_url, json=data, headers=headers)
-                    response.raise_for_status()
-                    res_json = response.json()
-                    follow_up_message = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
-                LOGGER.info(f"Generated follow-up message: '{follow_up_message}'")
-                await client.send_message(target_user, follow_up_message)
-                LOGGER.info("Follow-up message sent.")
-                client.remove_event_handler(reply_handler)
-                LOGGER.info(f"Removed reply handler for target '{target_user}'.")
-
-        except Exception as e:
-            await self._send_error_explanation(user_id, e)
-        finally:
-            if client and client.is_connected():
-                await client.disconnect()
-            session_data['state'] = 'authenticated'
+        await event.reply("This feature is not available.")
 
     async def _approval_handler(self, event: events.CallbackQuery.Event):
         user_id = event.sender_id
@@ -2969,35 +2359,6 @@ class GroupCreatorBot:
             await event.answer("You are not authorized to perform this action.")
             return
 
-        # --- AI Patching Logic ---
-        if data == "patch_feature":
-            if hasattr(self, 'suggested_code') and self.suggested_code:
-                try:
-                    # Backup the current script before patching, with a timestamp
-                    backup_path = f"{__file__}.{datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
-                    shutil.copyfile(__file__, backup_path)
-                    LOGGER.info(f"Created backup of the script at {backup_path}")
-                    
-                    with open(__file__, "w", encoding='utf-8') as f:
-                        f.write(self.suggested_code)
-                    
-                    await event.edit("✅ Code patched successfully. Restarting bot...")
-                    self.suggested_code = None # Clear after use
-                    await self.bot.disconnect()
-                    os.execv(sys.executable, ['python'] + sys.argv)
-                except Exception as e:
-                    LOGGER.error(f"Failed to patch the code: {e}", exc_info=True)
-                    await event.edit(f"❌ Failed to patch the code: {e}")
-            else:
-                await event.edit("❌ No suggested code found to apply.")
-            return
-        
-        if data == "ignore_feature":
-            self.suggested_code = None # Clear the suggestion
-            await event.edit("👍 Suggestion ignored.")
-            return
-
-        # --- User Approval Logic ---
         if data.startswith("approve_") or data.startswith("deny_"):
             try:
                 action, user_id_str = data.split('_', 1)
@@ -3027,28 +2388,20 @@ class GroupCreatorBot:
                 else:
                     await event.edit(f"⚠️ User `{user_id_to_act_on}` was not found in the pending list.")
 
-    # --- [NEW & REFACTORED] Group Health Maintenance ---
     async def _group_maintenance_scheduler_task(self):
-        """Background task that periodically runs the group health check."""
         while True:
             await asyncio.sleep(self.health_check_interval)
             LOGGER.info("[Scheduler] Running periodic group health check...")
             await self.run_group_health_check(triggered_by="Scheduler")
 
     async def _manual_health_check_handler(self, event: events.NewMessage.Event):
-        """Handles the admin's manual request to run a health check."""
         if event.sender_id != ADMIN_USER_ID:
             return
         
         await event.reply(Config.MSG_HEALTH_CHECK_STARTED)
-        # Run the check in the background to not block the bot
         asyncio.create_task(self.run_group_health_check(triggered_by=f"Admin ({event.sender_id})"))
 
     async def run_group_health_check(self, triggered_by: str):
-        """
-        The core logic for the group health check. Can be called by the scheduler or manually.
-        It checks all groups for member count and message count, and takes action if needed.
-        """
         if self.health_check_lock.locked():
             LOGGER.warning(f"Health check triggered by {triggered_by} but another check is already in progress. Skipping.")
             return
@@ -3098,7 +2451,6 @@ class GroupCreatorBot:
                         if not (is_known or title_matches):
                             continue
 
-                        # --- Group Discovery & Healing Logic ---
                         if is_known and "owner_id" in self.created_groups[group_id_str]:
                             owner_id = self.created_groups[group_id_str]["owner_id"]
                         else:
@@ -3126,9 +2478,7 @@ class GroupCreatorBot:
                                 LOGGER.error(f"Error finding creator for group {group_id}: {e}")
                                 continue
 
-                        # --- Standard Health Check Logic ---
                         try:
-                            # 1. Member Cleanup Check
                             participants = await owner_client.get_participants(dialog.entity, limit=200)
                             if len(participants) > 1:
                                 LOGGER.info(f"[Health Check] Group {group_id} has {len(participants)} members. Cleaning up...")
@@ -3137,12 +2487,11 @@ class GroupCreatorBot:
                                         try:
                                             await owner_client.kick_participant(dialog.entity, p)
                                             LOGGER.info(f"Kicked member {p.id} from group {group_id}.")
-                                            await asyncio.sleep(1) # Rate limit
+                                            await asyncio.sleep(1)
                                         except Exception as e:
                                             LOGGER.error(f"Failed to kick {p.id} from {group_id}: {e}")
                                 cleaned_count += 1
 
-                            # 2. Message Top-Up Check
                             messages = await owner_client.get_messages(dialog.entity, limit=1)
                             total_messages = messages.total if messages else 0
                             
@@ -3153,39 +2502,12 @@ class GroupCreatorBot:
                                 messages_to_send = min(20 - total_messages, remaining_daily)
                                 LOGGER.info(f"[Health Check] Group {group_id} has {total_messages} messages. Topping up with {messages_to_send} more.")
                                 
-                                conv_clients_meta = []
-                                temp_clients = []
-                                try:
-                                    participant_names = self.conversation_accounts.get(str(user_id), [])
-                                    if len(participant_names) < 2:
-                                        LOGGER.warning(f"Not enough conv accounts for user {user_id} to top up group {group_id}.")
-                                        continue
-
-                                    invite_link_res = await owner_client(ExportChatInviteRequest(dialog.entity))
-                                    invite_hash = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', invite_link_res.link).group(1)
-
-                                    for p_name in participant_names:
-                                        if p_name == account_name: continue
-                                        p_session = self.session_manager.load_session_string(user_id, p_name)
-                                        p_proxy = self.account_proxies.get(f"{user_id}:{p_name}")
-                                        p_client = await self._create_worker_client(p_session, p_proxy)
-                                        if p_client:
-                                            temp_clients.append(p_client)
-                                            await p_client(ImportChatInviteRequest(invite_hash))
-                                            p_me = await p_client.get_me()
-                                            conv_clients_meta.append({'client': p_client, 'user_id': user_id, 'account_id': p_me.id, 'account_name': p_name})
-                                    
-                                    all_clients_meta = [{'client': owner_client, 'user_id': user_id, 'account_id': owner_id, 'account_name': account_name}] + conv_clients_meta
-
-                                    if len(all_clients_meta) >= 2:
-                                        await self._run_interactive_conversation(user_id, group_id, all_clients_meta, num_messages=messages_to_send, owner_id=owner_id, use_predefined_messages=True)
-                                        topped_up_count += 1
-                                    else:
-                                        LOGGER.warning(f"Could not gather enough clients to top up group {group_id}.")
-
-                                finally:
-                                    for tc in temp_clients:
-                                        if tc.is_connected(): await tc.disconnect()
+                                for _ in range(messages_to_send):
+                                    message = random.choice(Config.RANDOM_MESSAGES)
+                                    await owner_client.send_message(dialog.entity, message)
+                                    self._increment_daily_count_for_group(group_id)
+                                    await asyncio.sleep(random.uniform(1,3))
+                                topped_up_count += 1
                                 
                         except Exception as group_err:
                             LOGGER.error(f"[Health Check] Error processing group {group_id}: {group_err}")
@@ -3203,23 +2525,73 @@ class GroupCreatorBot:
                     Config.MSG_HEALTH_CHECK_COMPLETE.format(healed_count=healed_count, cleaned_count=cleaned_count, topped_up_count=topped_up_count)
                 )
                 await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_END)
+
+    async def _periodic_random_messaging_task(self):
+        """[NEW] Every two days, sends one message to 5 random groups."""
+        while True:
+            await asyncio.sleep(172800) # 2 * 24 * 60 * 60
+            LOGGER.info("[Scheduler] Running periodic random messaging task...")
+
+            if len(self.created_groups) < 5:
+                LOGGER.info("[Scheduler] Not enough groups (< 5) to run periodic messaging. Skipping.")
+                continue
+
+            all_group_ids = list(self.created_groups.keys())
+            selected_group_ids = random.sample(all_group_ids, 5)
+            LOGGER.info(f"[Scheduler] Selected 5 random groups for messaging: {selected_group_ids}")
+
+            groups_by_owner = {}
+            for group_id in selected_group_ids:
+                data = self.created_groups.get(group_id)
+                if data and data.get("owner_worker_key"):
+                    owner_key = data["owner_worker_key"]
+                    groups_by_owner.setdefault(owner_key, []).append(int(group_id))
+
+            for owner_key, group_ids in groups_by_owner.items():
+                client = None
+                try:
+                    user_id_str, account_name = owner_key.split(":", 1)
+                    user_id = int(user_id_str)
+                    session_str = self.session_manager.load_session_string(user_id, account_name)
+                    if not session_str:
+                        LOGGER.warning(f"[Scheduler] Could not load session for {owner_key}. Skipping {len(group_ids)} groups.")
+                        continue
+
+                    proxy = self.account_proxies.get(owner_key)
+                    client = await self._create_worker_client(session_str, proxy)
+                    if not client:
+                        LOGGER.error(f"[Scheduler] Could not connect as {owner_key}. Skipping {len(group_ids)} groups.")
+                        continue
+
+                    for group_id in group_ids:
+                        try:
+                            message = random.choice(Config.RANDOM_MESSAGES)
+                            await client.send_message(PeerChannel(group_id), message)
+                            self._increment_daily_count_for_group(group_id)
+                            LOGGER.info(f"[Scheduler] Sent a random message to group {group_id} using account {owner_key}.")
+                            await asyncio.sleep(random.uniform(5, 10))
+                        except Exception as e:
+                            LOGGER.error(f"[Scheduler] Failed to send message to group {group_id} with owner {owner_key}: {e}")
+
+                except Exception as e:
+                    LOGGER.error(f"[Scheduler] Major error while processing owner {owner_key}: {e}")
+                finally:
+                    if client and client.is_connected():
+                        await client.disconnect()
+
     async def _message_all_groups_handler(self, event: events.NewMessage.Event):
-        """Handles the admin's request to message all groups."""
         if event.sender_id != ADMIN_USER_ID:
             return
         
         await event.reply(Config.MSG_MESSAGE_ALL_GROUPS_STARTED)
-        # Run the task in the background to not block the bot
         asyncio.create_task(self.run_message_all_groups())
 
     async def run_message_all_groups(self):
-        """[MODIFIED] The core logic for sending messages to all groups for all accounts, now faster and with a global lock."""
         if self.health_check_lock.locked():
             LOGGER.warning("Message all groups task triggered but another is already in progress. Skipping.")
             await self.bot.send_message(ADMIN_USER_ID, "⚠️ یک عملیات تعمیر و نگهداری دیگر (مانند بررسی سلامت) از قبل در حال اجرا است.")
             return
 
-        # [NEW] Lock the bot for all non-admin users
         async with self.health_check_lock:
             await self._broadcast_message(Config.MSG_MAINTENANCE_BROADCAST_START)
             LOGGER.info("--- Messaging All Groups Task Started ---")
@@ -3252,15 +2624,14 @@ class GroupCreatorBot:
                             LOGGER.info(f"[Message All] Found group '{dialog.title}' (ID: {dialog.id}) for account {owner_key}.")
                             try:
                                 for i in range(10):
-                                    message_text = random.choice(Config.PREDEFINED_FALLBACK_MESSAGES)
+                                    message_text = random.choice(Config.RANDOM_MESSAGES)
                                     await client.send_message(dialog.id, message_text)
                                     total_messages_sent += 1
                                     LOGGER.info(f"[Message All] >> Sent message {i + 1}/10 to group '{dialog.title}' from {owner_key}.")
-                                    # [MODIFIED] Faster delay
                                     await asyncio.sleep(1)
                             except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError):
                                 LOGGER.warning(f"[Message All] Account {owner_key} cannot send messages in group '{dialog.title}'. Skipping.")
-                                break # Move to the next group
+                                break
                             except Exception as e:
                                 LOGGER.error(f"[Message All] Error sending message to group '{dialog.title}' with account {owner_key}: {e}")
                     
@@ -3289,13 +2660,11 @@ class GroupCreatorBot:
 
           
     async def _send_error_explanation(self, user_id: int, e: Exception):
-        """Logs an error and sends a simplified explanation to the user and a detailed one to the admin."""
         LOGGER.error(f"An error occurred for user {user_id}", exc_info=True)
         sentry_sdk.capture_exception(e)
 
         traceback_str = traceback.format_exc()
         
-        # [NEW] Simplified error mapping for users
         user_message = "❌ یک خطای پیش‌بینی نشده رخ داد. لطفاً دوباره تلاش کنید."
         if isinstance(e, errors.FloodWaitError):
             user_message = f"⏳ تلگرام از ما خواسته است که {e.seconds} ثانیه صبر کنیم. لطفاً بعد از این مدت دوباره تلاش کنید."
@@ -3311,14 +2680,12 @@ class GroupCreatorBot:
         except Exception as send_error:
             LOGGER.error(f"Failed to send error explanation message to user {user_id}: {send_error}")
 
-        # [NEW] Send full traceback to admin
         try:
             admin_error_report = (
                 f"**🚨 Error Report for User `{user_id}`**\n\n"
                 f"**Simplified Message:**\n{user_message}\n\n"
                 f"**Full Traceback:**\n```\n{traceback_str}\n```"
             )
-            # Split the message if it's too long for Telegram
             if len(admin_error_report) > 4096:
                 for i in range(0, len(admin_error_report), 4096):
                     await self.bot.send_message(ADMIN_USER_ID, admin_error_report[i:i + 4096])
@@ -3327,117 +2694,7 @@ class GroupCreatorBot:
         except Exception as admin_send_error:
             LOGGER.error(f"Failed to send full error traceback to admin: {admin_send_error}")
 
-    async def _generate_ai_code_suggestion(self, prompt: str, current_code: str) -> Optional[Dict]:
-        """Calls the OpenRouter API to get a code suggestion."""
-        if not self.openrouter_api_key:
-            LOGGER.error("OPENROUTER_API_KEY not set. Cannot generate AI code suggestion.")
-            await self.bot.send_message(ADMIN_USER_ID, "❌ `OPENROUTER_API_KEY` is not set. Cannot generate AI code suggestion.")
-            return None
-
-        full_prompt = (
-            f"{prompt}\n\n"
-            "The response must be a valid JSON object with two string keys: 'suggestion' and 'code'. "
-            "'suggestion' should be a brief, one-line explanation of the change. "
-            "'code' must contain the complete, modified, and runnable Python source code for the bot.\n\n"
-            f"**Current Source Code:**\n```python\n{current_code}\n```"
-        )
-
-        headers = {"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json"}
-        api_url = "https://openrouter.ai/api/v1/chat/completions"
-        
-        for model_name in self.openrouter_model_hierarchy:
-            LOGGER.info(f"Attempting AI code suggestion with model: {model_name}")
-            data = {"model": model_name, "messages": [{"role": "user", "content": full_prompt}]}
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    response = await client.post(api_url, json=data, headers=headers)
-                    response.raise_for_status()
-                    res_json = response.json()
-                    
-                    message_content = res_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    
-                    json_str = message_content
-                    start_index = json_str.find('{')
-                    end_index = json_str.rfind('}')
-                    
-                    if start_index == -1 or end_index == -1:
-                        LOGGER.warning(f"AI response from model {model_name} did not contain a JSON object. Response: {message_content}")
-                        continue
-
-                    json_str = json_str[start_index:end_index+1]
-                    
-                    try:
-                        json_str_cleaned = json_str.replace('\n', '\\n')
-                        parsed_json = json.loads(json_str_cleaned)
-
-                        if "suggestion" in parsed_json and "code" in parsed_json:
-                            return parsed_json
-                        else:
-                            LOGGER.warning(f"AI JSON response from model {model_name} was missing 'suggestion' or 'code' keys. Response: {parsed_json}")
-                            continue
-                    except json.JSONDecodeError as e:
-                        LOGGER.warning(f"Failed to decode JSON from AI response from model {model_name}: {e}. Raw text: {json_str}")
-                        continue
-
-            except Exception as e:
-                LOGGER.warning(f"An error occurred during AI code suggestion with model {model_name}: {e}")
-        
-        LOGGER.error("All AI models in the hierarchy failed for code suggestion.")
-        await self.bot.send_message(ADMIN_USER_ID, "❌ All AI models failed to generate a valid code suggestion.")
-        return None
-
-    async def _trigger_ai_suggestion(self, test_mode=False):
-        """Contains the core logic for generating and proposing an AI code suggestion."""
-        try:
-            with open(__file__, 'r', encoding='utf-8') as f:
-                current_code = f.read()
-            
-            if test_mode:
-                prompt = "This is a test. Please confirm you can read the code by suggesting a harmless change, like adding a comment. The full code must be returned."
-            else:
-                prompt = (
-                    "Analyze the following Python code for a Telegram bot. "
-                    "Suggest one new feature or a refinement to an existing one."
-                )
-
-            ai_response = await self._generate_ai_code_suggestion(prompt, current_code)
-
-            if ai_response:
-                self.suggested_code = ai_response['code']
-                suggestion_text = ai_response['suggestion']
-                
-                message = (
-                    f"**💡 AI Feature Suggestion**\n\n"
-                    f"{suggestion_text}\n\n"
-                    f"Do you want to apply this change? The bot will restart if you approve."
-                )
-                await self.bot.send_message(
-                    ADMIN_USER_ID, 
-                    message, 
-                    buttons=[
-                        [Button.inline("✅ Apply & Restart", data="patch_feature")],
-                        [Button.inline("❌ Ignore", data="ignore_feature")]
-                    ]
-                )
-                LOGGER.info("Sent AI feature suggestion to admin for approval.")
-            else:
-                LOGGER.error("Failed to get a valid AI suggestion.")
-                await self.bot.send_message(ADMIN_USER_ID, "❌ Failed to get a valid response from the AI.")
-
-        except Exception as e:
-            LOGGER.error(f"Failed to get AI feature suggestion: {e}", exc_info=True)
-            await self.bot.send_message(ADMIN_USER_ID, f"❌ An error occurred during AI analysis: {e}")
-
-    async def _force_refine_handler(self, event: events.NewMessage.Event):
-        """Manually triggers the AI feature suggestion process."""
-        if event.sender_id != ADMIN_USER_ID:
-            return
-        await event.reply("🤖 Triggering AI code analysis... This may take a moment.")
-        LOGGER.info(f"Admin {event.sender_id} manually triggered the AI feature suggestion.")
-        await self._trigger_ai_suggestion()
-
     async def _test_self_healing_handler(self, event: events.NewMessage.Event):
-        """Simulates a critical error to test the self-healing (external restart) mechanism."""
         await event.reply(
             "💥 **Simulating critical failure!**\n\n"
             "I will now raise an unhandled exception. If you are running this bot with a process manager "
@@ -3445,25 +2702,7 @@ class GroupCreatorBot:
             "The error will be reported to Sentry if configured."
         )
         await asyncio.sleep(2)
-        # This will crash the bot. The OS/process manager is responsible for restarting it.
         raise RuntimeError("Simulating a critical failure for self-healing test.")
-
-    async def _test_ai_generation_handler(self, event: events.NewMessage.Event):
-        """Allows the admin to test the AI message generation directly."""
-        await event.reply("🧪 Testing AI message generation...")
-        test_prompt = "Generate a short, friendly test message in English to confirm the AI is working."
-        messages = await self._generate_persian_messages(event.sender_id, persona="a helpful assistant", previous_message=test_prompt)
-        if messages:
-            await event.reply(f"✅ **AI Response:**\n\n{messages[0]}")
-        else:
-            await event.reply("❌ **Failed to generate AI message.**\n\nCheck the logs for errors. This could be due to an invalid API key, network issues, or a problem with the OpenRouter service.")
-
-    async def _daily_feature_suggestion(self):
-        """[ENABLED] This background task runs daily to suggest AI-powered code refinements."""
-        while True:
-            await asyncio.sleep(86400) # Run once a day
-            LOGGER.info("[Scheduler] Running daily AI feature suggestion task...")
-            await self._trigger_ai_suggestion()
 
     def register_handlers(self) -> None:
         self.bot.add_event_handler(self._start_handler, events.NewMessage(pattern='/start'))
@@ -3479,13 +2718,10 @@ class GroupCreatorBot:
             await self.bot.start(bot_token=BOT_TOKEN)
             LOGGER.info("Bot service started successfully.")
 
-            # [NEW] Start the background scheduler for group health maintenance.
             self.bot.loop.create_task(self._group_maintenance_scheduler_task())
+            # [NEW] Start the periodic messaging task
+            self.bot.loop.create_task(self._periodic_random_messaging_task())
             
-            # Start the background scheduler for AI feature suggestions.
-            self.bot.loop.create_task(self._daily_feature_suggestion())
-            
-            # Automatically resume workers that were active before a restart.
             if self.active_workers_state:
                 LOGGER.info(f"Found {len(self.active_workers_state)} workers to resume from previous session.")
                 for worker_key, worker_data in list(self.active_workers_state.items()):

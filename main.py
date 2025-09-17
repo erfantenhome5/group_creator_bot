@@ -1948,9 +1948,110 @@ class GroupCreatorBot:
         self.user_sessions[user_id]['state'] = 'awaiting_account_name'
         await event.reply('✍️ لطفاً یک نام مستعار برای این حساب وارد کنید (مثال: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
 
-     async def _handle_conv_accounts_input(self, event: events.NewMessage.Event) -> None:
-         user_id = str(event.sender_id)
-         input_text = event.message.text.strip()
+    async def _handle_conv_accounts_input(self, event: events.NewMessage.Event) -> None:
+        user_id = str(event.sender_id)
+        input_text = event.message.text.strip()
+
+        if not input_text:
+            self.conversation_accounts[user_id] = []
+            self._save_conversation_accounts()
+            await event.reply(Config.MSG_CONVERSATION_ACCOUNTS_SET, buttons=self._build_main_menu())
+            self.user_sessions[event.sender_id]['state'] = 'authenticated'
+            raise events.StopPropagation
+
+        all_user_accounts = self.session_manager.get_user_accounts(int(user_id))
+        provided_accounts = [acc.strip() for acc in input_text.split(',')]
+        invalid_accounts = [acc for acc in provided_accounts if acc not in all_user_accounts]
+
+        if invalid_accounts:
+            await event.reply(f"❌ حساب‌های زیر یافت نشدند یا متعلق به شما نیستند: `{'`, `'.join(invalid_accounts)}`\n\nلطفاً دوباره تلاش کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
+            return
+
+        self.conversation_accounts[user_id] = provided_accounts
+        self._save_conversation_accounts()
+        await event.reply(Config.MSG_CONVERSATION_ACCOUNTS_SET, buttons=self._build_main_menu())
+        self.user_sessions[event.sender_id]['state'] = 'authenticated'
+        raise events.StopPropagation
+
+    async def _handle_join_account_selection(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        account_name = event.message.text.strip()
+        user_accounts = self.session_manager.get_user_accounts(user_id)
+
+        if account_name not in user_accounts:
+            await event.reply("❌ حساب انتخاب شده نامعتبر است. لطفاً از دکمه‌ها استفاده کنید.")
+            return
+
+        self.user_sessions[user_id]['join_account_name'] = account_name
+        self.user_sessions[user_id]['state'] = 'awaiting_join_link'
+        await event.reply(Config.MSG_PROMPT_JOIN_LINK_MULTIPLE, buttons=[[Button.text(Config.BTN_BACK)]])
+
+    async def _handle_join_link_input(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        text = event.message.text.strip()
+        links = [link.strip() for link in re.split(r'[\n,]+', text) if link.strip()]
+
+        if not links:
+            await event.reply("❌ لینکی وارد نشده است. لطفاً حداقل یک لینک ارسال کنید.")
+            return
+
+        account_name = self.user_sessions[user_id].get('join_account_name')
+        if not account_name:
+            await event.reply("خطای داخلی رخ داده است. لطفاً از ابتدا شروع کنید.", buttons=self._build_main_menu())
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        session_str = self.session_manager.load_session_string(user_id, account_name)
+        if not session_str:
+            await event.reply(f"❌ نشست برای حساب `{account_name}` یافت نشد.", buttons=self._build_main_menu())
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            return
+
+        await event.reply(f"⏳ در حال تلاش برای عضویت حساب `{account_name}` در {len(links)} لینک...")
+
+        client = None
+        success_count = 0
+        fail_count = 0
+        fail_details_list = []
+        try:
+            proxy = self.account_proxies.get(f"{user_id}:{account_name}")
+            client = await self._create_worker_client(session_str, proxy)
+            if not client:
+                await event.reply(f"❌ اتصال به حساب `{account_name}` ناموفق بود.", buttons=self._build_main_menu())
+                return
+
+            for i, link in enumerate(links):
+                match = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', link)
+                if not match:
+                    fail_count += 1
+                    fail_details_list.append(f"- `{link}` (فرمت نامعتبر)")
+                    continue
+
+                invite_hash = match.group(1)
+                try:
+                    await client(ImportChatInviteRequest(invite_hash))
+                    success_count += 1
+                    LOGGER.info(f"Account '{account_name}' successfully joined chat with link {link}.")
+                except Exception as e:
+                    fail_count += 1
+                    fail_details_list.append(f"- `{link}` ({e.__class__.__name__})")
+                    LOGGER.warning(f"Account '{account_name}' failed to join {link}: {e}")
+
+                if i < len(links) - 1:
+                    await asyncio.sleep(random.uniform(5, 15))
+
+            fail_details = "\n".join(fail_details_list) if fail_details_list else "موردی یافت نشد."
+            summary_msg = Config.MSG_JOIN_SUMMARY.format(
+                account_name=account_name,
+                success_count=success_count,
+                fail_count=fail_count,
+                fail_details=f"**جزئیات خطاها:**\n{fail_details}" if fail_count > 0 else ""
+            )
+            await event.reply(summary_msg, buttons=self._build_main_menu())
+
+        except Exception as e:
+            await self._send_error_explanation(user_id, e)
+        finally:
             if client and client.is_connected():
                 await client.disconnect()
             self.user_sessions[user_id]['state'] = 'authenticated'
@@ -2781,4 +2882,5 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+
 

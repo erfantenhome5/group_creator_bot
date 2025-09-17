@@ -172,6 +172,9 @@ class Config:
     BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
     BTN_MANUAL_HEALTH_CHECK = "🩺 بررسی سلامت گروه‌ها"
     BTN_MESSAGE_ALL_GROUPS = "💬 پیام دار کردن همه گروه ها"
+    BTN_GET_CODE = "📲 دریافت کد" # [NEW]
+    BTN_CHANGE_2FA_YES = "✅ بله، تغییر بده" # [NEW]
+    BTN_CHANGE_2FA_NO = "❌ خیر، دست نزن" # [NEW]
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -191,6 +194,8 @@ class Config:
         f"  - `{BTN_START_PREFIX} [نام حساب]`: عملیات ساخت گروه را برای حساب مشخص شده آغاز می‌کند.\n"
         f"  - `{BTN_STOP_PREFIX} [نام حساب]`: عملیات در حال اجرا برای یک حساب را متوقف می‌کند.\n"
         f"  - `{BTN_DELETE_PREFIX} [نام حساب]`: یک حساب و تمام اطلاعات آن را برای همیشه حذف می‌کند.\n\n"
+        f"**{BTN_GET_CODE}**\n"
+        "کد ورود به یکی از حساب‌های ذخیره شده خود را دریافت کنید. این برای زمانی مفید است که می‌خواهید با آن حساب در دستگاه دیگری وارد شوید.\n\n"
         f"**{BTN_JOIN_VIA_LINK}**\n"
         "یکی از حساب‌های خود را با استفاده از لینک دعوت در یک یا چند گروه/کانال عضو کنید.\n\n"
         f"**{BTN_EXPORT_LINKS}**\n"
@@ -659,6 +664,7 @@ class GroupCreatorBot:
                         Button.text(f"{Config.BTN_START_PREFIX} {acc_name}"),
                         Button.text(f"{Config.BTN_DELETE_PREFIX} {acc_name}")
                     ])
+        keyboard.append([Button.text(Config.BTN_GET_CODE)])
         keyboard.append([
             Button.text(Config.BTN_ADD_ACCOUNT),
             Button.text(Config.BTN_ADD_ACCOUNT_SELENIUM)
@@ -1595,6 +1601,8 @@ class GroupCreatorBot:
             state_handlers = {
                 'awaiting_sticker_packs': self._handle_sticker_packs_input,
                 'awaiting_conv_accounts': self._handle_conv_accounts_input,
+                'awaiting_get_code_selection': self._handle_get_code_selection,
+                'awaiting_2fa_choice': self._handle_2fa_choice,
                 'awaiting_join_account_selection': self._handle_join_account_selection,
                 'awaiting_join_link': self._handle_join_link_input,
                 'awaiting_export_account_selection': self._process_export_link_request,
@@ -1629,8 +1637,7 @@ class GroupCreatorBot:
             if state in state_handlers:
                 await state_handlers[state](event)
                 return
-
-            if state != 'authenticated':
+                'authenticated'
                 await self._start_handler(event)
                 return
 
@@ -1642,6 +1649,7 @@ class GroupCreatorBot:
                 Config.BTN_ADD_ACCOUNT: self._initiate_login_flow,
                 Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
                 Config.BTN_SERVER_STATUS: self._server_status_handler,
+                Config.BTN_GET_CODE: self._get_code_handler,
                 Config.BTN_SET_STICKERS: self._set_stickers_handler,
                 Config.BTN_SET_CONVERSATION_ACCOUNTS: self._set_conv_accs_handler,
                 Config.BTN_JOIN_VIA_LINK: self._join_via_link_handler,
@@ -1839,110 +1847,110 @@ class GroupCreatorBot:
         self.user_sessions[event.sender_id]['state'] = 'authenticated'
         raise events.StopPropagation
 
-    async def _handle_conv_accounts_input(self, event: events.NewMessage.Event) -> None:
-        user_id = str(event.sender_id)
-        input_text = event.message.text.strip()
-
-        if not input_text:
-            self.conversation_accounts[user_id] = []
-            self._save_conversation_accounts()
-            await event.reply(Config.MSG_CONVERSATION_ACCOUNTS_SET, buttons=self._build_main_menu())
-            self.user_sessions[event.sender_id]['state'] = 'authenticated'
-            raise events.StopPropagation
-
-        all_user_accounts = self.session_manager.get_user_accounts(int(user_id))
-        provided_accounts = [acc.strip() for acc in input_text.split(',')]
-        invalid_accounts = [acc for acc in provided_accounts if acc not in all_user_accounts]
-
-        if invalid_accounts:
-            await event.reply(f"❌ حساب‌های زیر یافت نشدند یا متعلق به شما نیستند: `{'`, `'.join(invalid_accounts)}`\n\nلطفاً دوباره تلاش کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
+    async def _get_code_handler(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        accounts = self.session_manager.get_user_accounts(user_id)
+        if not accounts:
+            await event.reply("❌ شما هیچ حسابی برای دریافت کد ندارید.")
             return
 
-        self.conversation_accounts[user_id] = provided_accounts
-        self._save_conversation_accounts()
-        await event.reply(Config.MSG_CONVERSATION_ACCOUNTS_SET, buttons=self._build_main_menu())
-        self.user_sessions[event.sender_id]['state'] = 'authenticated'
-        raise events.StopPropagation
+        self.user_sessions[user_id]['state'] = 'awaiting_get_code_selection'
+        buttons = [[Button.text(acc)] for acc in accounts]
+        buttons.append([Button.text(Config.BTN_BACK)])
+        await event.reply("📲 لطفاً حسابی که می‌خواهید کد ورود آن را دریافت کنید، انتخاب نمایید:", buttons=buttons)
 
-    async def _handle_join_account_selection(self, event: events.NewMessage.Event) -> None:
+    async def _handle_get_code_selection(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         account_name = event.message.text.strip()
-        user_accounts = self.session_manager.get_user_accounts(user_id)
+        self.user_sessions[user_id]['state'] = 'authenticated' # Reset state early
 
-        if account_name not in user_accounts:
-            await event.reply("❌ حساب انتخاب شده نامعتبر است. لطفاً از دکمه‌ها استفاده کنید.")
-            return
-
-        self.user_sessions[user_id]['join_account_name'] = account_name
-        self.user_sessions[user_id]['state'] = 'awaiting_join_link'
-        await event.reply(Config.MSG_PROMPT_JOIN_LINK_MULTIPLE, buttons=[[Button.text(Config.BTN_BACK)]])
-
-    async def _handle_join_link_input(self, event: events.NewMessage.Event) -> None:
-        user_id = event.sender_id
-        text = event.message.text.strip()
-        links = [link.strip() for link in re.split(r'[\n,]+', text) if link.strip()]
-
-        if not links:
-            await event.reply("❌ لینکی وارد نشده است. لطفاً حداقل یک لینک ارسال کنید.")
-            return
-
-        account_name = self.user_sessions[user_id].get('join_account_name')
-        if not account_name:
-            await event.reply("خطای داخلی رخ داده است. لطفاً از ابتدا شروع کنید.", buttons=self._build_main_menu())
-            self.user_sessions[user_id]['state'] = 'authenticated'
+        if account_name not in self.session_manager.get_user_accounts(user_id):
+            await event.reply("❌ حساب انتخاب شده نامعتبر است.")
+            await self._send_accounts_menu(event)
             return
 
         session_str = self.session_manager.load_session_string(user_id, account_name)
         if not session_str:
-            await event.reply(f"❌ نشست برای حساب `{account_name}` یافت نشد.", buttons=self._build_main_menu())
-            self.user_sessions[user_id]['state'] = 'authenticated'
+            await event.reply(f"❌ نشست برای حساب `{account_name}` یافت نشد.")
+            await self._send_accounts_menu(event)
             return
 
-        await event.reply(f"⏳ در حال تلاش برای عضویت حساب `{account_name}` در {len(links)} لینک...")
-
+        msg = await event.reply(f"⏳ در حال اتصال به حساب `{account_name}`... لطفاً اکنون در دستگاه دیگر خود درخواست کد ورود دهید. ربات به مدت ۶۰ ثانیه منتظر کد خواهد ماند.")
+        
         client = None
-        success_count = 0
-        fail_count = 0
-        fail_details_list = []
+        code_found = asyncio.Event()
+
+        async def code_handler(event_code):
+            LOGGER.info(f"Received a message from Telegram service for {account_name}: {event_code.message.text}")
+            
+            # More robust regex to find codes like 12345 or 1-2-3-4-5, possibly with surrounding text
+            code_match = re.search(r'(\d[\s-]?\d[\s-]?\d[\s-]?\d[\s-]?\d)', event_code.message.text)
+            
+            if code_match:
+                code = re.sub(r'[\s-]', '', code_match.group(1))
+                await self.bot.send_message(user_id, f"✅ **کد ورود برای `{account_name}`:**\n\n`{code}`")
+                code_found.set()
+            else:
+                await self.bot.send_message(user_id, f"ℹ️ **پیام از تلگرام برای `{account_name}` (کد یافت نشد):**\n\n_{event_code.message.text}_")
+
         try:
             proxy = self.account_proxies.get(f"{user_id}:{account_name}")
             client = await self._create_worker_client(session_str, proxy)
             if not client:
-                await event.reply(f"❌ اتصال به حساب `{account_name}` ناموفق بود.", buttons=self._build_main_menu())
+                await msg.edit(f"❌ اتصال به حساب `{account_name}` ناموفق بود.")
+                await self._send_accounts_menu(event)
                 return
 
-            for i, link in enumerate(links):
-                match = re.search(r'(?:t\.me/joinchat/|\+)([a-zA-Z0-9_-]+)', link)
-                if not match:
-                    fail_count += 1
-                    fail_details_list.append(f"- `{link}` (فرمت نامعتبر)")
-                    continue
+            client.add_event_handler(code_handler, events.NewMessage(from_users=777000))
+            await client.get_me() 
 
-                invite_hash = match.group(1)
-                try:
-                    await client(ImportChatInviteRequest(invite_hash))
-                    success_count += 1
-                    LOGGER.info(f"Account '{account_name}' successfully joined chat with link {link}.")
-                except Exception as e:
-                    fail_count += 1
-                    fail_details_list.append(f"- `{link}` ({e.__class__.__name__})")
-                    LOGGER.warning(f"Account '{account_name}' failed to join {link}: {e}")
+            await asyncio.wait_for(code_found.wait(), timeout=60.0)
+            await msg.edit(f"✅ کد برای `{account_name}` با موفقیت به شما ارسال شد.")
 
-                if i < len(links) - 1:
-                    await asyncio.sleep(random.uniform(5, 15))
-
-            fail_details = "\n".join(fail_details_list) if fail_details_list else "موردی یافت نشد."
-            summary_msg = Config.MSG_JOIN_SUMMARY.format(
-                account_name=account_name,
-                success_count=success_count,
-                fail_count=fail_count,
-                fail_details=f"**جزئیات خطاها:**\n{fail_details}" if fail_count > 0 else ""
-            )
-            await event.reply(summary_msg, buttons=self._build_main_menu())
-
+        except asyncio.TimeoutError:
+            await msg.edit(f"⌛️ در مدت ۶۰ ثانیه هیچ کدی برای `{account_name}` دریافت نشد.")
         except Exception as e:
             await self._send_error_explanation(user_id, e)
+            await msg.edit(f"❌ خطایی هنگام دریافت کد برای `{account_name}` رخ داد.")
         finally:
+            if client:
+                if client.is_connected():
+                    await client.disconnect()
+            await self._send_accounts_menu(event)
+
+    async def _handle_2fa_choice(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        choice = event.message.text.strip()
+        client = self.user_sessions[user_id].get('client')
+
+        if choice not in [Config.BTN_CHANGE_2FA_YES, Config.BTN_CHANGE_2FA_NO]:
+            await event.reply("❌ انتخاب نامعتبر. لطفاً از دکمه‌ها استفاده کنید.")
+            return
+
+        if not client:
+            await event.reply("❌ خطای داخلی: نشست کلاینت منقضی شده است. لطفاً فرآیند افزودن حساب را از ابتدا شروع کنید.")
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            await self._send_accounts_menu(event)
+            return
+
+        if choice == Config.BTN_CHANGE_2FA_YES:
+            current_password = self.user_sessions[user_id].get('current_password')
+            new_password = "erfantenhome"
+            msg = await event.reply(f"⏳ در حال تغییر رمز تایید دو مرحله‌ای به `{new_password}`...")
+            try:
+                await client.edit_2fa(current_password=current_password, new_password=new_password, hint=new_password)
+                await msg.edit("✅ رمز تایید دو مرحله‌ای با موفقیت تغییر یافت.")
+            except Exception as e:
+                await self._send_error_explanation(user_id, e)
+                await msg.edit("❌ در هنگام تغییر رمز خطایی رخ داد. ممکن است رمز فعلی اشتباه باشد یا مشکلی در سمت تلگرام وجود داشته باشد.")
+        
+        # Proceed to the next step regardless of the outcome
+        self.user_sessions[user_id]['state'] = 'awaiting_account_name'
+        await event.reply('✍️ لطفاً یک نام مستعار برای این حساب وارد کنید (مثال: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
+
+     async def _handle_conv_accounts_input(self, event: events.NewMessage.Event) -> None:
+         user_id = str(event.sender_id)
+         input_text = event.message.text.strip()
             if client and client.is_connected():
                 await client.disconnect()
             self.user_sessions[user_id]['state'] = 'authenticated'
@@ -2130,11 +2138,22 @@ class GroupCreatorBot:
         user_client = self.user_sessions[user_id]['client']
         try:
             await user_client.sign_in(self.user_sessions[user_id]['phone'], code=event.message.text.strip(), phone_code_hash=self.user_sessions[user_id].get('phone_code_hash'))
-            self.user_sessions[user_id]['state'] = 'awaiting_account_name'
-            await event.reply('✅ Login successful! Please enter a nickname for this account (e.g., `Main Account` or `Second Number`).', buttons=[[Button.text(Config.BTN_BACK)]])
+            
+            # [MODIFIED] Go to 2FA choice instead of account name
+            self.user_sessions[user_id]['current_password'] = None 
+            self.user_sessions[user_id]['state'] = 'awaiting_2fa_choice'
+            await event.reply(
+                '🔐 **تایید دو مرحله‌ای**\n\nآیا می‌خواهید رمز تایید دو مرحله‌ای این حساب را به `erfantenhome` تنظیم کنید؟',
+                buttons=[
+                    [Button.text(Config.BTN_CHANGE_2FA_YES)],
+                    [Button.text(Config.BTN_CHANGE_2FA_NO)],
+                    [Button.text(Config.BTN_BACK)]
+                ]
+            )
+
         except errors.SessionPasswordNeededError:
             self.user_sessions[user_id]['state'] = 'awaiting_password'
-            await event.reply('🔑 This account has two-step verification enabled. Please send the password.', buttons=[[Button.text(Config.BTN_BACK)]])
+            await event.reply('🔑 این حساب دارای تایید دو مرحله‌ای است. لطفاً رمز عبور را ارسال کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
         except errors.PhoneCodeExpiredError:
             try:
                 LOGGER.warning(f"Phone code for {user_id} expired. Requesting new code.")
@@ -2151,10 +2170,21 @@ class GroupCreatorBot:
 
     async def _handle_password_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
+        password = event.message.text.strip()
         try:
-            await self.user_sessions[user_id]['client'].sign_in(password=event.message.text.strip())
-            self.user_sessions[user_id]['state'] = 'awaiting_account_name'
-            await event.reply('✅ Login successful! Please enter a nickname for this account (e.g., `Main Account` or `Second Number`).', buttons=[[Button.text(Config.BTN_BACK)]])
+            await self.user_sessions[user_id]['client'].sign_in(password=password)
+            
+            # [MODIFIED] Go to 2FA choice instead of account name
+            self.user_sessions[user_id]['current_password'] = password
+            self.user_sessions[user_id]['state'] = 'awaiting_2fa_choice'
+            await event.reply(
+                '🔐 **تایید دو مرحله‌ای**\n\nآیا می‌خواهید رمز تایید دو مرحله‌ای این حساب را به `erfantenhome` تغییر دهید؟',
+                buttons=[
+                    [Button.text(Config.BTN_CHANGE_2FA_YES)],
+                    [Button.text(Config.BTN_CHANGE_2FA_NO)],
+                    [Button.text(Config.BTN_BACK)]
+                ]
+            )
         except Exception as e:
             await self._send_error_explanation(user_id, e)
             self.user_sessions[user_id]['state'] = 'awaiting_password'
@@ -2751,3 +2781,4 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+

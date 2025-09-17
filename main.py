@@ -1573,6 +1573,8 @@ class GroupCreatorBot:
         
         user_id = event.sender_id
         
+        self._ensure_session(user_id) # [FIX] Ensure session exists for all users
+
         try:
             text = event.message.text
             if user_id in self.banned_users:
@@ -1637,7 +1639,8 @@ class GroupCreatorBot:
             if state in state_handlers:
                 await state_handlers[state](event)
                 return
-                'authenticated'
+
+            if state != 'authenticated':
                 await self._start_handler(event)
                 return
 
@@ -2882,5 +2885,3 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
-
-

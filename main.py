@@ -595,7 +595,7 @@ class GroupCreatorBot:
         try:
             proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy (direct connection)"
             LOGGER.debug(f"Attempting login connection {proxy_info}")
-            client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
+            client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, connection_retries=2, **device_params)
             client.parse_mode = CustomMarkdown()
             await client.connect()
             return client
@@ -608,7 +608,7 @@ class GroupCreatorBot:
         device_params = random.choice(Config.USER_AGENTS)
 
         client = TelegramClient(
-            session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout,
+            session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, connection_retries=2,
             device_model=device_params['device_model'], system_version=device_params['system_version']
         )
         client.parse_mode = CustomMarkdown()
@@ -705,7 +705,7 @@ class GroupCreatorBot:
         random.shuffle(potential_proxies)
 
         # To improve speed, we'll only try a sample of proxies, not all of them.
-        max_proxies_to_try = 10
+        max_proxies_to_try = 3
         if len(potential_proxies) > max_proxies_to_try:
             proxies_to_sample = random.sample(potential_proxies, max_proxies_to_try)
         else:
@@ -1590,7 +1590,7 @@ class GroupCreatorBot:
             client = None
             try:
                 device_params = random.choice(Config.USER_AGENTS)
-                client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
+                client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, connection_retries=2, **device_params)
                 await client.connect()
                 if client.is_connected():
                     proxy_line = f"{proxy['addr']}:{proxy['port']}"
@@ -1621,7 +1621,7 @@ class GroupCreatorBot:
         client = None
         try:
             device_params = random.choice(Config.USER_AGENTS)
-            client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=None, timeout=self.proxy_timeout, **device_params)
+            client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=None, timeout=self.proxy_timeout, connection_retries=2, **device_params)
             await client.connect()
             if client.is_connected():
                 direct_connection_works = True
@@ -3064,6 +3064,7 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+
 
 
 

@@ -627,19 +627,15 @@ class GroupCreatorBot:
             return None
 
     async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
-        """[MODIFIED] Tries to connect using proxies, and after 3 failures, attempts a direct connection."""
+        """[MODIFIED] Tries to connect using up to 2 proxies, then falls back to a direct connection."""
         worker_key = f"{user_id}:{account_name}"
         
-        # Get all available proxies and shuffle them
         potential_proxies = self.proxies[:]
         random.shuffle(potential_proxies)
 
-        # Prioritize the currently assigned proxy if it exists
         assigned_proxy = self.account_proxies.get(worker_key)
         if assigned_proxy:
-            # Move assigned proxy to the front of the list to try it first
             try:
-                # Find and move the exact proxy object if it's in the list
                 idx = -1
                 for i, p in enumerate(potential_proxies):
                     if p['addr'] == assigned_proxy['addr'] and p['port'] == assigned_proxy['port']:
@@ -647,32 +643,31 @@ class GroupCreatorBot:
                         break
                 if idx != -1:
                     potential_proxies.insert(0, potential_proxies.pop(idx))
-                else: # if not found (e.g., from an old proxy list), just add it to the front
+                else:
                     potential_proxies.insert(0, assigned_proxy)
             except Exception:
                 potential_proxies.insert(0, assigned_proxy)
 
         proxies_to_try = potential_proxies
         
-        LOGGER.info(f"Attempting connection for '{account_name}'. Trying up to {len(proxies_to_try)} proxies before direct connection.")
+        LOGGER.info(f"Attempting connection for '{account_name}'. Trying up to 2 proxies before direct connection.")
 
         failed_attempts = 0
         
-        # Try available proxies, up to a limit of 3 failures
+        # Try available proxies, up to a limit of 2 failures
         for proxy in proxies_to_try:
-            if failed_attempts >= 3:
+            if failed_attempts >= 2:
                 LOGGER.warning(f"[{account_name}] Reached {failed_attempts} failed proxy attempts. Now trying a direct connection.")
                 break
 
             proxy_info_str = f"{proxy['addr']}:{proxy['port']}"
-            LOGGER.info(f"[{account_name}] Proxy attempt {failed_attempts + 1}/3 using {proxy_info_str}...")
+            LOGGER.info(f"[{account_name}] Proxy attempt {failed_attempts + 1}/2 using {proxy_info_str}...")
 
             client = await self._create_worker_client(session_string, proxy)
             
             if client and client.is_connected():
                 LOGGER.info(f"[{account_name}] Successfully connected using proxy {proxy_info_str}.")
                 
-                # Check if the successful proxy is different from the assigned one before saving
                 is_different = True
                 if assigned_proxy:
                     if assigned_proxy['addr'] == proxy['addr'] and assigned_proxy['port'] == proxy['port']:
@@ -693,7 +688,6 @@ class GroupCreatorBot:
         if client and client.is_connected():
             LOGGER.info(f"[{account_name}] Successfully connected using a direct connection.")
             
-            # Since direct connection worked, we can clear any failed proxy assignment
             if self.account_proxies.get(worker_key) is not None:
                 LOGGER.info(f"Removing failed proxy assignment for '{account_name}'.")
                 self.account_proxies[worker_key] = None
@@ -2119,12 +2113,22 @@ class GroupCreatorBot:
             return
 
         if choice == Config.BTN_CHANGE_2FA_YES:
-            await event.reply(
-                "⚠️ **عملیات پیچیده**\n\n"
-                "تغییر رمز تایید دو مرحله‌ای از طریق ربات به دلیل نیاز به محاسبات رمزنگاری پیچیده پشتیبانی نمی‌شود. "
-                "لطفاً برای امنیت بیشتر، این کار را به صورت دستی در یکی از اپلیکیشن‌های رسمی تلگرام انجام دهید."
-            )
+            current_password = self.user_sessions[user_id].get('current_password')
+            new_password = "erfantenhome"
+            msg = await event.reply(f"⏳ در حال تلاش برای تنظیم/تغییر رمز عبور دو مرحله‌ای به `{new_password}`...")
+            try:
+                # Use the high-level client method. It handles both setting a new password
+                # (if current_password is None) and changing an existing one.
+                await client.edit_2fa(current_password=current_password, new_password=new_password)
+                await msg.edit(f"✅ رمز عبور دو مرحله‌ای با موفقیت به `{new_password}` تنظیم/تغییر یافت.")
+            except Exception as e:
+                await self._send_error_explanation(user_id, e)
+                await msg.edit(
+                    "❌ در هنگام تغییر رمز خطایی رخ داد. "
+                    "ممکن است رمز فعلی اشتباه باشد یا مشکلی در سمت تلگرام وجود داشته باشد."
+                )
         
+        # Proceed to the next step regardless of the outcome
         self.user_sessions[user_id]['state'] = 'awaiting_account_name'
         await event.reply('✍️ لطفاً یک نام مستعار برای این حساب وارد کنید (مثال: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
     # ---------- MODIFICATION END: 2FA Handler ----------
@@ -3060,6 +3064,8 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+
+
 
 
 

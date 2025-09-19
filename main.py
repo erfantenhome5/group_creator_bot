@@ -88,7 +88,7 @@ class CustomMarkdown:
 
 # --- Global Proxy Loading Function ---
 def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
-    """[MODIFIED] Loads proxies from a file, now supporting IP:PORT and IP:PORT:USER:PASS formats."""
+    """[FIXED] Loads proxies from a file, now supporting IP:PORT and IP:PORT:USER:PASS formats."""
     proxy_list = []
     try:
         with open(proxy_file_path, 'r', encoding='utf-8') as f:
@@ -102,10 +102,10 @@ def load_proxies_from_file(proxy_file_path: str) -> List[Dict]:
 
                 try:
                     if len(parts) == 2:
-                        proxy_info['addr'] = parts[0]
+                        proxy_info['host'] = parts[0]
                         proxy_info['port'] = int(parts[1])
                     elif len(parts) == 4:
-                        proxy_info['addr'] = parts[0]
+                        proxy_info['host'] = parts[0]
                         proxy_info['port'] = int(parts[1])
                         proxy_info['username'] = parts[2]
                         proxy_info['password'] = parts[3]
@@ -170,7 +170,7 @@ class Config:
     BTN_JOIN_VIA_LINK = "🔗 عضویت با لینک"
     BTN_EXPORT_LINKS = "🔗 صدور لینک‌های گروه"
     BTN_FORCE_CONVERSATION = "💬 شروع مکالمه دستی"
-    BTN_STOP_FORCE_CONVERSATION = "⏹️ توقف مکالمه دستی"
+    BTN_STOP_FORCE_CONversation = "⏹️ توقف مکالمه دستی"
     BTN_MANUAL_HEALTH_CHECK = "🩺 بررسی سلامت گروه‌ها"
     BTN_MESSAGE_ALL_GROUPS = "💬 پیام دار کردن همه گروه ها"
     BTN_GET_CODE = "📲 دریافت کد"
@@ -408,14 +408,14 @@ class GroupCreatorBot:
             if 'username' in sentry_proxy and 'password' in sentry_proxy:
                 proxy_url = (
                     f"http://{sentry_proxy['username']}:{sentry_proxy['password']}"
-                    f"@{sentry_proxy['addr']}:{sentry_proxy['port']}"
+                    f"@{sentry_proxy['host']}:{sentry_proxy['port']}"
                 )
             else:
-                proxy_url = f"http://{sentry_proxy['addr']}:{sentry_proxy['port']}"
+                proxy_url = f"http://{sentry_proxy['host']}:{sentry_proxy['port']}"
             
             sentry_options["http_proxy"] = proxy_url
             sentry_options["https_proxy"] = proxy_url
-            LOGGER.info(f"Sentry will use proxy: {sentry_proxy['addr']}:{sentry_proxy['port']}")
+            LOGGER.info(f"Sentry will use proxy: {sentry_proxy['host']}:{sentry_proxy['port']}")
         else:
             LOGGER.info("Sentry will not use a proxy (none found).")
 
@@ -445,13 +445,13 @@ class GroupCreatorBot:
         if not self.proxies:
             return None
         assigned_proxy_keys = {
-            (p['addr'], p['port'])
+            (p['host'], p['port'])
             for p in self.account_proxies.values() if p
         }
         for proxy in self.proxies:
-            proxy_key = (proxy['addr'], proxy['port'])
+            proxy_key = (proxy['host'], proxy['port'])
             if proxy_key not in assigned_proxy_keys:
-                LOGGER.info(f"Found available proxy: {proxy['addr']}:{proxy['port']}")
+                LOGGER.info(f"Found available proxy: {proxy['host']}:{proxy['port']}")
                 return proxy
         LOGGER.warning("All proxies are currently assigned. No available proxy found.")
         return None
@@ -593,7 +593,7 @@ class GroupCreatorBot:
         device_params = random.choice(Config.USER_AGENTS)
 
         try:
-            proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy (direct connection)"
+            proxy_info = f"with proxy {proxy['host']}:{proxy['port']}" if proxy else "without proxy (direct connection)"
             LOGGER.debug(f"Attempting login connection {proxy_info}")
             client = TelegramClient(session, API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
             client.parse_mode = CustomMarkdown()
@@ -614,7 +614,7 @@ class GroupCreatorBot:
         client.parse_mode = CustomMarkdown()
 
         try:
-            proxy_info = f"with proxy {proxy['addr']}:{proxy['port']}" if proxy else "without proxy"
+            proxy_info = f"with proxy {proxy['host']}:{proxy['port']}" if proxy else "without proxy"
             LOGGER.debug(f"Attempting worker connection {proxy_info}")
             await client.connect()
             LOGGER.info(f"Worker connected successfully {proxy_info}")
@@ -963,7 +963,7 @@ class GroupCreatorBot:
         self.account_proxies[worker_key] = assigned_proxy
         self._save_account_proxies()
         if assigned_proxy:
-            proxy_addr = f"{assigned_proxy['addr']}:{assigned_proxy['port']}"
+            proxy_addr = f"{assigned_proxy['host']}:{assigned_proxy['port']}"
             LOGGER.info(f"Login proxy {proxy_addr} assigned to account '{account_name}'.")
         else:
             LOGGER.info(f"Account '{account_name}' logged in directly and will run without a proxy.")
@@ -1297,7 +1297,7 @@ class GroupCreatorBot:
         message = "**- Active Workers -**\n\n"
         for worker_key, task in self.active_workers.items():
             proxy_info = self.account_proxies.get(worker_key)
-            proxy_str = f"Proxy: {proxy_info['addr']}:{proxy_info['port']}" if proxy_info else "Proxy: None"
+            proxy_str = f"Proxy: {proxy_info['host']}:{proxy_info['port']}" if proxy_info else "Proxy: None"
             message += f"- **Key:** `{worker_key}`\n  - **Status:** {'Running' if not task.done() else 'Finished'}\n  - **{proxy_str}**\n\n"
         
         await event.reply(message)
@@ -1478,11 +1478,11 @@ class GroupCreatorBot:
         await self.bot.send_message(event.sender_id, "🧪 Starting silent proxy test... Results will be in system logs.")
         LOGGER.debug("--- PROXY TEST START ---")
         for proxy in self.proxies:
-            proxy_addr = f"{proxy['addr']}:{proxy['port']}"
+            proxy_addr = f"{proxy['host']}:{proxy['port']}"
             client = None
             try:
                 device_params = random.choice(Config.USER_AGENTS)
-                LOGGER.debug(f"Testing proxy: {proxy['addr']} with device: {device_params}")
+                LOGGER.debug(f"Testing proxy: {proxy['host']} with device: {device_params}")
                 client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
                 await client.connect()
                 if client.is_connected():
@@ -2245,7 +2245,7 @@ class GroupCreatorBot:
         self.user_sessions[user_id]['phone'] = phone_number
         selected_proxy = self._get_available_proxy()
         if selected_proxy:
-            LOGGER.info(f"Using proxy {selected_proxy['addr']}:{selected_proxy['port']} for login.")
+            LOGGER.info(f"Using proxy {selected_proxy['host']}:{selected_proxy['port']} for login.")
         else:
             LOGGER.info("No available proxy from file. Attempting direct connection for login.")
 
@@ -2254,7 +2254,7 @@ class GroupCreatorBot:
         try:
             user_client = await self._create_login_client(selected_proxy)
             if not user_client:
-                proxy_msg = f" with proxy {selected_proxy['addr']}:{selected_proxy['port']}" if selected_proxy else " directly"
+                proxy_msg = f" with proxy {selected_proxy['host']}:{selected_proxy['port']}" if selected_proxy else " directly"
                 await event.reply(f'❌ Failed to connect to Telegram{proxy_msg}. Please try again later.')
                 return
             self.user_sessions[user_id]['client'] = user_client
@@ -2915,4 +2915,3 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
-

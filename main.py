@@ -368,7 +368,7 @@ class GroupCreatorBot:
 
     async def _initialize_sentry(self):
         """Initializes Sentry for error reporting, tracing, and logging."""
-        sentry_dsn = self.config.get("SENTRY_DSN", SENTRY_DSN)
+        sentry_dsn = self.config.get("SENTRY_DSn", SENTRY_DSN)
         if not sentry_dsn:
             return
 
@@ -626,47 +626,84 @@ class GroupCreatorBot:
             sentry_sdk.capture_exception(e)
             return None
 
+    # ---------- MODIFICATION START: Resilient Worker Client ----------
     async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
-        """[NEW] Tries to connect using the assigned proxy, then rotates to others on failure."""
+        """[MODIFIED] Tries to connect using proxies, and after 3 failures, attempts a direct connection."""
         worker_key = f"{user_id}:{account_name}"
         
-        assigned_proxy = self.account_proxies.get(worker_key)
-        
+        # Get all available proxies and shuffle them
         potential_proxies = self.proxies[:]
         random.shuffle(potential_proxies)
 
-        proxies_to_try = []
+        # Prioritize the currently assigned proxy if it exists
+        assigned_proxy = self.account_proxies.get(worker_key)
         if assigned_proxy:
-            proxies_to_try.append(assigned_proxy)
-            assigned_proxy_tuple = (assigned_proxy['addr'], assigned_proxy['port'])
-            for p in potential_proxies:
-                if (p['addr'], p['port']) != assigned_proxy_tuple:
-                    proxies_to_try.append(p)
-        else:
-            proxies_to_try = potential_proxies
+            # Move assigned proxy to the front of the list to try it first
+            try:
+                # Find and move the exact proxy object if it's in the list
+                idx = -1
+                for i, p in enumerate(potential_proxies):
+                    if p['addr'] == assigned_proxy['addr'] and p['port'] == assigned_proxy['port']:
+                        idx = i
+                        break
+                if idx != -1:
+                    potential_proxies.insert(0, potential_proxies.pop(idx))
+                else: # if not found (e.g., from an old proxy list), just add it to the front
+                    potential_proxies.insert(0, assigned_proxy)
+            except Exception:
+                potential_proxies.insert(0, assigned_proxy)
 
-        proxies_to_try.append(None) 
+        proxies_to_try = potential_proxies
+        
+        LOGGER.info(f"Attempting connection for '{account_name}'. Trying up to {len(proxies_to_try)} proxies before direct connection.")
 
-        LOGGER.info(f"Attempting connection for '{account_name}'. Trying up to {len(proxies_to_try)} connection methods.")
+        failed_attempts = 0
+        
+        # Try available proxies, up to a limit of 3 failures
+        for proxy in proxies_to_try:
+            if failed_attempts >= 3:
+                LOGGER.warning(f"[{account_name}] Reached {failed_attempts} failed proxy attempts. Now trying a direct connection.")
+                break
 
-        for i, proxy in enumerate(proxies_to_try):
-            proxy_info_str = f"{proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
-            LOGGER.info(f"[{account_name}] Connection attempt {i+1}/{len(proxies_to_try)} using {proxy_info_str}...")
+            proxy_info_str = f"{proxy['addr']}:{proxy['port']}"
+            LOGGER.info(f"[{account_name}] Proxy attempt {failed_attempts + 1}/3 using {proxy_info_str}...")
 
             client = await self._create_worker_client(session_string, proxy)
             
             if client and client.is_connected():
-                LOGGER.info(f"[{account_name}] Successfully connected using {proxy_info_str}.")
+                LOGGER.info(f"[{account_name}] Successfully connected using proxy {proxy_info_str}.")
                 
-                if proxy != assigned_proxy:
+                # Check if the successful proxy is different from the assigned one before saving
+                is_different = True
+                if assigned_proxy:
+                    if assigned_proxy['addr'] == proxy['addr'] and assigned_proxy['port'] == proxy['port']:
+                        is_different = False
+                
+                if is_different:
                     LOGGER.info(f"Updating assigned proxy for '{account_name}' to {proxy_info_str}.")
                     self.account_proxies[worker_key] = proxy
                     self._save_account_proxies()
                 
                 return client
+            else:
+                failed_attempts += 1
 
-        LOGGER.error(f"[{account_name}] All connection attempts failed.")
+        # If all proxy attempts failed or we hit the limit, try a direct connection
+        LOGGER.info(f"[{account_name}] All proxies failed or limit reached. Trying a direct connection...")
+        client = await self._create_worker_client(session_string, None)
+        if client and client.is_connected():
+            LOGGER.info(f"[{account_name}] Successfully connected using a direct connection.")
+            
+            # Since direct connection worked, we can clear any failed proxy assignment
+            if self.account_proxies.get(worker_key) is not None:
+                LOGGER.info(f"Removing failed proxy assignment for '{account_name}'.")
+                self.account_proxies[worker_key] = None
+                self._save_account_proxies()
+            return client
+
+        LOGGER.error(f"[{account_name}] All connection attempts (proxies and direct) failed.")
         return None
+    # ---------- MODIFICATION END: Resilient Worker Client ----------
 
     async def _send_request_with_reconnect(self, client: TelegramClient, request: Any, account_name: str) -> Any:
         try:
@@ -1508,46 +1545,67 @@ class GroupCreatorBot:
         
         await event.reply(message)
 
+    # ---------- MODIFICATION START: Proxy Debug Handler ----------
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
-        LOGGER.info(f"Admin {event.sender_id} initiated silent proxy test.")
+        """[MODIFIED] Tests all proxies, saves working ones to a file, and sends it to the admin."""
+        if event.sender_id != ADMIN_USER_ID: return
+
+        LOGGER.info(f"Admin {event.sender_id} initiated proxy test.")
         if not self.proxies:
-            LOGGER.debug("Proxy test: No proxies found in file.")
             await self.bot.send_message(event.sender_id, "⚠️ No proxies found in the file to test.")
             return
-        await self.bot.send_message(event.sender_id, "🧪 Starting silent proxy test... Results will be in system logs.")
-        LOGGER.debug("--- PROXY TEST START ---")
+
+        msg = await self.bot.send_message(event.sender_id, f"🧪 Starting test for {len(self.proxies)} proxies... This may take a moment.")
+        
+        working_proxies = []
+        tested_count = 0
+        total_proxies = len(self.proxies)
+
         for proxy in self.proxies:
-            proxy_addr = f"{proxy['addr']}:{proxy['port']}"
             client = None
             try:
                 device_params = random.choice(Config.USER_AGENTS)
-                LOGGER.debug(f"Testing proxy: {proxy['addr']} with device: {device_params}")
                 client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
                 await client.connect()
                 if client.is_connected():
-                    LOGGER.info(f"  ✅ SUCCESS: {proxy_addr}")
+                    proxy_parts = [proxy['addr'], str(proxy['port'])]
+                    if 'username' in proxy and 'password' in proxy:
+                        proxy_parts.extend([proxy['username'], proxy['password']])
+                    
+                    working_proxies.append(":".join(proxy_parts))
+                    LOGGER.info(f"  ✅ SUCCESS: {proxy['addr']}:{proxy['port']}")
             except Exception as e:
-                LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy_addr} - {e}")
+                LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy['addr']}:{proxy['port']} - {e}")
             finally:
                 if client and client.is_connected():
                     await client.disconnect()
-        LOGGER.debug("--- DIRECT CONNECTION TEST ---")
-        client = None
-        try:
-            device_params = random.choice(Config.USER_AGENTS)
-            LOGGER.debug(f"Testing direct connection with device: {device_params}")
-            client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, timeout=self.proxy_timeout, **device_params)
-            await client.connect()
-            if client.is_connected():
-                LOGGER.info("  ✅ SUCCESS: Direct Connection")
-        except Exception as e:
-            LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): Direct Connection - {e}")
-        finally:
-            if client and client.is_connected():
-                await client.disconnect()
-        LOGGER.info("Silent proxy test finished.")
-        await self.bot.send_message(event.sender_id, "🏁 Silent proxy test finished. Check system logs for results.")
+                
+                tested_count += 1
+                if tested_count % 10 == 0 or tested_count == total_proxies:
+                    try:
+                        await msg.edit(f"🧪 Testing proxies... ({tested_count}/{total_proxies})")
+                    except errors.MessageNotModifiedError:
+                        pass
+        
+        LOGGER.info("Proxy test finished.")
+        if working_proxies:
+            file_path = SESSIONS_DIR / "working_proxies.txt"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(working_proxies))
+            
+            await self.bot.send_file(
+                event.chat_id, 
+                file_path, 
+                caption=f"✅ Test complete. Found {len(working_proxies)} working proxies out of {total_proxies}."
+            )
+            os.remove(file_path)
+            if msg:
+                await msg.delete()
+        else:
+            await msg.edit(f"❌ Test complete. No working proxies were found out of {total_proxies} tested.")
+        
         raise events.StopPropagation
+    # ---------- MODIFICATION END: Proxy Debug Handler ----------
 
     async def _clean_sessions_handler(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id

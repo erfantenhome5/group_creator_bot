@@ -705,19 +705,26 @@ class GroupCreatorBot:
 
     # ---------- MODIFICATION START: Resilient Login Client ----------
     async def _create_resilient_login_client(self, user_id: int) -> tuple[Optional[TelegramClient], Optional[Dict]]:
-        """Tries to connect for login using proxies, and after failures, attempts a direct connection."""
+        """[MODIFIED] Tries to connect for login using a sample of proxies, falling back to direct connection."""
         
         potential_proxies = self.proxies[:]
         random.shuffle(potential_proxies)
-        
-        # We will also try a direct connection at the end
-        proxies_to_try = potential_proxies + [None] 
-        
-        LOGGER.info(f"Attempting login for user {user_id}. Trying up to {len(proxies_to_try)} connection methods.")
 
-        for i, proxy in enumerate(proxies_to_try):
-            proxy_info_str = f"{proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
-            LOGGER.info(f"[Login User {user_id}] Connection attempt {i+1}/{len(proxies_to_try)} using {proxy_info_str}...")
+        # To improve speed, we'll only try a sample of proxies, not all of them.
+        max_proxies_to_try = 10
+        if len(potential_proxies) > max_proxies_to_try:
+            proxies_to_sample = random.sample(potential_proxies, max_proxies_to_try)
+        else:
+            proxies_to_sample = potential_proxies
+
+        # We will also try a direct connection at the end
+        connections_to_try = proxies_to_sample + [None] 
+        
+        LOGGER.info(f"Attempting login for user {user_id}. Trying up to {len(connections_to_try)} connection methods.")
+
+        for i, proxy in enumerate(connections_to_try):
+            proxy_info_str = f"proxy {proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
+            LOGGER.info(f"[Login User {user_id}] Connection attempt {i+1}/{len(connections_to_try)} using {proxy_info_str}...")
 
             client = await self._create_login_client(proxy)
             
@@ -2095,6 +2102,7 @@ class GroupCreatorBot:
                     await client.disconnect()
             await self._send_accounts_menu(event)
 
+    # ---------- MODIFICATION START: 2FA Handler ----------
     async def _handle_2fa_choice(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         choice = event.message.text.strip()
@@ -2111,29 +2119,15 @@ class GroupCreatorBot:
             return
 
         if choice == Config.BTN_CHANGE_2FA_YES:
-            current_password = self.user_sessions[user_id].get('current_password')
-            new_password = "erfantenhome"
-            msg = await event.reply(f"⏳ در حال تغییر رمز تایید دو مرحله‌ای به `{new_password}`...")
-            try:
-                # Telethon's edit_2fa is deprecated, use direct request
-                current_pwd_check = await client(UpdatePasswordSettingsRequest(
-                    current_password_hash=b'', # This is complex to get, so we try with empty first
-                    new_settings=types.account.PasswordInputSettings(
-                        new_password_hash=b'', # Also complex, but we can set it
-                        hint=new_password
-                    )
-                ))
-                # This part is complex due to Telethon's password hashing. 
-                # A full implementation requires Salted-Random-KDF.
-                # For now, we inform the user it's a complex operation.
-                await msg.edit("⚠️ تغییر رمز عبور از طریق ربات یک عملیات پیچیده است و ممکن است به طور کامل پشتیبانی نشود. لطفاً به صورت دستی این کار را انجام دهید.")
-
-            except Exception as e:
-                await self._send_error_explanation(user_id, e)
-                await msg.edit("❌ در هنگام تغییر رمز خطایی رخ داد. ممکن است رمز فعلی اشتباه باشد یا مشکلی در سمت تلگرام وجود داشته باشد.")
+            await event.reply(
+                "⚠️ **عملیات پیچیده**\n\n"
+                "تغییر رمز تایید دو مرحله‌ای از طریق ربات به دلیل نیاز به محاسبات رمزنگاری پیچیده پشتیبانی نمی‌شود. "
+                "لطفاً برای امنیت بیشتر، این کار را به صورت دستی در یکی از اپلیکیشن‌های رسمی تلگرام انجام دهید."
+            )
         
         self.user_sessions[user_id]['state'] = 'awaiting_account_name'
         await event.reply('✍️ لطفاً یک نام مستعار برای این حساب وارد کنید (مثال: `حساب اصلی` یا `شماره دوم`).', buttons=[[Button.text(Config.BTN_BACK)]])
+    # ---------- MODIFICATION END: 2FA Handler ----------
 
     async def _handle_conv_accounts_input(self, event: events.NewMessage.Event) -> None:
         user_id = str(event.sender_id)
@@ -2450,6 +2444,11 @@ class GroupCreatorBot:
             except Exception as e:
                 await self._send_error_explanation(user_id, e)
                 self.user_sessions[user_id]['state'] = 'awaiting_phone'
+        # ---------- MODIFICATION START: Invalid Code Handler ----------
+        except errors.PhoneCodeInvalidError:
+            await event.reply('❌ کد وارد شده نامعتبر است. لطفاً دوباره تلاش کنید.', buttons=[[Button.text(Config.BTN_BACK)]])
+            self.user_sessions[user_id]['state'] = 'awaiting_code'
+        # ---------- MODIFICATION END: Invalid Code Handler ----------
         except Exception as e:
             await self._send_error_explanation(user_id, e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
@@ -3061,6 +3060,7 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+
 
 
 

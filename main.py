@@ -368,7 +368,7 @@ class GroupCreatorBot:
 
     async def _initialize_sentry(self):
         """Initializes Sentry for error reporting, tracing, and logging."""
-        sentry_dsn = self.config.get("SENTRY_DSn", SENTRY_DSN)
+        sentry_dsn = self.config.get("SENTRY_DSN", SENTRY_DSN)
         if not sentry_dsn:
             return
 
@@ -1547,20 +1547,20 @@ class GroupCreatorBot:
 
     # ---------- MODIFICATION START: Proxy Debug Handler ----------
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
-        """[MODIFIED] Tests all proxies, saves working ones to a file, and sends it to the admin."""
+        """[MODIFIED] Tests all proxies and the direct connection, then sends a report."""
         if event.sender_id != ADMIN_USER_ID: return
 
         LOGGER.info(f"Admin {event.sender_id} initiated proxy test.")
         if not self.proxies:
-            await self.bot.send_message(event.sender_id, "⚠️ No proxies found in the file to test.")
-            return
-
-        msg = await self.bot.send_message(event.sender_id, f"🧪 Starting test for {len(self.proxies)} proxies... This may take a moment.")
+            await self.bot.send_message(event.sender_id, "⚠️ No proxies found in the file to test. Testing direct connection only.")
+        
+        msg = await self.bot.send_message(event.sender_id, f"🧪 Starting test for {len(self.proxies)} proxies and direct connection... This may take a moment.")
         
         working_proxies = []
         tested_count = 0
         total_proxies = len(self.proxies)
 
+        LOGGER.info("--- PROXY TEST START ---")
         for proxy in self.proxies:
             client = None
             try:
@@ -1568,12 +1568,17 @@ class GroupCreatorBot:
                 client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, **device_params)
                 await client.connect()
                 if client.is_connected():
-                    proxy_parts = [proxy['addr'], str(proxy['port'])]
+                    proxy_line = f"{proxy['addr']}:{proxy['port']}"
                     if 'username' in proxy and 'password' in proxy:
-                        proxy_parts.extend([proxy['username'], proxy['password']])
+                        proxy_line += f":{proxy['username']}:{proxy['password']}"
                     
-                    working_proxies.append(":".join(proxy_parts))
+                    working_proxies.append(proxy_line)
                     LOGGER.info(f"  ✅ SUCCESS: {proxy['addr']}:{proxy['port']}")
+            except errors.GeneralProxyError as e:
+                if "407" in str(e):
+                    LOGGER.warning(f"  ❌ FAILURE (407 Auth Required): {proxy['addr']}:{proxy['port']}. Check if username/password are needed and correct.")
+                else:
+                    LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy['addr']}:{proxy['port']} - {e}")
             except Exception as e:
                 LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy['addr']}:{proxy['port']} - {e}")
             finally:
@@ -1587,22 +1592,50 @@ class GroupCreatorBot:
                     except errors.MessageNotModifiedError:
                         pass
         
-        LOGGER.info("Proxy test finished.")
+        LOGGER.info("--- DIRECT CONNECTION TEST ---")
+        direct_connection_works = False
+        client = None
+        try:
+            device_params = random.choice(Config.USER_AGENTS)
+            client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=None, timeout=self.proxy_timeout, **device_params)
+            await client.connect()
+            if client.is_connected():
+                direct_connection_works = True
+                LOGGER.info("  ✅ SUCCESS: Direct connection works.")
+        except Exception as e:
+            LOGGER.warning(f"  ❌ FAILURE: Direct connection failed. - {e}")
+        finally:
+            if client and client.is_connected():
+                await client.disconnect()
+        
+        LOGGER.info("Proxy and connection test finished.")
+
+        report_lines = [
+            f"✅ Test complete. Found {len(working_proxies)} working proxies out of {total_proxies}."
+        ]
+        if direct_connection_works:
+            report_lines.append("✅ Direct connection to Telegram is working.")
+        else:
+            report_lines.append("❌ Direct connection to Telegram failed. Proxies may be required.")
+
+        report_caption = "\n".join(report_lines)
+
         if working_proxies:
             file_path = SESSIONS_DIR / "working_proxies.txt"
             with open(file_path, "w", encoding="utf-8") as f:
+                f.write("# This file contains proxies that successfully connected to Telegram during the last test.\n")
                 f.write("\n".join(working_proxies))
             
             await self.bot.send_file(
                 event.chat_id, 
                 file_path, 
-                caption=f"✅ Test complete. Found {len(working_proxies)} working proxies out of {total_proxies}."
+                caption=report_caption
             )
             os.remove(file_path)
             if msg:
                 await msg.delete()
         else:
-            await msg.edit(f"❌ Test complete. No working proxies were found out of {total_proxies} tested.")
+            await msg.edit(report_caption)
         
         raise events.StopPropagation
     # ---------- MODIFICATION END: Proxy Debug Handler ----------
@@ -3004,3 +3037,4 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+

@@ -603,28 +603,6 @@ class GroupCreatorBot:
             LOGGER.error(f"Login connection {proxy_info} failed: {e}")
             return None
 
-    async def _create_resilient_login_client(self) -> (Optional[TelegramClient], Optional[Dict]):
-        """[NEW] Tries to connect for login using available proxies, falling back to direct connection."""
-        proxies_to_try = self.proxies[:]  # Create a copy
-        random.shuffle(proxies_to_try)
-        
-        # Add None to the end to try direct connection last
-        proxies_to_try.append(None)
-
-        LOGGER.info(f"Attempting login. Trying up to {len(proxies_to_try)} connection methods.")
-
-        for i, proxy in enumerate(proxies_to_try):
-            proxy_info_str = f"proxy {proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
-            LOGGER.info(f"Login attempt {i + 1}/{len(proxies_to_try)} using {proxy_info_str}...")
-
-            client = await self._create_login_client(proxy)
-            if client and client.is_connected():
-                LOGGER.info(f"Login connection successful using {proxy_info_str}.")
-                return client, proxy
-
-        LOGGER.error("All login attempts failed.")
-        return None, None
-
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         session = sessions.StringSession(session_string)
         device_params = random.choice(Config.USER_AGENTS)
@@ -2418,7 +2396,7 @@ class GroupCreatorBot:
         
         # [MODIFIED] Use resilient login method
         msg = await event.reply("⏳ Trying to connect to Telegram using available methods...")
-        user_client, selected_proxy = await self._create_resilient_login_client()
+        user_client, selected_proxy = await self._create_resilient_login_client(user_id)
 
         if not user_client:
             await msg.edit('❌ Failed to connect to Telegram using all available proxies and a direct connection. Please check your network and proxy list, then try again.')
@@ -3083,5 +3061,6 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+
 
 

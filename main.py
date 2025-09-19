@@ -1574,13 +1574,12 @@ class GroupCreatorBot:
                     
                     working_proxies.append(proxy_line)
                     LOGGER.info(f"  ✅ SUCCESS: {proxy['addr']}:{proxy['port']}")
-            except errors.GeneralProxyError as e:
-                if "407" in str(e):
+            except Exception as e:
+                # Check for proxy authentication error within the generic exception message
+                if "407" in str(e) or "Proxy Authentication Required" in str(e):
                     LOGGER.warning(f"  ❌ FAILURE (407 Auth Required): {proxy['addr']}:{proxy['port']}. Check if username/password are needed and correct.")
                 else:
                     LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy['addr']}:{proxy['port']} - {e}")
-            except Exception as e:
-                LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy['addr']}:{proxy['port']} - {e}")
             finally:
                 if client and client.is_connected():
                     await client.disconnect()
@@ -3037,4 +3036,5 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+
 

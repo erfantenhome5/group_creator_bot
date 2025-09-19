@@ -603,6 +603,28 @@ class GroupCreatorBot:
             LOGGER.error(f"Login connection {proxy_info} failed: {e}")
             return None
 
+    async def _create_resilient_login_client(self) -> (Optional[TelegramClient], Optional[Dict]):
+        """[NEW] Tries to connect for login using available proxies, falling back to direct connection."""
+        proxies_to_try = self.proxies[:]  # Create a copy
+        random.shuffle(proxies_to_try)
+        
+        # Add None to the end to try direct connection last
+        proxies_to_try.append(None)
+
+        LOGGER.info(f"Attempting login. Trying up to {len(proxies_to_try)} connection methods.")
+
+        for i, proxy in enumerate(proxies_to_try):
+            proxy_info_str = f"proxy {proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
+            LOGGER.info(f"Login attempt {i + 1}/{len(proxies_to_try)} using {proxy_info_str}...")
+
+            client = await self._create_login_client(proxy)
+            if client and client.is_connected():
+                LOGGER.info(f"Login connection successful using {proxy_info_str}.")
+                return client, proxy
+
+        LOGGER.error("All login attempts failed.")
+        return None, None
+
     async def _create_worker_client(self, session_string: str, proxy: Optional[Dict]) -> Optional[TelegramClient]:
         session = sessions.StringSession(session_string)
         device_params = random.choice(Config.USER_AGENTS)
@@ -626,7 +648,6 @@ class GroupCreatorBot:
             sentry_sdk.capture_exception(e)
             return None
 
-    # ---------- MODIFICATION START: Resilient Worker Client ----------
     async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
         """[MODIFIED] Tries to connect using proxies, and after 3 failures, attempts a direct connection."""
         worker_key = f"{user_id}:{account_name}"
@@ -703,7 +724,32 @@ class GroupCreatorBot:
 
         LOGGER.error(f"[{account_name}] All connection attempts (proxies and direct) failed.")
         return None
-    # ---------- MODIFICATION END: Resilient Worker Client ----------
+
+    # ---------- MODIFICATION START: Resilient Login Client ----------
+    async def _create_resilient_login_client(self, user_id: int) -> tuple[Optional[TelegramClient], Optional[Dict]]:
+        """Tries to connect for login using proxies, and after failures, attempts a direct connection."""
+        
+        potential_proxies = self.proxies[:]
+        random.shuffle(potential_proxies)
+        
+        # We will also try a direct connection at the end
+        proxies_to_try = potential_proxies + [None] 
+        
+        LOGGER.info(f"Attempting login for user {user_id}. Trying up to {len(proxies_to_try)} connection methods.")
+
+        for i, proxy in enumerate(proxies_to_try):
+            proxy_info_str = f"{proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
+            LOGGER.info(f"[Login User {user_id}] Connection attempt {i+1}/{len(proxies_to_try)} using {proxy_info_str}...")
+
+            client = await self._create_login_client(proxy)
+            
+            if client and client.is_connected():
+                LOGGER.info(f"[Login User {user_id}] Successfully connected using {proxy_info_str}.")
+                return client, proxy
+
+        LOGGER.error(f"[Login User {user_id}] All login connection attempts failed.")
+        return None, None
+    # ---------- MODIFICATION END: Resilient Login Client ----------
 
     async def _send_request_with_reconnect(self, client: TelegramClient, request: Any, account_name: str) -> Any:
         try:
@@ -2367,33 +2413,34 @@ class GroupCreatorBot:
                 buttons=[[Button.text(Config.BTN_BACK)]]
             )
             return
-        self.user_sessions[user_id]['phone'] = phone_number
-        selected_proxy = self._get_available_proxy()
-        if selected_proxy:
-            LOGGER.info(f"Using proxy {selected_proxy['addr']}:{selected_proxy['port']} for login.")
-        else:
-            LOGGER.info("No available proxy from file. Attempting direct connection for login.")
 
+        self.user_sessions[user_id]['phone'] = phone_number
+        
+        # [MODIFIED] Use resilient login method
+        msg = await event.reply("⏳ Trying to connect to Telegram using available methods...")
+        user_client, selected_proxy = await self._create_resilient_login_client()
+
+        if not user_client:
+            await msg.edit('❌ Failed to connect to Telegram using all available proxies and a direct connection. Please check your network and proxy list, then try again.')
+            self.user_sessions[user_id]['state'] = 'awaiting_phone' # Reset state
+            return
+
+        # Store the successful proxy (or None for direct) in the session
         self.user_sessions[user_id]['login_proxy'] = selected_proxy
-        user_client = None
+        
         try:
-            user_client = await self._create_login_client(selected_proxy)
-            if not user_client:
-                proxy_msg = f" with proxy {selected_proxy['addr']}:{selected_proxy['port']}" if selected_proxy else " directly"
-                await event.reply(f'❌ Failed to connect to Telegram{proxy_msg}. Please try again later.')
-                return
             self.user_sessions[user_id]['client'] = user_client
             sent_code = await user_client.send_code_request(self.user_sessions[user_id]['phone'])
             self.user_sessions[user_id]['phone_code_hash'] = sent_code.phone_code_hash
             self.user_sessions[user_id]['state'] = 'awaiting_code'
-            await event.reply('💬 A login code has been sent. Please send it here.', buttons=[[Button.text(Config.BTN_BACK)]])
+            await msg.edit('💬 A login code has been sent. Please send it here.', buttons=[[Button.text(Config.BTN_BACK)]])
         except Exception as e:
             await self._send_error_explanation(user_id, e)
             self.user_sessions[user_id]['state'] = 'awaiting_phone'
-        finally:
-            if user_client and self.user_sessions.get(user_id, {}).get('state') != 'awaiting_code':
-                 if user_client.is_connected():
-                    await user_client.disconnect()
+            # Clean up client if it exists but something else failed
+            if user_client and user_client.is_connected():
+                await user_client.disconnect()
+
 
     async def _handle_code_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id

@@ -626,6 +626,48 @@ class GroupCreatorBot:
             sentry_sdk.capture_exception(e)
             return None
 
+    async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
+        """[NEW] Tries to connect using the assigned proxy, then rotates to others on failure."""
+        worker_key = f"{user_id}:{account_name}"
+        
+        assigned_proxy = self.account_proxies.get(worker_key)
+        
+        potential_proxies = self.proxies[:]
+        random.shuffle(potential_proxies)
+
+        proxies_to_try = []
+        if assigned_proxy:
+            proxies_to_try.append(assigned_proxy)
+            assigned_proxy_tuple = (assigned_proxy['addr'], assigned_proxy['port'])
+            for p in potential_proxies:
+                if (p['addr'], p['port']) != assigned_proxy_tuple:
+                    proxies_to_try.append(p)
+        else:
+            proxies_to_try = potential_proxies
+
+        proxies_to_try.append(None) 
+
+        LOGGER.info(f"Attempting connection for '{account_name}'. Trying up to {len(proxies_to_try)} connection methods.")
+
+        for i, proxy in enumerate(proxies_to_try):
+            proxy_info_str = f"{proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
+            LOGGER.info(f"[{account_name}] Connection attempt {i+1}/{len(proxies_to_try)} using {proxy_info_str}...")
+
+            client = await self._create_worker_client(session_string, proxy)
+            
+            if client and client.is_connected():
+                LOGGER.info(f"[{account_name}] Successfully connected using {proxy_info_str}.")
+                
+                if proxy != assigned_proxy:
+                    LOGGER.info(f"Updating assigned proxy for '{account_name}' to {proxy_info_str}.")
+                    self.account_proxies[worker_key] = proxy
+                    self._save_account_proxies()
+                
+                return client
+
+        LOGGER.error(f"[{account_name}] All connection attempts failed.")
+        return None
+
     async def _send_request_with_reconnect(self, client: TelegramClient, request: Any, account_name: str) -> Any:
         try:
             if not client.is_connected():
@@ -923,8 +965,7 @@ class GroupCreatorBot:
             session_str = self.session_manager.load_session_string(user_id, first_participant_name)
             if not session_str: return
             
-            proxy = self.account_proxies.get(f"{user_id}:{first_participant_name}")
-            client = await self._create_worker_client(session_str, proxy)
+            client = await self._create_resilient_worker_client(user_id, first_participant_name, session_str)
             if not client: return
             clients_to_disconnect.append(client)
             
@@ -1361,8 +1402,7 @@ class GroupCreatorBot:
         client = None
         try:
             session_str = self.session_manager.load_session_string(source_user_id, source_account_name)
-            proxy = self.account_proxies.get(owner_key)
-            client = await self._create_worker_client(session_str, proxy)
+            client = await self._create_resilient_worker_client(source_user_id, source_account_name, session_str)
 
             if not client:
                 await event.reply(f"❌ Failed to connect with account `{owner_key}` to generate links.")
@@ -1423,8 +1463,7 @@ class GroupCreatorBot:
                     all_links.append(f"\n--- ERROR: Could not load session for {owner_key} ---")
                     continue
 
-                proxy = self.account_proxies.get(owner_key)
-                client = await self._create_worker_client(session_str, proxy)
+                client = await self._create_resilient_worker_client(user_id, account_name, session_str)
                 if not client:
                     all_links.append(f"\n--- ERROR: Could not connect as {owner_key} ---")
                     continue
@@ -1738,8 +1777,7 @@ class GroupCreatorBot:
 
         user_client = None
         try:
-            assigned_proxy = self.account_proxies.get(worker_key)
-            user_client = await self._create_worker_client(session_str, assigned_proxy)
+            user_client = await self._create_resilient_worker_client(user_id, account_name, session_str)
             if not user_client:
                 LOGGER.error(f"Failed to connect to Telegram for account '{account_name}'.")
                 await self.bot.send_message(user_id, f'❌ Failed to connect to Telegram for account `{account_name}`.')
@@ -1920,8 +1958,7 @@ class GroupCreatorBot:
                 await self.bot.send_message(user_id, f"ℹ️ **پیام از تلگرام برای `{account_name}` (کد یافت نشد):**\n\n_{event_code.message.text}_")
 
         try:
-            proxy = self.account_proxies.get(f"{user_id}:{account_name}")
-            client = await self._create_worker_client(session_str, proxy)
+            client = await self._create_resilient_worker_client(user_id, account_name, session_str)
             if not client:
                 await msg.edit(f"❌ اتصال به حساب `{account_name}` ناموفق بود.")
                 await self._send_accounts_menu(event)
@@ -2050,8 +2087,7 @@ class GroupCreatorBot:
         fail_count = 0
         fail_details_list = []
         try:
-            proxy = self.account_proxies.get(f"{user_id}:{account_name}")
-            client = await self._create_worker_client(session_str, proxy)
+            client = await self._create_resilient_worker_client(user_id, account_name, session_str)
             if not client:
                 await event.reply(f"❌ اتصال به حساب `{account_name}` ناموفق بود.", buttons=self._build_main_menu())
                 return
@@ -2117,8 +2153,7 @@ class GroupCreatorBot:
         client = None
         links = []
         try:
-            proxy = self.account_proxies.get(worker_key_to_find)
-            client = await self._create_worker_client(session_str, proxy)
+            client = await self._create_resilient_worker_client(user_id, account_name, session_str)
             if not client:
                 await event.reply(f"❌ اتصال به حساب `{account_name}` ناموفق بود.", buttons=self._build_main_menu())
                 return
@@ -2472,8 +2507,7 @@ class GroupCreatorBot:
         client = None
         try:
             session_str = self.session_manager.load_session_string(dm_user_id, account_name)
-            proxy = self.account_proxies.get(f"{dm_user_id}:{account_name}")
-            client = await self._create_worker_client(session_str, proxy)
+            client = await self._create_resilient_worker_client(dm_user_id, account_name, session_str)
             if not client:
                 await event.reply("❌ Failed to connect with the selected account.")
                 return
@@ -2593,8 +2627,7 @@ class GroupCreatorBot:
                         LOGGER.warning(f"[Health Check] No session for owner {owner_key}, skipping their groups.")
                         continue
                     
-                    proxy = self.account_proxies.get(owner_key)
-                    owner_client = await self._create_worker_client(session_str, proxy)
+                    owner_client = await self._create_resilient_worker_client(user_id, account_name, session_str)
                     if not owner_client:
                         LOGGER.error(f"[Health Check] Failed to connect as owner {owner_key}, skipping their groups.")
                         continue
@@ -2722,8 +2755,7 @@ class GroupCreatorBot:
                         LOGGER.warning(f"[Scheduler] Could not load session for {owner_key}. Skipping {len(group_ids)} groups.")
                         continue
 
-                    proxy = self.account_proxies.get(owner_key)
-                    client = await self._create_worker_client(session_str, proxy)
+                    client = await self._create_resilient_worker_client(user_id, account_name, session_str)
                     if not client:
                         LOGGER.error(f"[Scheduler] Could not connect as {owner_key}. Skipping {len(group_ids)} groups.")
                         continue
@@ -2777,8 +2809,7 @@ class GroupCreatorBot:
                         LOGGER.warning(f"[Message All] No session for account {owner_key}, skipping.")
                         continue
                     
-                    proxy = self.account_proxies.get(owner_key)
-                    client = await self._create_worker_client(session_str, proxy)
+                    client = await self._create_resilient_worker_client(user_id, account_name, session_str)
                     if not client:
                         LOGGER.error(f"[Message All] Failed to connect as account {owner_key}, skipping.")
                         continue
@@ -2915,4 +2946,3 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
-

@@ -628,53 +628,55 @@ class GroupCreatorBot:
             sentry_sdk.capture_exception(e)
             return None
 
+# In your GroupCreatorBot class...
+
+    # ... (other methods like _create_worker_client)
+
+    # This 'async def' line should have the same indentation as the other methods in the class
     async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
-  
+        # All of the code below this line MUST be indented further
         worker_key = f"{user_id}:{account_name}"
-    
-    # 1. Get the sticky proxy for this account, if it exists.
-       sticky_proxy = self.account_proxies.get(worker_key)
-    
-    # 2. Try the sticky proxy first.
-       if sticky_proxy:
+        
+        # 1. Get the sticky proxy for this account, if it exists.
+        sticky_proxy = self.account_proxies.get(worker_key)
+        
+        # 2. Try the sticky proxy first.
+        if sticky_proxy:
             LOGGER.info(f"[{account_name}] Attempting connection with sticky proxy {sticky_proxy['addr']}:{sticky_proxy['port']}...")
             client = await self._create_worker_client(session_string, sticky_proxy)
-      if client and client.is_connected():
-            LOGGER.info(f"[{account_name}] Successfully connected using sticky proxy.")
-            return client
-        else:
-            LOGGER.warning(f"[{account_name}] Sticky proxy failed. Searching for a new one.")
-            self.account_proxies[worker_key] = None # The sticky proxy is dead, clear it.
-            self._save_account_proxies()
+            if client and client.is_connected():
+                LOGGER.info(f"[{account_name}] Successfully connected using sticky proxy.")
+                return client
+            else:
+                LOGGER.warning(f"[{account_name}] Sticky proxy failed. Searching for a new one.")
+                self.account_proxies[worker_key] = None # The sticky proxy is dead, clear it.
+                self._save_account_proxies()
 
-    # 3. If no sticky proxy or it failed, search for a new one.
-           potential_proxies = self.proxies[:]
-           random.shuffle(potential_proxies)
-    
-       for proxy in potential_proxies:
+        # 3. If no sticky proxy or it failed, search for a new one.
+        potential_proxies = self.proxies[:]
+        random.shuffle(potential_proxies)
+        
+        for proxy in potential_proxies:
             LOGGER.info(f"[{account_name}] Trying new proxy {proxy['addr']}:{proxy['port']}...")
             client = await self._create_worker_client(session_string, proxy)
-        if client and client.is_connected():
-            LOGGER.info(f"[{account_name}] Successfully connected with new proxy. Setting as sticky.")
-            self.account_proxies[worker_key] = proxy # Save the new working proxy
-            self._save_account_proxies()
-            return client
+            if client and client.is_connected():
+                LOGGER.info(f"[{account_name}] Successfully connected with new proxy. Setting as sticky.")
+                self.account_proxies[worker_key] = proxy # Save the new working proxy
+                self._save_account_proxies()
+                return client
 
-        # If all proxy attempts failed or we hit the limit, try a direct connection
-        LOGGER.info(f"[{account_name}] All proxies failed or limit reached. Trying a direct connection...")
+        # 4. If all proxies fail, try a direct connection as a last resort.
+        LOGGER.warning(f"[{account_name}] All proxies failed. Trying a direct connection...")
         client = await self._create_worker_client(session_string, None)
         if client and client.is_connected():
-            LOGGER.info(f"[{account_name}] Successfully connected using a direct connection.")
-            
+            LOGGER.info(f"[{account_name}] Successfully connected directly. Removing sticky proxy assignment.")
             if self.account_proxies.get(worker_key) is not None:
-                LOGGER.info(f"Removing failed proxy assignment for '{account_name}'.")
-                self.account_proxies[worker_key] = None
-                self._save_account_proxies()
+                 self.account_proxies[worker_key] = None
+                 self._save_account_proxies()
             return client
 
-        LOGGER.error(f"[{account_name}] All connection attempts (proxies and direct) failed.")
+        LOGGER.error(f"[{account_name}] All connection attempts (proxies and direct) have failed.")
         return None
-
     # ---------- MODIFICATION START: Resilient Login Client ----------
     async def _create_resilient_login_client(self, user_id: int) -> tuple[Optional[TelegramClient], Optional[Dict]]:
         """[MODIFIED] Tries to connect for login using a sample of proxies, falling back to direct connection."""

@@ -309,6 +309,8 @@ class GroupCreatorBot:
     """A class to encapsulate the bot's logic for managing multiple accounts."""
 
     def __init__(self, session_manager) -> None:
+        self.proxies = load_proxies_from_file(Config.PROXY_FILE)
+        LOGGER.info("Main bot client will attempt to connect directly (no proxy).")
         """Initializes the bot instance and the encryption engine."""
         self.bot = TelegramClient('bot_session', API_ID, API_HASH)
         self.user_sessions: Dict[int, Dict[str, Any]] = {}
@@ -627,60 +629,36 @@ class GroupCreatorBot:
             return None
 
     async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
-        """[MODIFIED] Tries to connect using up to 2 proxies, then falls back to a direct connection."""
-        worker_key = f"{user_id}:{account_name}"
-        
-        potential_proxies = self.proxies[:]
-        random.shuffle(potential_proxies)
+    """[MODIFIED] Tries to connect with a 'sticky' proxy, falling back to others, then direct."""
+    worker_key = f"{user_id}:{account_name}"
+    
+    # 1. Get the sticky proxy for this account, if it exists.
+    sticky_proxy = self.account_proxies.get(worker_key)
+    
+    # 2. Try the sticky proxy first.
+    if sticky_proxy:
+        LOGGER.info(f"[{account_name}] Attempting connection with sticky proxy {sticky_proxy['addr']}:{sticky_proxy['port']}...")
+        client = await self._create_worker_client(session_string, sticky_proxy)
+        if client and client.is_connected():
+            LOGGER.info(f"[{account_name}] Successfully connected using sticky proxy.")
+            return client
+        else:
+            LOGGER.warning(f"[{account_name}] Sticky proxy failed. Searching for a new one.")
+            self.account_proxies[worker_key] = None # The sticky proxy is dead, clear it.
+            self._save_account_proxies()
 
-        assigned_proxy = self.account_proxies.get(worker_key)
-        if assigned_proxy:
-            try:
-                idx = -1
-                for i, p in enumerate(potential_proxies):
-                    if p['addr'] == assigned_proxy['addr'] and p['port'] == assigned_proxy['port']:
-                        idx = i
-                        break
-                if idx != -1:
-                    potential_proxies.insert(0, potential_proxies.pop(idx))
-                else:
-                    potential_proxies.insert(0, assigned_proxy)
-            except Exception:
-                potential_proxies.insert(0, assigned_proxy)
-
-        proxies_to_try = potential_proxies
-        
-        LOGGER.info(f"Attempting connection for '{account_name}'. Trying up to 2 proxies before direct connection.")
-
-        failed_attempts = 0
-        
-        # Try available proxies, up to a limit of 2 failures
-        for proxy in proxies_to_try:
-            if failed_attempts >= 2:
-                LOGGER.warning(f"[{account_name}] Reached {failed_attempts} failed proxy attempts. Now trying a direct connection.")
-                break
-
-            proxy_info_str = f"{proxy['addr']}:{proxy['port']}"
-            LOGGER.info(f"[{account_name}] Proxy attempt {failed_attempts + 1}/2 using {proxy_info_str}...")
-
-            client = await self._create_worker_client(session_string, proxy)
-            
-            if client and client.is_connected():
-                LOGGER.info(f"[{account_name}] Successfully connected using proxy {proxy_info_str}.")
-                
-                is_different = True
-                if assigned_proxy:
-                    if assigned_proxy['addr'] == proxy['addr'] and assigned_proxy['port'] == proxy['port']:
-                        is_different = False
-                
-                if is_different:
-                    LOGGER.info(f"Updating assigned proxy for '{account_name}' to {proxy_info_str}.")
-                    self.account_proxies[worker_key] = proxy
-                    self._save_account_proxies()
-                
-                return client
-            else:
-                failed_attempts += 1
+    # 3. If no sticky proxy or it failed, search for a new one.
+    potential_proxies = self.proxies[:]
+    random.shuffle(potential_proxies)
+    
+    for proxy in potential_proxies:
+        LOGGER.info(f"[{account_name}] Trying new proxy {proxy['addr']}:{proxy['port']}...")
+        client = await self._create_worker_client(session_string, proxy)
+        if client and client.is_connected():
+            LOGGER.info(f"[{account_name}] Successfully connected with new proxy. Setting as sticky.")
+            self.account_proxies[worker_key] = proxy # Save the new working proxy
+            self._save_account_proxies()
+            return client
 
         # If all proxy attempts failed or we hit the limit, try a direct connection
         LOGGER.info(f"[{account_name}] All proxies failed or limit reached. Trying a direct connection...")

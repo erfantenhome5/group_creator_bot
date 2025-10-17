@@ -629,17 +629,17 @@ class GroupCreatorBot:
             return None
 
     async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
-    """[MODIFIED] Tries to connect with a 'sticky' proxy, falling back to others, then direct."""
-    worker_key = f"{user_id}:{account_name}"
+  
+        worker_key = f"{user_id}:{account_name}"
     
     # 1. Get the sticky proxy for this account, if it exists.
-    sticky_proxy = self.account_proxies.get(worker_key)
+       sticky_proxy = self.account_proxies.get(worker_key)
     
     # 2. Try the sticky proxy first.
-    if sticky_proxy:
-        LOGGER.info(f"[{account_name}] Attempting connection with sticky proxy {sticky_proxy['addr']}:{sticky_proxy['port']}...")
-        client = await self._create_worker_client(session_string, sticky_proxy)
-        if client and client.is_connected():
+       if sticky_proxy:
+            LOGGER.info(f"[{account_name}] Attempting connection with sticky proxy {sticky_proxy['addr']}:{sticky_proxy['port']}...")
+            client = await self._create_worker_client(session_string, sticky_proxy)
+      if client and client.is_connected():
             LOGGER.info(f"[{account_name}] Successfully connected using sticky proxy.")
             return client
         else:
@@ -648,12 +648,12 @@ class GroupCreatorBot:
             self._save_account_proxies()
 
     # 3. If no sticky proxy or it failed, search for a new one.
-    potential_proxies = self.proxies[:]
-    random.shuffle(potential_proxies)
+           potential_proxies = self.proxies[:]
+           random.shuffle(potential_proxies)
     
-    for proxy in potential_proxies:
-        LOGGER.info(f"[{account_name}] Trying new proxy {proxy['addr']}:{proxy['port']}...")
-        client = await self._create_worker_client(session_string, proxy)
+       for proxy in potential_proxies:
+            LOGGER.info(f"[{account_name}] Trying new proxy {proxy['addr']}:{proxy['port']}...")
+            client = await self._create_worker_client(session_string, proxy)
         if client and client.is_connected():
             LOGGER.info(f"[{account_name}] Successfully connected with new proxy. Setting as sticky.")
             self.account_proxies[worker_key] = proxy # Save the new working proxy

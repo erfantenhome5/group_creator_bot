@@ -311,13 +311,16 @@ class GroupCreatorBot:
     def __init__(self, session_manager) -> None:
         """Initializes the bot instance and the encryption engine."""
         # --- MODIFICATION START ---
-        # Proxies are completely disabled per user request
-        self.proxies = [] 
+        # Load proxies *before* initializing any clients
+        self.proxies = load_proxies_from_file(Config.PROXY_FILE)
 
-        LOGGER.info(f"Main bot client will connect using DIRECT connection (Proxies disabled).")
+        # Select a random proxy for the main bot. If no proxies, it will be None.
+        proxy_for_bot = random.choice(self.proxies) if self.proxies else None
 
-        # Initialize the main bot client with proxy=None
-        self.bot = TelegramClient('bot_session', API_ID, API_HASH, proxy=None)
+        LOGGER.info(f"Main bot client will attempt to connect using proxy: {proxy_for_bot}")
+
+        # Initialize the main bot client *with* the selected proxy
+        self.bot = TelegramClient('bot_session', API_ID, API_HASH, proxy=proxy_for_bot)
         # --- MODIFICATION END ---
 
         self.user_sessions: Dict[int, Dict[str, Any]] = {}
@@ -337,7 +340,7 @@ class GroupCreatorBot:
         self.group_counts = self._load_group_counts()
         self.daily_counts_file = SESSIONS_DIR / "daily_counts.json"
         self.daily_counts = self._load_daily_counts()
-        self.proxies = [] # Ensure proxies are empty
+        self.proxies = load_proxies_from_file(self.config.get("PROXY_FILE", "proxy.txt"))
         
         self.account_proxy_file = SESSIONS_DIR / "account_proxies.json"
         self.account_proxies = self._load_account_proxies()
@@ -412,7 +415,21 @@ class GroupCreatorBot:
             "before_send": before_send_hook,
         }
         
-        LOGGER.info("Sentry will use DIRECT connection.")
+        sentry_proxy = random.choice(self.proxies) if self.proxies else None
+        if sentry_proxy:
+            if 'username' in sentry_proxy and 'password' in sentry_proxy:
+                proxy_url = (
+                    f"http://{sentry_proxy['username']}:{sentry_proxy['password']}"
+                    f"@{sentry_proxy['addr']}:{sentry_proxy['port']}"
+                )
+            else:
+                proxy_url = f"http://{sentry_proxy['addr']}:{sentry_proxy['port']}"
+            
+            sentry_options["http_proxy"] = proxy_url
+            sentry_options["https_proxy"] = proxy_url
+            LOGGER.info(f"Sentry will use proxy: {sentry_proxy['addr']}:{sentry_proxy['port']}")
+        else:
+            LOGGER.info("Sentry will not use a proxy (none found).")
 
         sentry_sdk.init(**sentry_options)
         LOGGER.info("Sentry initialized for error reporting, tracing, and logging.")
@@ -437,7 +454,19 @@ class GroupCreatorBot:
         self._save_json_file(self.account_proxies, self.account_proxy_file)
 
     def _get_available_proxy(self) -> Optional[Dict]:
-        return None # Force no proxy
+        if not self.proxies:
+            return None
+        assigned_proxy_keys = {
+            (p['addr'], p['port'])
+            for p in self.account_proxies.values() if p
+        }
+        for proxy in self.proxies:
+            proxy_key = (proxy['addr'], proxy['port'])
+            if proxy_key not in assigned_proxy_keys:
+                LOGGER.info(f"Found available proxy: {proxy['addr']}:{proxy['port']}")
+                return proxy
+        LOGGER.warning("All proxies are currently assigned. No available proxy found.")
+        return None
 
     # --- Data Store Helpers ---
     def _load_json_file(self, file_path: Path, default_type: Any = {}) -> Any:
@@ -610,30 +639,106 @@ class GroupCreatorBot:
             return None
 
     async def _create_resilient_worker_client(self, user_id: int, account_name: str, session_string: str) -> Optional[TelegramClient]:
-        """[MODIFIED] Connects directly, ignoring all proxies."""
-        LOGGER.info(f"Attempting DIRECT connection for '{account_name}'.")
+        """[MODIFIED] Tries to connect using up to 2 proxies, then falls back to a direct connection."""
+        worker_key = f"{user_id}:{account_name}"
+        
+        potential_proxies = self.proxies[:]
+        random.shuffle(potential_proxies)
 
+        assigned_proxy = self.account_proxies.get(worker_key)
+        if assigned_proxy:
+            try:
+                idx = -1
+                for i, p in enumerate(potential_proxies):
+                    if p['addr'] == assigned_proxy['addr'] and p['port'] == assigned_proxy['port']:
+                        idx = i
+                        break
+                if idx != -1:
+                    potential_proxies.insert(0, potential_proxies.pop(idx))
+                else:
+                    potential_proxies.insert(0, assigned_proxy)
+            except Exception:
+                potential_proxies.insert(0, assigned_proxy)
+
+        proxies_to_try = potential_proxies
+        
+        LOGGER.info(f"Attempting connection for '{account_name}'. Trying up to 2 proxies before direct connection.")
+
+        failed_attempts = 0
+        
+        # Try available proxies, up to a limit of 2 failures
+        for proxy in proxies_to_try:
+            if failed_attempts >= 2:
+                LOGGER.warning(f"[{account_name}] Reached {failed_attempts} failed proxy attempts. Now trying a direct connection.")
+                break
+
+            proxy_info_str = f"{proxy['addr']}:{proxy['port']}"
+            LOGGER.info(f"[{account_name}] Proxy attempt {failed_attempts + 1}/2 using {proxy_info_str}...")
+
+            client = await self._create_worker_client(session_string, proxy)
+            
+            if client and client.is_connected():
+                LOGGER.info(f"[{account_name}] Successfully connected using proxy {proxy_info_str}.")
+                
+                is_different = True
+                if assigned_proxy:
+                    if assigned_proxy['addr'] == proxy['addr'] and assigned_proxy['port'] == proxy['port']:
+                        is_different = False
+                
+                if is_different:
+                    LOGGER.info(f"Updating assigned proxy for '{account_name}' to {proxy_info_str}.")
+                    self.account_proxies[worker_key] = proxy
+                    self._save_account_proxies()
+                
+                return client
+            else:
+                failed_attempts += 1
+
+        # If all proxy attempts failed or we hit the limit, try a direct connection
+        LOGGER.info(f"[{account_name}] All proxies failed or limit reached. Trying a direct connection...")
         client = await self._create_worker_client(session_string, None)
         if client and client.is_connected():
-            LOGGER.info(f"[{account_name}] Successfully connected using DIRECT connection.")
+            LOGGER.info(f"[{account_name}] Successfully connected using a direct connection.")
+            
+            if self.account_proxies.get(worker_key) is not None:
+                LOGGER.info(f"Removing failed proxy assignment for '{account_name}'.")
+                self.account_proxies[worker_key] = None
+                self._save_account_proxies()
             return client
 
-        LOGGER.error(f"[{account_name}] Direct connection failed.")
+        LOGGER.error(f"[{account_name}] All connection attempts (proxies and direct) failed.")
         return None
 
     # ---------- MODIFICATION START: Resilient Login Client ----------
     async def _create_resilient_login_client(self, user_id: int) -> tuple[Optional[TelegramClient], Optional[Dict]]:
-        """[MODIFIED] Connects directly for login, ignoring all proxies."""
+        """[MODIFIED] Tries to connect for login using a sample of proxies, falling back to direct connection."""
         
-        LOGGER.info(f"Attempting DIRECT login connection for user {user_id}.")
+        potential_proxies = self.proxies[:]
+        random.shuffle(potential_proxies)
 
-        client = await self._create_login_client(None)
+        # To improve speed, we'll only try a sample of proxies, not all of them.
+        max_proxies_to_try = 3
+        if len(potential_proxies) > max_proxies_to_try:
+            proxies_to_sample = random.sample(potential_proxies, max_proxies_to_try)
+        else:
+            proxies_to_sample = potential_proxies
+
+        # We will also try a direct connection at the end
+        connections_to_try = proxies_to_sample + [None] 
         
-        if client and client.is_connected():
-            LOGGER.info(f"[Login User {user_id}] Successfully connected using DIRECT connection.")
-            return client, None
+        LOGGER.info(f"Attempting login for user {user_id}. Trying up to {len(connections_to_try)} connection methods.")
 
-        LOGGER.error(f"[Login User {user_id}] Direct login connection failed.")
+        for i, proxy in enumerate(connections_to_try):
+            proxy_info_str = f"proxy {proxy['addr']}:{proxy['port']}" if proxy else "a direct connection"
+            LOGGER.info(f"[Login User {user_id}] Connection attempt {i+1}/{len(connections_to_try)} using {proxy_info_str}...")
+
+            client = await self._create_login_client(proxy)
+            
+            if client and client.is_connected():
+                LOGGER.info(f"[Login User {user_id}] Successfully connected using {proxy_info_str}.")
+                return client, proxy
+
+        LOGGER.error(f"[Login User {user_id}] All login connection attempts failed.")
         return None, None
     # ---------- MODIFICATION END: Resilient Login Client ----------
 
@@ -1479,12 +1584,49 @@ class GroupCreatorBot:
 
     # ---------- MODIFICATION START: Proxy Debug Handler ----------
     async def _debug_test_proxies_handler(self, event: events.NewMessage.Event) -> None:
-        """[MODIFIED] Tests direct connection only."""
+        """[MODIFIED] Tests all proxies and the direct connection, then sends a report."""
         if event.sender_id != ADMIN_USER_ID: return
 
-        LOGGER.info(f"Admin {event.sender_id} initiated connection test.")
+        LOGGER.info(f"Admin {event.sender_id} initiated proxy test.")
+        if not self.proxies:
+            await self.bot.send_message(event.sender_id, "⚠️ No proxies found in the file to test. Testing direct connection only.")
         
-        msg = await self.bot.send_message(event.sender_id, f"🧪 Testing DIRECT connection...")
+        msg = await self.bot.send_message(event.sender_id, f"🧪 Starting test for {len(self.proxies)} proxies and direct connection... This may take a moment.")
+        
+        working_proxies = []
+        tested_count = 0
+        total_proxies = len(self.proxies)
+
+        LOGGER.info("--- PROXY TEST START ---")
+        for proxy in self.proxies:
+            client = None
+            try:
+                device_params = random.choice(Config.USER_AGENTS)
+                client = TelegramClient(sessions.StringSession(), API_ID, API_HASH, proxy=proxy, timeout=self.proxy_timeout, connection_retries=2, **device_params)
+                await client.connect()
+                if client.is_connected():
+                    proxy_line = f"{proxy['addr']}:{proxy['port']}"
+                    if 'username' in proxy and 'password' in proxy:
+                        proxy_line += f":{proxy['username']}:{proxy['password']}"
+                    
+                    working_proxies.append(proxy_line)
+                    LOGGER.info(f"  ✅ SUCCESS: {proxy['addr']}:{proxy['port']}")
+            except Exception as e:
+                # Check for proxy authentication error within the generic exception message
+                if "407" in str(e) or "Proxy Authentication Required" in str(e):
+                    LOGGER.warning(f"  ❌ FAILURE (407 Auth Required): {proxy['addr']}:{proxy['port']}. Check if username/password are needed and correct.")
+                else:
+                    LOGGER.warning(f"  ❌ FAILURE ({type(e).__name__}): {proxy['addr']}:{proxy['port']} - {e}")
+            finally:
+                if client and client.is_connected():
+                    await client.disconnect()
+                
+                tested_count += 1
+                if tested_count % 10 == 0 or tested_count == total_proxies:
+                    try:
+                        await msg.edit(f"🧪 Testing proxies... ({tested_count}/{total_proxies})")
+                    except errors.MessageNotModifiedError:
+                        pass
         
         LOGGER.info("--- DIRECT CONNECTION TEST ---")
         direct_connection_works = False
@@ -1502,10 +1644,34 @@ class GroupCreatorBot:
             if client and client.is_connected():
                 await client.disconnect()
         
+        LOGGER.info("Proxy and connection test finished.")
+
+        report_lines = [
+            f"✅ Test complete. Found {len(working_proxies)} working proxies out of {total_proxies}."
+        ]
         if direct_connection_works:
-            await msg.edit("✅ Direct connection to Telegram is working.\n(Proxies are currently DISABLED by code).")
+            report_lines.append("✅ Direct connection to Telegram is working.")
         else:
-            await msg.edit("❌ Direct connection to Telegram failed.\n(Proxies are currently DISABLED by code).")
+            report_lines.append("❌ Direct connection to Telegram failed. Proxies may be required.")
+
+        report_caption = "\n".join(report_lines)
+
+        if working_proxies:
+            file_path = SESSIONS_DIR / "working_proxies.txt"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("# This file contains proxies that successfully connected to Telegram during the last test.\n")
+                f.write("\n".join(working_proxies))
+            
+            await self.bot.send_file(
+                event.chat_id, 
+                file_path, 
+                caption=report_caption
+            )
+            os.remove(file_path)
+            if msg:
+                await msg.delete()
+        else:
+            await msg.edit(report_caption)
         
         raise events.StopPropagation
     # ---------- MODIFICATION END: Proxy Debug Handler ----------
@@ -2910,3 +3076,11 @@ if __name__ == "__main__":
         asyncio.run(bot_instance.run())
     except Exception as e:
         LOGGER.critical("Bot crashed at the top level.", exc_info=True)
+
+
+
+
+
+
+
+
